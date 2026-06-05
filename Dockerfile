@@ -1,38 +1,44 @@
-# Build stage
-FROM node:18-alpine AS builder
+# 使用Python 3.11作为基础镜像
+FROM python:3.11
 
+# 设置工作目录
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
-RUN npm ci
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    gcc \
+    wget \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+    && tar xf ffmpeg-release-amd64-static.tar.xz \
+    && mv ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ \
+    && mv ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ \
+    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+    && rm -rf ffmpeg-release-amd64-static.tar.xz ffmpeg-*-amd64-static
 
-# Copy source
+# 复制依赖文件
+COPY requirements.txt .
+
+# 安装Python依赖
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
 COPY . .
 
-# Build backend and frontend
-RUN npm run build && cd frontend && npm ci && npm run build
+# 创建临时文件目录
+RUN mkdir -p temp_media
 
-# Production stage
-FROM node:18-alpine
+# 设置环境变量
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
-WORKDIR /app
+# 暴露端口
+EXPOSE 8000
 
-# Install production dependencies
-COPY package*.json ./
-RUN npm ci --only=production && npm cache clean --force
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/monitoring/health || exit 1
 
-# Copy built files from builder
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/src/config/database.sql ./src/config/database.sql
-COPY .env.example .env.example
-
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
-
-USER nodejs
-
-EXPOSE 3000
-
-CMD ["sh", "-c", "npm run migration:run && npm start"]
+# 启动命令
+CMD ["python", "run.py"]
