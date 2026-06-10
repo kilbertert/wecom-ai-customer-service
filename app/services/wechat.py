@@ -663,14 +663,14 @@ class WeChatService:
         except Exception as e:
             raise WeChatAPIError(f"获取用户信息异常: {str(e)}")
 
-    async def process_single_message(self, message: WeChatMessage, coze_service: 'CozeService'):
+    async def process_single_message(self, message: WeChatMessage, ai_service: 'AIService'):
         """处理单条微信消息
-        
+
         Args:
             message: 微信消息对象
-            coze_service: Coze服务实例
+            ai_service: AI 后端服务实例 (CozeService 或 DifyService, 接口同形)
         """
-        from app.services.coze import CozeService
+        from app.services import AIService  # noqa: F401  (用于类型注解)
 
         # 消息去重检查
         msgid = getattr(message, 'msgid', None)
@@ -744,7 +744,7 @@ class WeChatService:
                             # 上传到Coze并获取文件ID
                             file_name = f"wechat_image_{media_id}.jpg"
                             logger.info(f"[图片消息] 开始上传图片到Coze，文件名: {file_name}")
-                            image_file_id = await coze_service.upload_file(image_content, file_name)
+                            image_file_id = await ai_service.upload_file(image_content, file_name)
                             logger.info(f"[图片消息] 图片上传到Coze成功，文件ID: {image_file_id}")
                             
                             input_data['file_image_id'] = image_file_id
@@ -785,7 +785,7 @@ class WeChatService:
                                 # 如果处理失败，使用原始文件
                                 logger.warning("语音格式转换失败，使用原始文件")
                                 file_name = f"wechat_voice_{media_id}.amr"
-                                voice_file_id = await coze_service.upload_file(voice_content, file_name)
+                                voice_file_id = await ai_service.upload_file(voice_content, file_name)
                             else:
                                 # 使用转换后的文件
                                 if media_info.get('converted') and media_info.get('wav_path'):
@@ -793,10 +793,10 @@ class WeChatService:
                                     async with aiofiles.open(media_info['wav_path'], 'rb') as f:
                                         wav_content = await f.read()
                                     file_name = f"wechat_voice_{media_id}.wav"
-                                    voice_file_id = await coze_service.upload_file(wav_content, file_name)
+                                    voice_file_id = await ai_service.upload_file(wav_content, file_name)
                                 else:
                                     file_name = f"wechat_voice_{media_id}.amr"
-                                    voice_file_id = await coze_service.upload_file(voice_content, file_name)
+                                    voice_file_id = await ai_service.upload_file(voice_content, file_name)
                             
                             logger.info(f"语音上传到Coze成功，文件ID: {voice_file_id}")
                             input_data['file_voice_id'] = voice_file_id
@@ -835,7 +835,7 @@ class WeChatService:
             logger.info(f"触发Coze工作流，用户ID: {external_userid}, 输入数据: {input_data}")
             try:
                 
-                workflow_result = await coze_service.run_workflow(input_data, user_id=external_userid)
+                workflow_result = await ai_service.run_workflow(input_data, user_id=external_userid)
                 logger.info("工作流执行成功")
 
                 # 检查数据类型（保留必要的类型检查）

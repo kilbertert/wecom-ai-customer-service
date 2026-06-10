@@ -3,10 +3,10 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
 # 数据验证和配置
-pydantic==2.5.0
-pydantic-settings==2.1.0
+pydantic>=2.7,<3
+pydantic-settings>=2.3,<3
 httpx==0.28.0
-aiofiles==23.2.1
+aiofiles>=24.1.0
 
 # 加密和安全
 cryptography==41.0.7
@@ -41,9 +41,4 @@ pre-commit==3.5.0
 flask==2.3.2
 
 pycryptodome>=3.19.0
-
-<<<<<<< Updated upstream
 psutil>=5.9.0
-=======
-psutil>=5.9.0
->>>>>>> Stashed changes

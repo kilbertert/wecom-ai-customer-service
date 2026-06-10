@@ -13,14 +13,18 @@ class WeChatAPIError(Exception):
         super().__init__(self.message)
 
 
-class CozeAPIError(Exception):
-    """Coze API异常"""
+class AIBackendError(Exception):
+    """AI 后端 (Coze / Dify / ...) 通用异常。"""
 
     def __init__(self, message: str, code: Optional[int] = None, details: Optional[Dict[str, Any]] = None):
         self.message = message
         self.code = code
         self.details = details or {}
         super().__init__(self.message)
+
+
+# 向后兼容:旧名称仍然可用,新代码请用 AIBackendError
+CozeAPIError = AIBackendError
 
 
 class SessionError(Exception):

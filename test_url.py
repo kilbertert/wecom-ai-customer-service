@@ -101,15 +101,15 @@ def check_service():
     print("\n检查本地服务...")
     
     try:
-        response = requests.get("http://localhost:8001/", timeout=2)
+        response = requests.get("http://localhost:8000/", timeout=2)
         if response.status_code == 200:
-            print("✅ 本地服务运行正常 (8001端口)")
+            print("✅ 本地服务运行正常 (8000端口)")
             return True
         else:
             print(f"⚠️  本地服务响应异常: {response.status_code}")
             return False
     except requests.exceptions.ConnectionError:
-        print("❌ 本地服务未运行 (8001端口)")
+        print("❌ 本地服务未运行 (8000端口)")
         print("   请运行: python test_wechat_callback.py")
         return False
     except Exception as e:
@@ -137,12 +137,12 @@ def main():
     if not local_ok:
         print("\n🔧 修复建议:")
         print("1. 启动服务: python test_wechat_callback.py")
-        print("2. 确保服务运行在8001端口")
+        print("2. 确保服务运行在8000端口")
         print("3. 等待服务完全启动后再测试")
     
     if not url_ok:
         print("\n🔧 修复建议:")
-        print("1. 检查ngrok是否运行: ngrok http 8001")
+        print("1. 检查ngrok是否运行: ngrok http 8000")
         print("2. 确认ngrok URL是否已更新")
         print("3. 检查网络连接")
         print("4. 确认服务已启动")

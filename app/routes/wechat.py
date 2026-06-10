@@ -10,7 +10,7 @@ import logging
 
 from app.core.config import settings
 from app.services.wechat import WeChatService
-from app.services.coze import CozeService
+from app.services import get_ai_service
 from app.models.wechat import WeChatSyncRequest, WeChatMessage
 
 logger = logging.getLogger(__name__)
@@ -56,19 +56,18 @@ async def wechat_callback_verify(
             logger.info(f"收到的签名: {msg_signature}")
 
             # 步骤2: 解密echostr并返回明文
+            # 注意：wechatpy 的 check_signature() 只验证签名，不返回解密内容
+            # 所以这里直接用项目里成熟的 decrypt_message_custom 来解密
             logger.info("步骤2: 解密echostr并返回明文...")
             wechat_service = WeChatService()
 
-            # 使用官方SDK的check_signature方法
-            # 该方法会验证签名并返回解密后的echostr
-            decrypted_echostr = wechat_service.crypto.check_signature(
-                msg_signature,
-                timestamp,
-                nonce,
-                echostr
+            decrypted_echostr = wechat_service.decrypt_message_custom(
+                echostr,
+                wechat_service.config.kf_encoding_aes_key,
+                wechat_service.config.corp_id
             )
 
-            logger.info("[SUCCESS] echostr解密成功（官方SDK）")
+            logger.info("[SUCCESS] echostr解密成功")
             logger.info(f"解密后内容: {repr(decrypted_echostr)}")
             logger.info("=" * 60)
 
@@ -333,9 +332,9 @@ async def process_message_background(message_data):
     logger.info(f"[后台任务开始] 开始处理消息: {msgid}")
 
     wechat_service = WeChatService()
-    coze_service = CozeService()
+    ai_service = get_ai_service()
     try:
-        await wechat_service.process_single_message(message_data, coze_service)
+        await wechat_service.process_single_message(message_data, ai_service)
         logger.info(f"[后台任务完成] 后台消息处理完成: {msgid}")
     except Exception as e:
         logger.error(f"[后台任务错误] 后台处理消息失败 {msgid}: {e}")
@@ -349,9 +348,9 @@ async def process_message_background(message_data):
             logger.warning(f"[后台任务清理] 关闭wechat_service失败: {e}")
 
         try:
-            await coze_service.close()
+            await ai_service.close()
         except Exception as e:
-            logger.warning(f"[后台任务清理] 关闭coze_service失败: {e}")
+            logger.warning(f"[后台任务清理] 关闭ai_service失败: {e}")
 
 
 @router.get("/test")

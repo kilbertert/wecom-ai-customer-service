@@ -95,13 +95,44 @@ class CelerySettings(BaseSettings):
         env_prefix = "CELERY_"
 
 
+class DifySettings(BaseSettings):
+    """Dify相关配置"""
+
+    api_base: str = Field("https://api.dify.ai/v1", description="Dify API base URL")
+    api_key: SecretStr = Field(SecretStr("PLACEHOLDER_DIFY_API_KEY"), description="Dify API Key (app-xxx)")
+
+    # Workflow 输入变量名 — 与 Dify 工作流"开始"节点保持一致
+    input_text: str = Field("input_text", description="Workflow 文本输入变量名")
+    input_image: str = Field("input_img_id", description="Workflow 图片输入变量名")
+    input_audio: str = Field("input_audio_id", description="Workflow 语音输入变量名")
+
+    # end-user 标识 (Dify 强制要求)。WeChat 场景下用 external_userid 覆盖
+    end_user_default: str = Field("wechat-default-user", description="Dify end-user 默认标识")
+
+    # 工作流配置
+    workflow_timeout: int = Field(120, description="工作流超时时间(秒) — Dify 较 Coze 慢,默认 120s")
+    upload_timeout: int = Field(60, description="文件上传超时(秒)")
+
+    # 输出变量名 — workflow 结束节点里设置的变量
+    output_text: str = Field("output", description="Workflow 文本输出变量名")
+
+    class Config:
+        env_prefix = "DIFY_"
+        env_file = ".env"
+        env_file_encoding = 'utf-8'
+        extra = "ignore"
+
+
 class AppSettings(BaseSettings):
     """应用配置"""
 
     # 基础配置
-    app_name: str = Field("WeChat Coze Service", description="应用名称")
-    version: str = Field("1.0.0", description="应用版本")
+    app_name: str = Field("WeChat AI Service", description="应用名称")
+    version: str = Field("1.1.0", description="应用版本")
     debug: bool = Field(False, description="调试模式")
+
+    # AI 后端选择: "coze" | "dify"
+    ai_backend: str = Field("coze", description="AI 后端: coze | dify")
 
     # 服务器配置
     host: str = Field("0.0.0.0", description="服务器主机")
@@ -134,6 +165,7 @@ class Settings(BaseSettings):
     # 子配置
     wechat: WeChatSettings = WeChatSettings()
     coze: CozeSettings = CozeSettings()
+    dify: DifySettings = DifySettings()
     redis: RedisSettings = RedisSettings()
     database: DatabaseSettings = DatabaseSettings()
     celery: CelerySettings = CelerySettings()

@@ -17,7 +17,7 @@ from app.core.exceptions import (
     handle_coze_error,
     handle_session_error
 )
-from app.services import WeChatService, CozeService, MediaService
+from app.services import WeChatService, MediaService, get_ai_service
 
 # 配置标准日志
 logging.basicConfig(
@@ -31,21 +31,22 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """应用生命周期管理"""
-    logger.info("Starting WeChat Coze Service (Single-round mode)")
+    backend = (settings.app.ai_backend or "coze").lower()
+    logger.info("Starting WeChat AI Service (Single-round mode, backend=%s)", backend)
 
     # 初始化全局服务 (单轮对话模式，无会话管理)
     app.state.wechat_service = WeChatService()
-    app.state.coze_service = CozeService()
+    app.state.ai_service = get_ai_service()  # CozeService or DifyService
     app.state.media_service = MediaService(app.state.wechat_service)
 
     yield
 
     # 清理资源
-    logger.info("Shutting down WeChat Coze Service")
+    logger.info("Shutting down WeChat AI Service (backend=%s)", backend)
 
     try:
         await app.state.wechat_service.close()
-        await app.state.coze_service.close()
+        await app.state.ai_service.close()
     except Exception as e:
         logger.error("Error during shutdown", error=str(e))
 
@@ -54,7 +55,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title=settings.app.app_name,
     version=settings.app.version,
-    description="微信客服接入Coze智能体",
+    description="微信客服接入AI智能体 (Coze / Dify 可切换)",
     lifespan=lifespan,
     debug=settings.app.debug,
 )
