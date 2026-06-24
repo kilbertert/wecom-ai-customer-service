@@ -223,7 +223,7 @@ async def wechat_callback_handler(
         # 初始化服务（如果还没有创建）
         if 'wechat_service' not in locals():
             wechat_service = WeChatService()
-        coze_service = CozeService()
+        ai_service = get_ai_service()
 
         # 处理event类型消息（主要是kf_msg_or_event事件）
         if msg_type == 'event':
@@ -357,3 +357,203 @@ async def process_message_background(message_data):
 async def test_endpoint():
     """测试接口"""
     return {"status": "ok", "message": "WeChat callback service is running"}
+
+
+# ============================================================================
+# 微信群机器人回调（区别于客服：明文 JSON 协议，无需 AES 解密）
+# ============================================================================
+
+@router.get("/bot/callback")
+async def bot_callback_verify(
+    msg_signature: str = Query(..., description="消息签名(SHA1)"),
+    timestamp: str = Query(..., description="时间戳"),
+    nonce: str = Query(..., description="随机数"),
+    echostr: str = Query(..., description="回显字符串(加密)"),
+):
+    """企业微信智能机器人 URL 验证
+
+    与客服不同: 智能机器人的 echostr 是 AES 加密字符串
+    服务端必须:
+      1) SHA1(sort([token, timestamp, nonce, echostr])) 验签
+      2) AES 解密 echostr (receive_id="", 企业自建)
+      3) 返回解密后的 msg 明文
+    """
+    logger.info(f"[BOT VERIFY] timestamp={timestamp} nonce={nonce} echostr_len={len(echostr)}")
+    try:
+        svc = WeChatService()
+        # 1) 验签（用加密的 echostr 原文参与签名计算）
+        if not svc.verify_bot_signature(msg_signature, timestamp, nonce, echostr):
+            logger.warning("[BOT VERIFY] 签名验证失败")
+            return Response(
+                status_code=403,
+                content="signature verification failed",
+                media_type="text/plain",
+                headers={"Content-Type": "text/plain"},
+            )
+
+        # 2) AES 解密 echostr —— 企业自建智能机器人 receive_id 传空字符串 ""
+        aes_key = svc.config.kf_encoding_aes_key
+        try:
+            plaintext_msg = WeChatService.decrypt_message_custom(
+                echostr, aes_key, ""  # receive_id=""
+            )
+        except Exception as e:
+            logger.error(f"[BOT VERIFY] AES 解密 echostr 失败: {e}")
+            return Response(
+                status_code=500,
+                content=f"decrypt failed: {e}",
+                media_type="text/plain",
+                headers={"Content-Type": "text/plain"},
+            )
+
+        logger.info(f"[BOT VERIFY] 验签+解密通过, 返回明文 (长度 {len(plaintext_msg)})")
+
+        # 3) 返回明文 msg —— 不能加引号/BOM/换行
+        return Response(
+            status_code=200,
+            content=plaintext_msg,
+            media_type="text/plain",
+            headers={"Content-Type": "text/plain"},
+        )
+    except Exception as e:
+        logger.error(f"[BOT VERIFY] 异常: {e}")
+        return Response(
+            status_code=500,
+            content=f"error: {e}",
+            media_type="text/plain",
+            headers={"Content-Type": "text/plain"},
+        )
+
+
+@router.post("/bot/callback")
+async def bot_callback_handler(
+    request: Request,
+    msg_signature: str = Query(..., description="消息签名(SHA1)"),
+    timestamp: str = Query(..., description="时间戳"),
+    nonce: str = Query(..., description="随机数"),
+):
+    """企业微信智能机器人消息回调
+
+    协议关键点（与客服不同）:
+      - POST body 是 JSON `{"encrypt": "B64_..."}`（不是 XML）
+      - 签名: SHA1(sort([token, timestamp, nonce, encrypt_value]))
+      - 解密: AES-256-CBC, receive_id="" (企业自建固定空字符串)
+      - 解密后是 JSON: {msgid, aibotid, chattype, from.userid, msgtype, text.content, response_url, ...}
+      - 异步响应 (response_url): aibot/response 接口只接受 msgtype="markdown"
+        试 text / text嵌套 / markdown 三个格式后确认 markdown 才能 errcode=0
+    """
+    import json as _json
+    import httpx as _httpx
+    body_str = (await request.body()).decode("utf-8", errors="ignore")
+    logger.info(f"[BOT MSG] ts={timestamp} nonce={nonce} body_len={len(body_str)}")
+
+    try:
+        # 1) 解析外部 JSON + 验签
+        try:
+            data = _json.loads(body_str)
+        except _json.JSONDecodeError as e:
+            return Response(status_code=400, content=f"invalid json: {e}")
+        msg_encrypt = (data.get("encrypt") or "").strip()
+        if not msg_encrypt:
+            return Response(status_code=400, content="missing encrypt")
+
+        svc = WeChatService()
+        if not svc.verify_bot_signature(msg_signature, timestamp, nonce, msg_encrypt):
+            return Response(status_code=403, content="signature verification failed")
+        logger.info("[BOT MSG] 签名验证通过")
+
+        # 2) AES 解密 (receive_id="")
+        try:
+            decrypted = WeChatService.decrypt_message_custom(
+                msg_encrypt, svc.config.kf_encoding_aes_key, ""
+            )
+        except Exception as e:
+            logger.error(f"[BOT MSG] AES 解密失败: {e}")
+            return Response(status_code=500, content=f"decrypt failed: {e}")
+
+        # 3) 解析内层 JSON 消息
+        try:
+            msg = _json.loads(decrypted)
+        except _json.JSONDecodeError as e:
+            logger.error(f"[BOT MSG] 内层 JSON 解析失败: {e}")
+            return Response(status_code=500, content=f"invalid decrypted json: {e}")
+
+        from_user = (msg.get("from") or {}).get("userid") or "unknown"
+        msg_type = msg.get("msgtype") or ""
+        msg_id = msg.get("msgid") or ""
+        text_obj = msg.get("text") or {}
+        content = (text_obj.get("content") if isinstance(text_obj, dict) else text_obj) or ""
+        content = str(content).strip()
+        logger.info(f"[BOT MSG] from={from_user} type={msg_type} content_len={len(content)} id={msg_id}")
+
+        # 4) 调 Coze workflow 拿回复
+        if msg_type != "text" or not content:
+            reply_text = "收到不支持的消息类型" if msg_type != "text" else "收到空消息"
+        else:
+            ai = get_ai_service()
+            try:
+                wf = await ai.run_workflow({"text": content, "user_id": from_user}, user_id=from_user)
+                logger.info(f"[BOT MSG] Coze 返回, 键={list(wf.keys()) if isinstance(wf, dict) else type(wf).__name__}")
+                # 提取 reply_content.text.content
+                rc = wf.get("reply_content") if isinstance(wf, dict) else None
+                if isinstance(rc, dict):
+                    tf = rc.get("text") or {}
+                    reply_text = (tf.get("content") if isinstance(tf, dict) else "") or ""
+                else:
+                    reply_text = wf.get("content", "") if isinstance(wf, dict) else ""
+            except Exception as e:
+                logger.error(f"[BOT MSG] Coze 失败: {e}")
+                reply_text = f"AI 处理失败: {e}"
+
+        if not reply_text:
+            reply_text = "（AI 未返回内容）"
+        logger.info(f"[BOT MSG] 回复 ({len(reply_text)} 字符): {reply_text[:80]}")
+
+        # 5) 异步推送 reply_url (msgtype 必须用 markdown)
+        # NOTE: 实测 text / 嵌套text 都返 errcode=40008, 仅 markdown 通过
+        response_url = msg.get("response_url")
+        async_result_errcode = None
+        if response_url:
+            payload = {"msgtype": "markdown", "markdown": {"content": reply_text}}
+            try:
+                async with _httpx.AsyncClient(timeout=15.0) as ac:
+                    r = await ac.post(response_url, json=payload, headers={"Content-Type": "application/json"})
+                try:
+                    async_result_errcode = _json.loads(r.text).get("errcode")
+                except _json.JSONDecodeError:
+                    pass
+                logger.info(f"[BOT MSG] 异步推送: HTTP {r.status_code} errcode={async_result_errcode}")
+            except Exception as e:
+                logger.error(f"[BOT MSG] 异步推送异常: {e}")
+
+        # 6) 同步返回加密 JSON 信封（兜底）
+        sync_envelope = None
+        try:
+            envelope_xml = WeChatService.encrypt_message_custom(
+                reply_xml=_json.dumps({"msgtype": "markdown", "markdown": {"content": reply_text}}, ensure_ascii=False),
+                encoding_aes_key=svc.config.kf_encoding_aes_key,
+                corp_id="",
+                timestamp=timestamp,
+                nonce=nonce,
+                token=svc.config.kf_token,
+            )
+            env_root = ET.fromstring(envelope_xml)
+            sync_envelope = _json.dumps({
+                "encrypt": env_root.findtext("Encrypt"),
+                "msgsignature": env_root.findtext("MsgSignature"),
+                "timestamp": timestamp,
+                "nonce": nonce,
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[BOT MSG] 同步信封构建失败: {e}")
+
+        return Response(
+            status_code=200,
+            content=sync_envelope or "{}",
+            media_type="application/json",
+        )
+    except Exception as e:
+        import traceback
+        logger.error(f"[BOT MSG] 处理异常: {e}\n{traceback.format_exc()}")
+        return Response(status_code=500, content=f"error: {e}")
+        return Response(status_code=500, content=f"error: {e}")

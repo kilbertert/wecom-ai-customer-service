@@ -13,9 +13,24 @@ from app.services.wechat import WeChatService
 from app.services.media import MediaService
 
 # Coze SDK
-from cozepy import COZE_CN_BASE_URL, Coze, TokenAuth
+from cozepy import Coze, TokenAuth
 
 logger = logging.getLogger(__name__)
+
+
+def _coze_base_url() -> str:
+    """根据 .env 的 COZE_API_BASE_URL 返回 Coze API 根地址。
+
+    支持的值：
+      - "https://api.coze.cn"  → 国内站
+      - "https://api.coze.com"  → 海外站
+      - "api.coze.cn" / "api.coze.com"（缺 scheme 时自动补 https://）
+      - 带或不带尾部斜杠都会 strip
+    """
+    raw = (settings.coze.api_base_url or "https://api.coze.cn").strip()
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    return raw.rstrip("/")
 
 
 class CozeService:
@@ -26,9 +41,10 @@ class CozeService:
         self.client = httpx.AsyncClient(timeout=settings.coze.workflow_timeout)
 
         # Coze SDK客户端（保留以防需要其他SDK功能）
+        # base_url 跟随 settings.coze.api_base_url，海外/国内站都兼容
         self.coze_client = Coze(
             auth=TokenAuth(token=settings.coze.api_token.get_secret_value()),
-            base_url=COZE_CN_BASE_URL
+            base_url=_coze_base_url()
         )
 
         self.wechat_service = WeChatService()
@@ -47,95 +63,154 @@ class CozeService:
         return await self.run_workflow(input_data, user_id)
 
     async def run_workflow(self, input_data: Dict[str, Any], user_id: str = "wechat_user") -> Dict[str, Any]:
-        """运行Coze工作流 - 使用run API
+        """运行Coze工作流 - 使用 stream_run API（SSE 流式响应）
 
         Args:
-            input_data: 输入数据，支持多种格式：
-                - {'text': str, 'file_image_id': str, 'file_voice_id': str} (简化格式，会转换为parameters格式)
-                - 其他自定义格式
-            user_id: 用户ID，默认为 wechat_user
+            input_data: 兼容旧字段，目前**不传给新工作流**（新工作流用空 parameters），
+                        保留参数签名以便将来再扩展
+            user_id: 用户ID，目前**不传给新工作流**
 
         Returns:
-            工作流执行结果
-
-        Note:
-            使用run API，直接返回完整响应。
-            简化格式会转换为Coze工作流parameters格式：
-            - 文本: {"text": "消息内容"}
-            - 图片: {"file_image_id": "{\"file_id\":\"文件ID\"}"}
-            - 语音: {"file_voice_id": "{\"file_id\":\"文件ID\"}"}
+            工作流执行结果，统一为下游可识别的格式：
+              - 若 stream 收到 done 事件，其 data 直接透传
+              - 否则聚合 message/answer 事件为 {"reply_content": {"msgtype": "text", "text": {"content": "..."}}}
         """
         if not settings.coze.bot_id:
             raise CozeAPIError("Bot ID未配置，请设置COZE_BOT_ID环境变量")
 
-        # 处理不同的输入格式
-        if isinstance(input_data, dict):
-            # 检查是否为简化输入格式：{'text': str, 'file_image_id': str, 'file_voice_id': str}
-            if any(key in input_data for key in ['text', 'file_image_id', 'file_voice_id']):
-                # 构建Coze工作流所需的parameters格式
-                workflow_input = {}
-                # 处理文本
-                if input_data.get('text'):
-                    workflow_input['text'] = input_data['text']
-                    logger.info(f"设置文本参数: {input_data['text']}")
+        import json
 
-                # 处理图片 - 使用 image 参数，值为JSON字符串格式
-                if input_data.get('file_image_id'):
-                    import json
-                    workflow_input['file_image_id'] = json.dumps({"file_id": input_data['file_image_id']}, ensure_ascii=False)
-                    logger.info(f"设置图片参数 image: {workflow_input['file_image_id']}")
+        url = f"{_coze_base_url()}/v1/workflow/stream_run"
+        headers = {
+            "Authorization": f"Bearer {settings.coze.api_token.get_secret_value()}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        # 当前 Coze 工作流契约：parameters 为空对象
+        payload = {
+            "workflow_id": settings.coze.bot_id,
+            "parameters": {},
+        }
 
-                # 处理语音 - 使用 voice 参数，值为JSON字符串格式
-                if input_data.get('file_voice_id'):
-                    import json
-                    workflow_input['file_voice_id'] = json.dumps({"file_id": input_data['file_voice_id']}, ensure_ascii=False)
-                    logger.info(f"设置语音参数 voice: {workflow_input['file_voice_id']}")
-
-                workflow_input['user_id'] = user_id
-                # 如果没有任何有效参数，提供默认文本
-                if not workflow_input:
-                    workflow_input['text'] = '收到您的消息'
-                    logger.info("使用默认文本参数")
-            else:
-                # 直接使用提供的输入数据
-                workflow_input = input_data
-        else:
-            workflow_input = input_data
+        logger.info(f"使用 stream_run API 调用工作流: workflow_id={settings.coze.bot_id}, base={_coze_base_url()}")
+        logger.info(f"发送工作流请求: {payload}")
 
         try:
-            logger.info(f"使用run API调用工作流: workflow_id={settings.coze.bot_id}")
-            logger.info(f"workflow_input: {workflow_input}")
-            # 构建API请求
-            import json
-            url = "https://api.coze.cn/v1/workflow/run"
-            headers = {
-                "Authorization": f"Bearer {settings.coze.api_token.get_secret_value()}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "workflow_id": settings.coze.bot_id,
-                "parameters": workflow_input
-            }
+            async with self.client.stream("POST", url, headers=headers, json=payload) as response:
+                response.raise_for_status()
 
-            logger.info(f"发送工作流请求: {payload}")
+                events: list = []
+                answer_text = ""
+                done_data = None
+                # 关键修复：Coze 把事件类型放在 SSE 的 `event:` 行里（不在 data JSON 里）
+                # 标准 SSE 格式：event: <type>\ndata: <payload>\n\n
+                # 需要维护当前事件的 type + data 状态，遇到空行才提交
+                cur_evt_type: str = ""
+                cur_evt_id: str = ""
 
-            # 发送HTTP请求（使用json参数发送JSON数据）
-            response = await self.client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
+                def _commit():
+                    """提交当前累积的事件"""
+                    nonlocal cur_evt_type, cur_evt_id, answer_text, done_data, events
+                    if not cur_data_str:
+                        return
+                    if cur_data_str == "[DONE]":
+                        return
+                    try:
+                        data_obj = json.loads(cur_data_str)
+                    except json.JSONDecodeError:
+                        logger.warning(f"SSE data 无法解析: {cur_data_str[:120]}")
+                        return
+                    events.append({"event": cur_evt_type, "id": cur_evt_id, "data": data_obj})
 
-            result_data = response.json()
-            logger.info(f"工作流返回数据: {result_data}")
+                    evt_type = cur_evt_type.lower() if cur_evt_type else ""
+                    evt_data = data_obj if isinstance(data_obj, dict) else {}
 
-            # 处理run API的响应格式（直接返回完整结果）
-            if isinstance(result_data, dict):
-                logger.info("run API调用成功，返回字典格式数据")
-                return result_data
-            else:
-                logger.warning(f"API返回数据类型异常: {type(result_data)}")
-                return {"data": str(result_data) if result_data is not None else ""}
+                    # 每个 SSE 事件用 debug 级别, 默认不打印, 排错时打开
+                    logger.debug(f"SSE event: type={cur_evt_type!r}, data_keys={list(evt_data.keys()) if isinstance(evt_data, dict) else None}")
+
+                    if evt_type == "message":
+                        content = evt_data.get("content")
+                        if content:
+                            if isinstance(content, str):
+                                try:
+                                    parsed = json.loads(content)
+                                    if isinstance(parsed, dict):
+                                        if "output" in parsed:
+                                            answer_text += str(parsed["output"])
+                                        elif "text" in parsed:
+                                            answer_text += str(parsed["text"])
+                                        else:
+                                            answer_text += content
+                                    else:
+                                        answer_text += str(parsed)
+                                except (json.JSONDecodeError, ValueError):
+                                    answer_text += content
+                            else:
+                                answer_text += str(content)
+                    elif evt_type == "done":
+                        done_data = evt_data
+                    elif evt_type == "error":
+                        logger.error(f"SSE error event: {data_obj}")
+                        raise CozeAPIError(f"工作流执行错误: {data_obj}")
+                    elif evt_type == "interrupt":
+                        logger.info(f"工作流被打断（需要外部输入）: {evt_data}")
+
+                cur_data_str: str = ""
+
+                async for line in response.aiter_lines():
+                    line = line.rstrip("\n\r")
+                    if not line:
+                        # 空行 = 事件分隔符，提交当前事件
+                        _commit()
+                        cur_evt_type = ""
+                        cur_evt_id = ""
+                        cur_data_str = ""
+                        if done_data is not None:
+                            break
+                        continue
+                    if line.startswith("event:"):
+                        cur_evt_type = line[6:].strip()
+                    elif line.startswith("data:"):
+                        cur_data_str += line[5:].strip()
+                    elif line.startswith("id:"):
+                        cur_evt_id = line[3:].strip()
+                    # 其他 SSE 字段（retry: 等）忽略
+
+                # 流结束，若还有未提交的事件则提交
+                if cur_data_str:
+                    _commit()
+
+                logger.info(f"stream_run 收到 {len(events)} 个事件, answer 长度={len(answer_text)}, done_data={type(done_data).__name__}")
+
+                # 关键修复：done_data 通常只是 SSE meta（debug_url），不是工作流输出
+                # 真正的回复在 answer_text 里。优先用 answer_text 构造 reply_content
+                if answer_text:
+                    return {
+                        "reply_content": {
+                            "msgtype": "text",
+                            "text": {"content": answer_text},
+                        }
+                    }
+                # 兜底：如果没有任何 message 事件聚合到内容，再用 done_data
+                if isinstance(done_data, dict):
+                    return done_data
+                if done_data is not None:
+                    return {"data": done_data}
+
+                return {
+                    "reply_content": {
+                        "msgtype": "text",
+                        "text": {"content": ""},
+                    }
+                }
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"工作流HTTP请求失败，状态码: {e.response.status_code}, 响应: {e.response.text}")
+            err_body = ""
+            try:
+                err_body = e.response.text[:500]
+            except Exception:
+                pass
+            logger.error(f"工作流HTTP请求失败，状态码: {e.response.status_code}, 响应: {err_body}")
             raise CozeAPIError(f"工作流API请求失败: HTTP {e.response.status_code}")
         except httpx.RequestError as e:
             logger.error(f"工作流网络请求失败: {e}")
@@ -154,7 +229,7 @@ class CozeService:
         Returns:
             文件ID（file_id）
         """
-        url = "https://api.coze.cn/v1/files/upload"
+        url = f"{_coze_base_url()}/v1/files/upload"
 
         # 构建multipart/form-data请求
         files = {

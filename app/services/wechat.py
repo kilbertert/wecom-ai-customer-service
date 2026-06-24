@@ -207,6 +207,32 @@ class WeChatService:
             logger.error(f"签名验证异常: {e}")
             return False
 
+    def verify_bot_signature(self, signature: str, timestamp: str, nonce: str, msg_body: str = "") -> bool:
+        """验证群机器人回调签名
+
+        微信群机器人签名算法: SHA1( sort([token, timestamp, nonce, msg_body]) )
+        消息体明文 JSON,不加密。
+
+        Args:
+            signature: query 参数 msg_signature
+            timestamp: query 参数 timestamp
+            nonce: query 参数 nonce
+            msg_body: 原始 POST body(URL verification 时为 echostr)
+
+        Returns:
+            签名是否匹配
+        """
+        try:
+            token = self.config.kf_token
+            params = [token, timestamp, nonce, msg_body]
+            params.sort()
+            tmp = "".join(params)
+            expected = hashlib.sha1(tmp.encode("utf-8")).hexdigest()
+            return expected == signature
+        except Exception as e:
+            logger.error(f"群机器人签名验证异常: {e}")
+            return False
+
     def decrypt_message(self, encrypted_msg: str, signature: str = "", timestamp: str = "", nonce: str = "") -> str:
         """解密消息"""
         if not self.crypto:
@@ -229,11 +255,11 @@ class WeChatService:
             # 补全=号（43位 -> 44位，能被4整除）
             if len(encoding_aes_key) != 43:
                 raise ValueError(f"EncodingAESKey应该是43位，实际是{len(encoding_aes_key)}位")
-            
+
             aes_key = encoding_aes_key + "="
             key = base64.b64decode(aes_key)
-           
-            
+
+
             # IV是key的前16字节
             iv = key[:16]
             
@@ -334,6 +360,63 @@ class WeChatService:
             print(f"解密过程异常: {e}")
             import traceback
             traceback.print_exc()
+            raise
+
+    @staticmethod
+    def encrypt_message_custom(reply_xml: str, encoding_aes_key: str, corp_id: str, timestamp: str, nonce: str, token: str) -> str:
+        """加密回复并返回 XML 信封
+
+        微信智能机器人/客服的回复格式:
+          <xml>
+             <Encrypt><![CDATA[B64_...]]></Encrypt>
+             <MsgSignature>SHA1(sort([token, timestamp, nonce, encrypt]))</MsgSignature>
+             <TimeStamp>...</TimeStamp>
+             <Nonce>...</Nonce>
+          </xml>
+        其中 encrypt = base64( AES-256-CBC( pkcs7( 16随机 + 4字节len + reply_xml + corp_id ) ) )
+        AES key = base64decode(encoding_aes_key + "="), IV = key[:16]
+        """
+        try:
+            import struct, os
+            if len(encoding_aes_key) != 43:
+                raise ValueError(f"EncodingAESKey 必须是 43 位，实际 {len(encoding_aes_key)}")
+
+            key = base64.b64decode(encoding_aes_key + "=")
+            iv = key[:16]
+
+            rand16 = os.urandom(16)
+            msg_bytes = reply_xml.encode("utf-8")
+            msg_len = struct.pack(">I", len(msg_bytes))
+            corp_bytes = corp_id.encode("utf-8")
+            body = rand16 + msg_len + msg_bytes + corp_bytes
+
+            # PKCS7 填充到 32 字节边界
+            pad_len = 32 - (len(body) % 32)
+            if pad_len == 0:
+                pad_len = 32
+            body = body + bytes([pad_len] * pad_len)
+
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            encrypted = cipher.encrypt(body)
+            encrypt_b64 = base64.b64encode(encrypted).decode("utf-8")
+
+            # 计算 MsgSignature
+            sig_items = sorted([token, timestamp, nonce, encrypt_b64])
+            msg_signature = hashlib.sha1("".join(sig_items).encode("utf-8")).hexdigest()
+
+            envelope = (
+                f"<xml>"
+                f"<Encrypt><![CDATA[{encrypt_b64}]]></Encrypt>"
+                f"<MsgSignature><![CDATA[{msg_signature}]]></MsgSignature>"
+                f"<TimeStamp>{timestamp}</TimeStamp>"
+                f"<Nonce><![CDATA[{nonce}]]></Nonce>"
+                f"</xml>"
+            )
+            return envelope
+        except Exception as e:
+            logger.error(f"encrypt_message_custom 失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
 
     async def get_access_token(self) -> str:
@@ -861,6 +944,18 @@ class WeChatService:
                         logger.info(f"从run API提取到reply_text: '{reply_text}' (长度: {len(reply_text) if reply_text else 0})")
                         logger.info(f"content_type: {workflow_result.get('content_type', 'unknown')}")
                         logger.info(f"node_type: {workflow_result.get('node_type', 'unknown')}")
+
+                    # 兼容 stream_run 的 reply_content 结构（Coze 标准回复格式）
+                    elif 'reply_content' in workflow_result:
+                        rc = workflow_result['reply_content'] or {}
+                        if isinstance(rc, dict):
+                            if rc.get('msgtype') == 'text':
+                                text_obj = rc.get('text') or {}
+                                if isinstance(text_obj, dict):
+                                    reply_text = text_obj.get('content', '')
+                            else:
+                                reply_text = rc.get('content', '')
+                        logger.info(f"从 reply_content 提取到 reply_text: '{reply_text}' (长度: {len(reply_text) if reply_text else 0})")
 
                     # 兼容其他可能的格式
                     elif 'data' in workflow_result:

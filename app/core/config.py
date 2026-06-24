@@ -35,6 +35,9 @@ class CozeSettings(BaseSettings):
     api_token: SecretStr = Field(SecretStr("PLACEHOLDER_COZE_API_TOKEN"), description="Coze API Token")
     bot_id: str = Field("7599886499640147968", description="Coze Bot ID")
 
+    # API 根地址 — 国内站 api.coze.cn / 海外站 api.coze.com
+    api_base_url: str = Field("https://api.coze.cn", description="Coze API base URL")
+
     # 工作流配置
     workflow_timeout: int = Field(30, description="工作流超时时间(秒)")
     max_retries: int = Field(3, description="工作流重试次数")
