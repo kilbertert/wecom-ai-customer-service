@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.exceptions import CozeAPIError
 from app.services.wechat import WeChatService
 from app.services.media import MediaService
+from app.services.multimodal import extract_multimodal_payload
 
 # Coze SDK
 from cozepy import Coze, TokenAuth
@@ -101,6 +102,12 @@ class CozeService:
 
                 events: list = []
                 answer_text = ""
+                # 一期新增: 多模态字段聚合。Coze 工作流可以在"结束节点"自定义输出
+                # JSON, 例如 {"output": "...", "images": [...], "videos": [...], "files": [...]}
+                # 这里把多个 message 事件里的同名数组去重合并。
+                images_list: list = []
+                videos_list: list = []
+                files_list: list = []
                 done_data = None
                 # 关键修复：Coze 把事件类型放在 SSE 的 `event:` 行里（不在 data JSON 里）
                 # 标准 SSE 格式：event: <type>\ndata: <payload>\n\n
@@ -111,6 +118,7 @@ class CozeService:
                 def _commit():
                     """提交当前累积的事件"""
                     nonlocal cur_evt_type, cur_evt_id, answer_text, done_data, events
+                    nonlocal images_list, videos_list, files_list
                     if not cur_data_str:
                         return
                     if cur_data_str == "[DONE]":
@@ -131,22 +139,45 @@ class CozeService:
                     if evt_type == "message":
                         content = evt_data.get("content")
                         if content:
+                            # 一期重做: 把 content 解析成 dict 后调统一的 extract_multimodal_payload
+                            # 该函数内部已支持真实工作流结构:
+                            #   - 顶层 assistant_text (用户工作流实际形态)
+                            #   - 顶层 media 数组 (按 type 分到 images/videos/files)
+                            #   - 顶层 images/videos/files
+                            #   - 嵌套 output 字段 (可能是 <think>{json}</think> 字符串)
                             if isinstance(content, str):
                                 try:
-                                    parsed = json.loads(content)
-                                    if isinstance(parsed, dict):
-                                        if "output" in parsed:
-                                            answer_text += str(parsed["output"])
-                                        elif "text" in parsed:
-                                            answer_text += str(parsed["text"])
-                                        else:
-                                            answer_text += content
-                                    else:
-                                        answer_text += str(parsed)
+                                    parsed_content = json.loads(content)
                                 except (json.JSONDecodeError, ValueError):
-                                    answer_text += content
+                                    parsed_content = {"content": content}
+                            elif isinstance(content, dict):
+                                parsed_content = content
                             else:
-                                answer_text += str(content)
+                                parsed_content = {"content": str(content)}
+
+                            if not isinstance(parsed_content, dict):
+                                parsed_content = {"content": str(parsed_content)}
+
+                            extracted = extract_multimodal_payload(parsed_content)
+
+                            # text: 首个非空文本作为基础, 后续文本追加 (兼容 output 流式分段)
+                            if extracted["text"]:
+                                if not answer_text:
+                                    answer_text = extracted["text"]
+                                else:
+                                    # 流式分段场景: 追加
+                                    answer_text += extracted["text"]
+
+                            # 多模态: 多事件去重合并
+                            for url in extracted["images"]:
+                                if url not in images_list:
+                                    images_list.append(url)
+                            for url in extracted["videos"]:
+                                if url not in videos_list:
+                                    videos_list.append(url)
+                            for url in extracted["files"]:
+                                if url not in files_list:
+                                    files_list.append(url)
                     elif evt_type == "done":
                         done_data = evt_data
                     elif evt_type == "error":
@@ -180,28 +211,61 @@ class CozeService:
                 if cur_data_str:
                     _commit()
 
-                logger.info(f"stream_run 收到 {len(events)} 个事件, answer 长度={len(answer_text)}, done_data={type(done_data).__name__}")
+                logger.info(
+                    f"stream_run 收到 {len(events)} 个事件, answer 长度={len(answer_text)}, "
+                    f"images={len(images_list)}, videos={len(videos_list)}, files={len(files_list)}, "
+                    f"done_data={type(done_data).__name__}"
+                )
 
-                # 关键修复：done_data 通常只是 SSE meta（debug_url），不是工作流输出
-                # 真正的回复在 answer_text 里。优先用 answer_text 构造 reply_content
-                if answer_text:
-                    return {
+                # 一期新增: 即使 answer_text 为空，只要工作流产出了多模态 URL，也照样返回
+                # 因为 markdown 内嵌图片也能"无文本有图"
+                has_text = bool(answer_text)
+                has_multimodal = bool(images_list or videos_list or files_list)
+
+                if has_text or has_multimodal:
+                    result: Dict[str, Any] = {
+                        # 兼容旧字段 (下游 process_single_message / bot_callback_handler 仍按 reply_content 解)
                         "reply_content": {
                             "msgtype": "text",
                             "text": {"content": answer_text},
-                        }
+                        },
+                        # 一期新增: 顶层多模态字段，下游用 compose_multimodal_markdown 拼 markdown
+                        "text": answer_text,
+                        "images": images_list,
+                        "videos": videos_list,
+                        "files": files_list,
                     }
+                    return result
+
                 # 兜底：如果没有任何 message 事件聚合到内容，再用 done_data
+                # 但 done_data 通常只是 SSE meta (debug_url)，不是工作流输出
+                # 仍补上 text/images/videos/files 空字段, 保证下游结构一致
                 if isinstance(done_data, dict):
-                    return done_data
+                    return {
+                        **done_data,
+                        "text": "",
+                        "images": [],
+                        "videos": [],
+                        "files": [],
+                    }
                 if done_data is not None:
-                    return {"data": done_data}
+                    return {
+                        "data": done_data,
+                        "text": "",
+                        "images": [],
+                        "videos": [],
+                        "files": [],
+                    }
 
                 return {
                     "reply_content": {
                         "msgtype": "text",
                         "text": {"content": ""},
-                    }
+                    },
+                    "text": "",
+                    "images": [],
+                    "videos": [],
+                    "files": [],
                 }
 
         except httpx.HTTPStatusError as e:

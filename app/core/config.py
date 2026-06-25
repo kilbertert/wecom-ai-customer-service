@@ -160,6 +160,9 @@ class AppSettings(BaseSettings):
 
     class Config:
         env_prefix = "APP_"
+        env_file = ".env"  # 必需: 否则 APP_* 字段不会从 .env 读取
+        env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class Settings(BaseSettings):

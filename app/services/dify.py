@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.exceptions import AIBackendError  # 通用 AI 后端异常
 from app.services.dify_client import DifyClient, DifyError
 from app.services.response_parser import extract_assistant_text
+from app.services.multimodal import _coerce_url_list
 
 logger = logging.getLogger(__name__)
 
@@ -136,15 +137,29 @@ class DifyService:
         # 构造 workflow inputs
         inputs: Dict[str, Any] = {}
         if isinstance(input_data, dict):
-            if any(k in input_data for k in ("text", "file_image_id", "file_voice_id")):
+            if any(k in input_data for k in ("text", "file_image_id", "file_image_url", "file_voice_id", "file_voice_url")):
                 if input_data.get("text"):
                     inputs[settings.dify.input_text] = input_data["text"]
-                if input_data.get("file_image_id"):
-                    # Dify 文件型输入必须是数组,即使只有一个文件
+                # 一期改造: 优先 file_image_url (Dify remote_url 模式, 跳过 /v1/files/upload)
+                if input_data.get("file_image_url"):
+                    inputs[settings.dify.input_image] = [{
+                        "type": "image",
+                        "transfer_method": "remote_url",
+                        "url": input_data["file_image_url"],
+                    }]
+                elif input_data.get("file_image_id"):
+                    # 兼容旧 local_file 模式 (实测 Dify v7 拒, 但保留以防 v8 修复)
                     inputs[settings.dify.input_image] = [
                         client.file_ref(str(input_data["file_image_id"]), "image")
                     ]
-                if input_data.get("file_voice_id"):
+                # 同样支持 voice 的 remote_url / local_file 双模式
+                if input_data.get("file_voice_url"):
+                    inputs[settings.dify.input_audio] = [{
+                        "type": "audio",
+                        "transfer_method": "remote_url",
+                        "url": input_data["file_voice_url"],
+                    }]
+                elif input_data.get("file_voice_id"):
                     inputs[settings.dify.input_audio] = [
                         client.file_ref(str(input_data["file_voice_id"]), "audio")
                     ]
@@ -160,6 +175,9 @@ class DifyService:
             inputs[settings.dify.input_text] = "收到您的消息"
 
         logger.info("Dify workflow inputs keys=%s", list(inputs.keys()))
+        # DEBUG: dump 实际发送给 Dify 的 inputs (诊断 input_img_id 格式)
+        import json as _json
+        logger.warning(f"[DIAG] inputs payload: {_json.dumps(inputs, ensure_ascii=False)[:500]}")
 
         # 调用 workflow
         try:
@@ -173,13 +191,52 @@ class DifyService:
             "Dify workflow 成功: assistant_text_len=%d",
             len(assistant_text) if assistant_text else 0,
         )
+        # 一期诊断: dump raw 头尾到日志, 看真实结构
+        try:
+            raw_str = json.dumps(raw, ensure_ascii=False)
+            logger.warning(
+                "DIAG raw head (300): %s",
+                raw_str[:300].replace("\n", " "),
+            )
+            logger.warning(
+                "DIAG raw tail (300): %s",
+                raw_str[-300:].replace("\n", " "),
+            )
+            # 检查 output 字段的真实形态
+            outputs_check = ((raw or {}).get("data") or {}).get("outputs") or {}
+            for k, v in outputs_check.items():
+                v_str = str(v)
+                logger.warning(
+                    "DIAG outputs[%s] type=%s len=%d head=%.120s",
+                    k, type(v).__name__, len(v_str), v_str[:120].replace("\n", " "),
+                )
+        except Exception as diag_err:
+            logger.error(f"DIAG 失败: {diag_err}")
+
+        # 一期新增: 从 Dify 工作流 outputs 节点提取多模态字段。
+        # Dify 工作流结束节点声明 images/videos/files (Array[String]) 后,
+        # 响应 raw["data"]["outputs"]["images"] 等就是 URL 数组。
+        outputs = ((raw or {}).get("data") or {}).get("outputs") or {}
+        images = _coerce_url_list(outputs.get("images"))
+        videos = _coerce_url_list(outputs.get("videos"))
+        files = _coerce_url_list(outputs.get("files"))
+        if images or videos or files:
+            logger.info(
+                "Dify 多模态字段: images=%d, videos=%d, files=%d",
+                len(images), len(videos), len(files),
+            )
 
         # 归一化成 Coze-like 形态,让 WeChatService 既有的解析逻辑 (content / data 字段)
-        # 无差别工作。
+        # 无差别工作。同时携带顶层多模态字段,供 compose_multimodal_markdown 使用。
         return {
             "content": assistant_text,
             "content_type": "text",
             "node_type": "dify_workflow",
+            # 一期新增: 顶层多模态字段
+            "text": assistant_text,
+            "images": images,
+            "videos": videos,
+            "files": files,
             "raw": raw,
         }
 

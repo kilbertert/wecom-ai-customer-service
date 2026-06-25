@@ -36,6 +36,7 @@ from app.models.wechat import (
     MessageType,
 )
 from app.core.exceptions import WeChatAPIError
+from app.services.multimodal import compose_multimodal_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -932,60 +933,24 @@ class WeChatService:
                         logger.error(f"JSON解析失败: {e}")
                         return
 
-                # 提取工作流返回的文本内容并发送回微信客服
+                # 提取工作流返回的内容并发送回微信客服
                 logger.info(f"最终检查workflow_result类型: {type(workflow_result)}, 是否为dict: {isinstance(workflow_result, dict)}")
                 if isinstance(workflow_result, dict):
                     logger.info(f"workflow_result包含的键: {list(workflow_result.keys())}")
 
-                    # 处理run API的响应格式
-                    if 'content' in workflow_result:
-                        # 直接从content字段提取回复内容
-                        reply_text = workflow_result['content']
-                        logger.info(f"从run API提取到reply_text: '{reply_text}' (长度: {len(reply_text) if reply_text else 0})")
-                        logger.info(f"content_type: {workflow_result.get('content_type', 'unknown')}")
-                        logger.info(f"node_type: {workflow_result.get('node_type', 'unknown')}")
-
-                    # 兼容 stream_run 的 reply_content 结构（Coze 标准回复格式）
-                    elif 'reply_content' in workflow_result:
-                        rc = workflow_result['reply_content'] or {}
-                        if isinstance(rc, dict):
-                            if rc.get('msgtype') == 'text':
-                                text_obj = rc.get('text') or {}
-                                if isinstance(text_obj, dict):
-                                    reply_text = text_obj.get('content', '')
-                            else:
-                                reply_text = rc.get('content', '')
-                        logger.info(f"从 reply_content 提取到 reply_text: '{reply_text}' (长度: {len(reply_text) if reply_text else 0})")
-
-                    # 兼容其他可能的格式
-                    elif 'data' in workflow_result:
-                        raw_data = workflow_result['data']
-                        logger.info(f"原始data字段: '{raw_data}' (类型: {type(raw_data)})")
-
-                        # 如果data是字符串，尝试解析JSON
-                        if isinstance(raw_data, str):
-                            try:
-                                import json
-                                parsed_data = json.loads(raw_data)
-                                logger.info(f"解析JSON成功: {parsed_data}")
-
-                                # 从解析结果中提取实际的回复内容
-                                if isinstance(parsed_data, dict) and 'data' in parsed_data:
-                                    reply_text = parsed_data['data']
-                                    logger.info(f"提取到reply_text: '{reply_text}' (长度: {len(reply_text) if reply_text else 0})")
-                                else:
-                                    logger.warning(f"解析结果中没有data字段: {parsed_data}")
-                                    reply_text = str(parsed_data)
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"JSON解析失败，使用原始字符串: {e}")
-                                reply_text = raw_data
-                        else:
-                            # 如果data不是字符串，直接使用
-                            reply_text = str(raw_data)
-                            logger.info(f"data不是字符串，直接使用: '{reply_text}'")
+                    # 一期改造: 用 compose_multimodal_markdown 统一从工作流结果里
+                    # 提取 text + 自动把 images/videos/files 数组拼成 markdown 图片语法
+                    # (兼容旧的 content / reply_content / data 字段)
+                    reply_text = compose_multimodal_markdown(workflow_result)
+                    if reply_text:
+                        logger.info(
+                            f"composed markdown 长度={len(reply_text)}, "
+                            f"images={len(workflow_result.get('images', []))}, "
+                            f"videos={len(workflow_result.get('videos', []))}, "
+                            f"files={len(workflow_result.get('files', []))}"
+                        )
                     else:
-                        logger.warning(f"workflow_result中没有找到content或data字段: {workflow_result}")
-                        reply_text = ""
+                        logger.warning(f"工作流返回的内容为空: {workflow_result}")
 
                     if reply_text and reply_text.strip():
                         # 检查是否已经发送过回复（防止重复发送）
@@ -1005,6 +970,8 @@ class WeChatService:
                                 # 再次确认reply_text的值
                                 logger.info(f"准备发送内容类型: {type(reply_text)}, 值: {repr(reply_text[:100])}")
                                 # 发送回复消息回微信客服
+                                # 一期: 用 text msgtype 发送 markdown 文本（含内嵌图片 URL）
+                                # 二期: 改成 native 多模态 (image/voice/video/file msgtype + media_id)
                                 logger.info(f"发送回复消息到微信客服，用户: {external_userid}, 客服: {open_kfid}, 内容: {reply_text[:50]}...")
                                 send_result = await self.send_message_simple(external_userid, open_kfid, reply_text)
                                 logger.info(f"回复消息发送成功: {msgid}")
