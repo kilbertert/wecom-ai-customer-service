@@ -1,7 +1,6 @@
 """微信服务模块"""
-import time
 import traceback
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 import httpx
 import logging
 from datetime import datetime, timedelta
@@ -9,9 +8,7 @@ import asyncio
 
 # 微信客服官方SDK
 from wechatpy.enterprise.crypto import WeChatCrypto
-from wechatpy.exceptions import InvalidSignatureException
 from wechatpy.enterprise import WeChatClient
-from wechatpy.session.memorystorage import MemoryStorage
 
 from app.core.config import settings
 
@@ -21,8 +18,6 @@ from app.models.wechat import (
     WeChatSyncRequest,
     WeChatSyncResponse,
     WeChatSendMessage,
-    WeChatTokenResponse,
-    MessageType,
 )
 from app.core.exceptions import WeChatAPIError
 

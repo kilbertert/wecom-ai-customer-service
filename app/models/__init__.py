@@ -14,5 +14,4 @@ __all__ = [
     # Coze models
     "CozeWorkflowInput",
     "CozeWorkflowOutput",
-    "IntentType",
 ]

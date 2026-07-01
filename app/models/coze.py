@@ -1,17 +1,7 @@
 """Coze相关数据模型"""
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any
 from enum import Enum
 from pydantic import BaseModel, Field
-
-
-class IntentType(str, Enum):
-    """意图类型枚举"""
-    PRE_SALE = "售前问题"
-    AFTER_SALE = "售后问题"
-    FUNCTION_CONSULT = "功能咨询"
-    COMPLAINT = "投诉"
-    CHAT = "闲聊问候"
-    OTHER = "其他"
 
 
 class ActionType(str, Enum):
@@ -44,28 +34,4 @@ class CozeWorkflowOutput(BaseModel):
 
     class Config:
         use_enum_values = True
-
-
-class IntentResult(BaseModel):
-    """意图识别结果"""
-    intent_type: IntentType = Field(..., description="意图类型")
-    confidence: float = Field(..., description="置信度")
-    keywords: List[str] = Field(default_factory=list, description="关键词")
-
-    class Config:
-        use_enum_values = True
-
-
-class TransferResult(BaseModel):
-    """转人工判断结果"""
-    need_transfer: bool = Field(..., description="是否需要转人工")
-    score: int = Field(..., description="评分")
-    reason: str = Field("", description="原因")
-
-
-class KnowledgeSearchResult(BaseModel):
-    """知识库检索结果"""
-    documents: List[Dict[str, Any]] = Field(default_factory=list, description="检索到的文档")
-    total_count: int = Field(0, description="总数量")
-    search_time: float = Field(0.0, description="检索时间")
 
