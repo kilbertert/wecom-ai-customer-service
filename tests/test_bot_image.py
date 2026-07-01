@@ -21,16 +21,13 @@ class TestUploadToDifyFileStore:
 
         mock_client = MagicMock(spec=DifyClient)
         mock_client.upload_file = AsyncMock(return_value=fake_dify_id)
+        mock_ai = MagicMock()
+        mock_ai.client = mock_client
 
-        with patch("app.routes.wechat.get_ai_service") as mock_get_ai:
-            mock_ai = MagicMock()
-            mock_ai.client = mock_client
-            mock_get_ai.return_value = mock_ai
-
-            from app.routes.wechat import _upload_to_dify_file_store
-            result = await _upload_to_dify_file_store(
-                fake_bytes, "wechat_media_xxx", "image",
-            )
+        from app.services.message_processor import _upload_to_dify_file_store
+        result = await _upload_to_dify_file_store(
+            mock_ai, fake_bytes, "wechat_media_xxx", "image",
+        )
 
         assert result == fake_dify_id
         mock_client.upload_file.assert_called_once()
@@ -47,16 +44,13 @@ class TestUploadToDifyFileStore:
 
         mock_client = MagicMock(spec=DifyClient)
         mock_client.upload_file = AsyncMock(return_value=fake_dify_id)
+        mock_ai = MagicMock()
+        mock_ai.client = mock_client
 
-        with patch("app.routes.wechat.get_ai_service") as mock_get_ai:
-            mock_ai = MagicMock()
-            mock_ai.client = mock_client
-            mock_get_ai.return_value = mock_ai
-
-            from app.routes.wechat import _upload_to_dify_file_store
-            result = await _upload_to_dify_file_store(
-                fake_bytes, "wechat_voice_yyy", "audio",
-            )
+        from app.services.message_processor import _upload_to_dify_file_store
+        result = await _upload_to_dify_file_store(
+            mock_ai, fake_bytes, "wechat_voice_yyy", "audio",
+        )
 
         assert result == fake_dify_id
         call_kwargs = mock_client.upload_file.call_args.kwargs
@@ -66,13 +60,11 @@ class TestUploadToDifyFileStore:
     @pytest.mark.asyncio
     async def test_raises_when_no_client(self):
         """非 Dify 后端 (无 client.upload_file) 应抛 RuntimeError"""
-        with patch("app.routes.wechat.get_ai_service") as mock_get_ai:
-            mock_ai = MagicMock(spec=[])  # 没有 client 属性
-            mock_get_ai.return_value = mock_ai
+        mock_ai = MagicMock(spec=[])  # 没有 client 属性
 
-            from app.routes.wechat import _upload_to_dify_file_store
-            with pytest.raises(RuntimeError, match="不支持文件上传"):
-                await _upload_to_dify_file_store(b"x", "m", "image")
+        from app.services.message_processor import _upload_to_dify_file_store
+        with pytest.raises(RuntimeError, match="不支持文件上传"):
+            await _upload_to_dify_file_store(mock_ai, b"x", "m", "image")
 
 
 # ---------------------------------------------------------------------------

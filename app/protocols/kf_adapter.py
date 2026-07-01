@@ -163,10 +163,16 @@ class KfAdapter(ProtocolAdapter):
         )
         return [inbound]
 
-    async def send(self, inbound: InboundMessage, reply: OutboundReply) -> bool:
+    async def send(
+        self,
+        inbound: InboundMessage,
+        reply: OutboundReply,
+        trace: Any = None,
+    ) -> bool:
         """通过 ``send_kf_msg`` 把回复文本发回客户。
 
         KF 当前用 ``msgtype=text`` 发送 markdown 文本 (含内嵌图片 URL)。
+        ``trace`` 参数仅为与 ``BotAdapter.send`` 同形, KF 路径忽略。
         """
         if not inbound.open_kfid:
             logger.warning("[KF] inbound 缺少 open_kfid, 无法发送回复")

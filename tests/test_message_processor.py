@@ -42,7 +42,7 @@ class _FakeAdapter(ProtocolAdapter):
     async def receive(self, request):
         return []
 
-    async def send(self, inbound, reply):
+    async def send(self, inbound, reply, trace=None):
         self.sent.append((inbound, reply))
         return self.send_ok
 
@@ -291,3 +291,126 @@ async def test_empty_workflow_result_skips_send():
 
     await proc.process(_inbound(text="hi"), adapter)
     assert adapter.sent == []
+
+
+# ---------------------------------------------------------------------------
+# bot flow (trace + canned reply + conversation_id)
+# ---------------------------------------------------------------------------
+
+
+def _bot_inbound(msgid="bm1", msg_type="text", text="hi", **kw):
+    base = dict(
+        protocol="bot", msgid=msgid, msg_type=msg_type, text=text,
+        user_id="bot_u", response_url="https://r/x",
+    )
+    base.update(kw)
+    return InboundMessage(**base)
+
+
+async def test_bot_text_flow_emits_trace_and_sends():
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    # adapter.send is _FakeAdapter.send (no trace rendering, just records)
+    await proc.process(_bot_inbound(text="你好"), adapter)
+    ai.run_workflow.assert_awaited_once()
+    # bot scope = "bot"
+    assert await conv.get("bot_u", "bot") is None  # ai returned no conversation_id
+    assert len(adapter.sent) == 1
+
+
+async def test_bot_conversation_id_persisted_under_bot_scope():
+    proc, ai, wechat, media, conv = _make_processor()
+    ai.run_workflow = AsyncMock(
+        return_value={"content": "r", "text": "r", "conversation_id": "bot-conv-1"}
+    )
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    await proc.process(_bot_inbound(msgid="b1", text="第一轮"), adapter)
+    assert await conv.get("bot_u", "bot") == "bot-conv-1"
+    ai.run_workflow.reset_mock()
+    await proc.process(_bot_inbound(msgid="b2", text="第二轮"), adapter)
+    assert ai.run_workflow.await_args.kwargs["conversation_id"] == "bot-conv-1"
+
+
+async def test_bot_unsupported_msg_type_sends_canned_reply():
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    await proc.process(_bot_inbound(msg_type="video", text=""), adapter)
+    ai.run_workflow.assert_not_awaited()
+    # canned reply sent
+    assert len(adapter.sent) == 1
+    assert "不支持" in adapter.sent[0][1].text
+
+
+async def test_bot_empty_text_mixed_sends_canned_reply():
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    await proc.process(_bot_inbound(msg_type="mixed", text="", media_ref=""), adapter)
+    ai.run_workflow.assert_not_awaited()
+    assert "空消息" in adapter.sent[0][1].text
+
+
+async def test_bot_image_url_uses_remote_url_no_download():
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    inbound = _bot_inbound(
+        msg_type="image", text="",
+        media_ref="https://cdn/x.jpg", media_kind="url",
+    )
+    await proc.process(inbound, adapter)
+    wechat.download_media.assert_not_awaited()  # url 模式不下载
+    sent_input = ai.run_workflow.await_args.args[0]
+    assert sent_input["file_image_url"] == "https://cdn/x.jpg"
+    assert "file_image_id" not in sent_input
+    # bot image 无文本时给 hint
+    assert sent_input["text"] == "[用户发了一张图片]"
+
+
+async def test_bot_image_media_id_downloads_and_uploads_via_client():
+    proc, ai, wechat, media, conv = _make_processor()
+    # bot 用 ai.client.upload_file (不是 ai.upload_file)
+    client = MagicMock()
+    client.upload_file = AsyncMock(return_value="dify-img-uuid")
+    ai.client = client
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    inbound = _bot_inbound(
+        msg_type="image", text="",
+        media_ref="img_mid_1", media_kind="media_id",
+    )
+    await proc.process(inbound, adapter)
+    wechat.download_media.assert_awaited_once_with("img_mid_1")
+    client.upload_file.assert_awaited_once()
+    sent_input = ai.run_workflow.await_args.args[0]
+    assert sent_input["file_image_id"] == "dify-img-uuid"
+    # 文件名带 wechat_image_ 前缀
+    fname = client.upload_file.await_args.kwargs["filename"]
+    assert fname.startswith("wechat_image_") and fname.endswith(".jpg")
+
+
+async def test_bot_empty_ai_reply_uses_fallback():
+    proc, ai, wechat, media, conv = _make_processor()
+    ai.run_workflow = AsyncMock(return_value={"content": "", "text": ""})
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    await proc.process(_bot_inbound(text="hi"), adapter)
+    assert adapter.sent[0][1].text == "（AI 未返回内容）"
+
+
+async def test_bot_does_not_notify_chatwoot():
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    with patch(
+        "app.services.chatwoot_sync_service.ChatwootSyncService"
+    ) as cw_cls:
+        sync_mock = MagicMock()
+        sync_mock.notify_incoming = AsyncMock()
+        sync_mock.aclose = AsyncMock()
+        cw_cls.return_value = sync_mock
+        await proc.process(_bot_inbound(text="hi"), adapter)
+    sync_mock.notify_incoming.assert_not_awaited()

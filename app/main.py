@@ -19,6 +19,7 @@ from app.core.exceptions import (
 )
 from app.protocols.base import InMemoryDedupStore
 from app.protocols.kf_adapter import KfAdapter
+from app.protocols.bot_adapter import BotAdapter
 from app.services import WeChatService, MediaService, get_ai_service
 from app.services.conversation_store import create_conversation_store
 from app.services.message_processor import MessageProcessor
@@ -54,6 +55,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         conversation_store=app.state.conversation_store,
     )
     app.state.kf_adapter = KfAdapter(
+        app.state.wechat_service, app.state.dedup_store
+    )
+    app.state.bot_adapter = BotAdapter(
         app.state.wechat_service, app.state.dedup_store
     )
 

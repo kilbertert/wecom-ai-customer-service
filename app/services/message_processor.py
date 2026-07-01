@@ -1,18 +1,18 @@
 """协议无关的消息编排器 (MessageProcessor)。
 
-从历史 ``WeChatService.process_single_message`` 与 route 层
-``_process_bot_message_background`` 提取出与协议无关的编排主干::
+把 KF (历史 ``WeChatService.process_single_message``) 与智能机器人 (历史 route
+``_process_bot_message_background``) 两条编排主干统一到一个协议无关的流程::
 
     dedup → 媒体下载/上传 → ConversationStore.get(conversation_id)
            → ai.run_workflow(conversation_id=...) → ConversationStore.save
-           → compose_multimodal_markdown → adapter.send → Chatwoot notify
+           → compose_multimodal_markdown → adapter.send → (KF) Chatwoot notify
 
-协议特定动作 (验签/解密/拉取/投递/同步 ACK) 全部委托给 :class:`ProtocolAdapter`,
-本类只消费 ``InboundMessage`` / ``OutboundReply``, 新增协议无需改编排器。
+协议特定动作 (验签/解密/拉取/投递/同步 ACK) 委托 :class:`ProtocolAdapter`。
+智能机器人独有的 9 阶段决策日志 (BotTrace) 在本类内按 ``inbound.protocol=="bot"``
+门控发射 —— 这是计划中明确保留的"adapter/trace 差异"。
 
 设计约束 (与 CLAUDE.md 一致):
-    - 不引入会话历史存储; ``ConversationStore`` 仅存一个 conversation_id 字符串
-      供 Dify chatflow 续接, 记忆由 Dify / Chatwoot 侧持有。
+    - 不引入会话历史存储; ``ConversationStore`` 仅存 conversation_id 字符串。
     - 去重委托共享 :class:`DedupStore`, 默认 InMemory (单 worker)。
     - 不在编排器内关闭共享服务实例 (wechat/ai/media 由 lifespan 管理)。
 """
@@ -20,24 +20,40 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from app.protocols.base import InboundMessage, OutboundReply, ProtocolAdapter
+from app.services.bot_trace import (
+    BotTrace,
+    format_knowledge_lines,
+    format_thinking_lines,
+)
 from app.services.conversation_store import ConversationStore
 from app.services.multimodal import compose_multimodal_markdown
+from app.services.trace_extract import extract_knowledge, extract_thinking
 
 logger = logging.getLogger(__name__)
 
+# bot 支持的消息类型
+_BOT_SUPPORTED_TYPES = ("text", "image", "voice", "mixed")
+
+
+@dataclass(frozen=True)
+class PreparedInput:
+    """``_prepare_input`` 的返回。
+
+    - ``input_data`` 非空 → 正常调 AI 工作流
+    - ``canned_reply`` 非空 → 跳过 AI, 直接回该文案 (bot 不支持/空消息)
+    - 两者皆空 → 跳过 (KF 空内容, 不回执)
+    """
+
+    input_data: Optional[dict] = None
+    canned_reply: str = ""
+
 
 class MessageProcessor:
-    """协议无关的消息编排器。
-
-    Args:
-        wechat_service: 共享 WeChatService (用于 download_media 等 KF 媒体下载)
-        media_service:  共享 MediaService (语音 AMR→WAV 转码)
-        ai_service:     共享 AI 后端 (Coze / Dify), 实现 upload_file / run_workflow
-        conversation_store: 薄 conversation_id 映射
-    """
+    """协议无关的消息编排器 (KF + 智能机器人)。"""
 
     def __init__(
         self,
@@ -59,131 +75,189 @@ class MessageProcessor:
         任何异常都被捕获并记录, 不抛出 (后台任务无人 await)。
         """
         msgid = inbound.msgid or "unknown"
-        logger.info("[PROC] 开始处理: protocol=%s msgid=%s type=%s",
-                    inbound.protocol, msgid, inbound.msg_type)
+        is_bot = inbound.protocol == "bot"
+        logger.info(
+            "[PROC] 开始处理: protocol=%s msgid=%s type=%s",
+            inbound.protocol, msgid, inbound.msg_type,
+        )
+
+        # bot 决策日志 (可拔插, 默认 off — 渲染由 adapter.send 按 trace_mode 决定)
+        trace: Optional[BotTrace] = None
+        if is_bot:
+            trace = BotTrace(
+                chat_type=inbound.chat_type, msg_type=inbound.msg_type
+            )
+            trace.event(
+                "receive", "ok", f"from={inbound.user_id} id={msgid[:12]}"
+            )
 
         dedup = adapter.dedup
         ttl = getattr(adapter, "dedup_ttl", 300)
 
-        # 1) 去重: 占有处理权
+        # 1) 去重
         acquired = await dedup.acquire(msgid, ttl)
         if not acquired:
             logger.info("[PROC] msgid=%s 已处理过/处理中, 跳过", msgid)
             return
+        if trace is not None:
+            trace.event("dedup", "ok", "首次处理")
 
         try:
-            # 2) 媒体编排 → input_data
-            input_data = await self._prepare_input(inbound)
-            if not input_data:
-                logger.info("[PROC] msgid=%s 无有效内容, 跳过工作流", msgid)
-                # 标记完成, 防止重试风暴 (与历史行为一致)
+            # 2) 媒体编排 + 预过滤 → input_data 或 canned_reply
+            prepared = await self._prepare_input(inbound, trace)
+            if not prepared.input_data and not prepared.canned_reply:
+                logger.info("[PROC] msgid=%s 无有效内容, 跳过", msgid)
                 await dedup.mark_done(msgid)
                 return
-
-            # 内容准备成功 → 标记已处理 (即使后续工作流失败也不重试, 避免风暴)
             await dedup.mark_done(msgid)
 
-            # 3) conversation_id 续接 (薄映射, Dify chatflow 多轮)
-            scope = inbound.open_kfid or ("bot" if inbound.protocol == "bot" else "kf")
-            conversation_id = await self._conv.get(inbound.user_id, scope)
-
-            # 4) 调 AI 工作流
-            try:
-                wf = await self._ai.run_workflow(
-                    input_data,
-                    user_id=inbound.user_id,
-                    conversation_id=conversation_id,
+            reply_text = ""
+            if prepared.canned_reply:
+                # bot 不支持/空消息: 跳过 AI, 直接回 canned (trace skip 已发射)
+                reply_text = prepared.canned_reply
+            else:
+                # 3) conversation_id 续接 (薄映射, Dify chatflow 多轮)
+                scope = (
+                    "bot" if is_bot else (inbound.open_kfid or "kf")
                 )
-            except Exception as e:
-                logger.error("[PROC] AI 工作流失败: msgid=%s, %s", msgid, e)
-                return
+                conversation_id = await self._conv.get(
+                    inbound.user_id, scope
+                )
 
-            # 持久化新 conversation_id (Dify chatflow 返回)
-            if isinstance(wf, dict):
-                new_conv = wf.get("conversation_id") or ""
-                if new_conv:
-                    await self._conv.save(inbound.user_id, scope, new_conv)
+                # 4) 调 AI 工作流
+                try:
+                    wf = await self._ai.run_workflow(
+                        prepared.input_data,
+                        user_id=inbound.user_id,
+                        conversation_id=conversation_id,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "[PROC] AI 工作流失败: msgid=%s, %s", msgid, e
+                    )
+                    if trace is not None:
+                        trace.event("knowledge", "skip", "无知识库检索")
+                        trace.event("thinking", "skip", "无思考过程")
+                        trace.event("ai", "fail", str(e)[:80])
+                    reply_text = f"AI 处理失败: {e}"
 
-            # 5) 组装回复 markdown
-            reply_text = compose_multimodal_markdown(wf) if isinstance(wf, dict) else ""
+                else:
+                    # 持久化新 conversation_id
+                    if isinstance(wf, dict):
+                        new_conv = wf.get("conversation_id") or ""
+                        if new_conv:
+                            await self._conv.save(
+                                inbound.user_id, scope, new_conv
+                            )
+                    # bot: 知识库 / 思考阶段 trace
+                    if trace is not None and isinstance(wf, dict):
+                        self._trace_kb_thinking(trace, wf)
+                        ai_detail = self._ai_detail(wf)
+                        trace.event("ai", "ok", ai_detail)
+
+                    reply_text = (
+                        compose_multimodal_markdown(wf)
+                        if isinstance(wf, dict)
+                        else ""
+                    )
+
+            # 5) 空回复兜底
             if not reply_text or not reply_text.strip():
-                logger.warning("[PROC] msgid=%s 工作流返回空内容", msgid)
-                return
+                if is_bot:
+                    reply_text = "（AI 未返回内容）"
+                else:
+                    logger.warning(
+                        "[PROC] msgid=%s 工作流返回空内容, 跳过发送", msgid
+                    )
+                    return
 
             # 6) 发送去重 + 投递
             if not await dedup.mark_sent(msgid):
                 logger.info("[PROC] msgid=%s 回复已发送过, 跳过", msgid)
                 return
 
-            sent_ok = await adapter.send(inbound, OutboundReply(text=reply_text))
+            sent_ok = await adapter.send(
+                inbound, OutboundReply(text=reply_text), trace=trace
+            )
             if not sent_ok:
                 logger.warning("[PROC] msgid=%s 回复投递失败", msgid)
                 return
 
-            # 7) Chatwoot 同步 (KF 路径, 把 AI 回复同步到人工侧)
-            if inbound.protocol == "kf" and inbound.open_kfid:
+            # 7) Chatwoot 同步 (仅 KF: 把 AI 回复同步到人工侧)
+            if not is_bot and inbound.open_kfid:
                 await self._chatwoot_notify(inbound, reply_text)
 
             logger.info("[PROC] 完成: msgid=%s", msgid)
 
         except Exception as e:
-            logger.error("[PROC] 编排异常: msgid=%s, %s", msgid, e, exc_info=True)
-            # 失败时释放"处理中"标记, 允许重试 (mark_done 未到则不影响)
+            logger.error(
+                "[PROC] 编排异常: msgid=%s, %s", msgid, e, exc_info=True
+            )
             await dedup.release_processing(msgid)
 
     # ------------------------------------------------------------------
-    # 媒体编排: InboundMessage → AI input_data
+    # 媒体编排 + 预过滤: InboundMessage → PreparedInput
     # ------------------------------------------------------------------
-    async def _prepare_input(self, inbound: InboundMessage) -> Optional[dict]:
-        """把入站消息转成 AI 工作流输入。
+    async def _prepare_input(
+        self, inbound: InboundMessage, trace: Optional[BotTrace]
+    ) -> PreparedInput:
+        if inbound.protocol == "bot":
+            return await self._prepare_bot_input(inbound, trace)
+        return await self._prepare_kf_input(inbound)
+
+    # ---- KF ----
+    async def _prepare_kf_input(self, inbound: InboundMessage) -> PreparedInput:
+        """KF 媒体编排 (历史 process_single_message 行为)。
 
         text: 直接取 text
         image: download_media → ai.upload_file → file_image_id
         voice: MediaService 转码 → ai.upload_file → file_voice_id
-
-        不支持/空内容返回 None。
         """
         input_data: dict = {"user_id": inbound.user_id}
         mt = inbound.msg_type
 
         if mt == "text":
             if not inbound.text:
-                logger.warning("[PROC] 文本消息内容为空")
-                return None
+                logger.warning("[PROC] KF 文本消息内容为空")
+                return PreparedInput()
             input_data["text"] = inbound.text
-            return input_data
+            return PreparedInput(input_data=input_data)
 
         if mt == "image":
             if not inbound.media_ref:
-                logger.warning("[PROC] 图片消息缺少 media_ref")
-                return None
+                logger.warning("[PROC] KF 图片消息缺少 media_ref")
+                return PreparedInput()
             try:
                 content = await self._wechat.download_media(inbound.media_ref)
                 file_name = f"wechat_image_{inbound.media_ref}.jpg"
                 file_id = await self._ai.upload_file(content, file_name)
                 input_data["file_image_id"] = file_id
-                logger.info("[PROC] 图片上传成功: media_id=%s → %s",
-                            inbound.media_ref, file_id)
-                return input_data
+                logger.info(
+                    "[PROC] KF 图片上传: media_id=%s → %s",
+                    inbound.media_ref, file_id,
+                )
+                return PreparedInput(input_data=input_data)
             except Exception as e:
-                logger.error("[PROC] 图片处理失败: %s", e, exc_info=True)
-                return None
+                logger.error("[PROC] KF 图片处理失败: %s", e, exc_info=True)
+                return PreparedInput()
 
         if mt == "voice":
             if not inbound.media_ref:
-                logger.warning("[PROC] 语音消息缺少 media_ref")
-                return None
+                logger.warning("[PROC] KF 语音消息缺少 media_ref")
+                return PreparedInput()
             try:
-                # 原始语音字节 (转码失败时兜底用)
-                voice_content = await self._wechat.download_media(inbound.media_ref)
+                voice_content = await self._wechat.download_media(
+                    inbound.media_ref
+                )
                 media_info = await self._media.download_and_process_media(
                     inbound.media_ref, "voice"
                 )
-
                 if media_info.get("error"):
-                    logger.warning("[PROC] 语音转码失败, 使用原始 AMR")
+                    logger.warning("[PROC] KF 语音转码失败, 使用原始 AMR")
                     file_name = f"wechat_voice_{inbound.media_ref}.amr"
-                    file_id = await self._ai.upload_file(voice_content, file_name)
+                    file_id = await self._ai.upload_file(
+                        voice_content, file_name
+                    )
                 elif media_info.get("converted") and media_info.get("wav_path"):
                     import aiofiles
                     async with aiofiles.open(media_info["wav_path"], "rb") as f:
@@ -192,26 +266,191 @@ class MessageProcessor:
                     file_id = await self._ai.upload_file(wav_content, file_name)
                 else:
                     file_name = f"wechat_voice_{inbound.media_ref}.amr"
-                    file_id = await self._ai.upload_file(voice_content, file_name)
-
+                    file_id = await self._ai.upload_file(
+                        voice_content, file_name
+                    )
                 input_data["file_voice_id"] = file_id
-                logger.info("[PROC] 语音上传成功: media_id=%s → %s",
-                            inbound.media_ref, file_id)
-                return input_data
+                logger.info(
+                    "[PROC] KF 语音上传: media_id=%s → %s",
+                    inbound.media_ref, file_id,
+                )
+                return PreparedInput(input_data=input_data)
             except Exception as e:
-                logger.error("[PROC] 语音处理失败: %s", e, exc_info=True)
-                return None
+                logger.error("[PROC] KF 语音处理失败: %s", e, exc_info=True)
+                return PreparedInput()
 
-        logger.warning("[PROC] 不支持的消息类型: %s", mt)
-        return None
+        logger.warning("[PROC] KF 不支持的消息类型: %s", mt)
+        return PreparedInput()
+
+    # ---- bot ----
+    async def _prepare_bot_input(
+        self, inbound: InboundMessage, trace: Optional[BotTrace]
+    ) -> PreparedInput:
+        """智能机器人媒体编排 + 预过滤 (历史 _process_bot_message_background 行为)。
+
+        image url  → dify_file_image_url (remote_url, 不下载)
+        image id   → download_media + upload → dify_file_image_id
+        voice id   → download_media + upload → dify_file_voice_id (不转码)
+        """
+        import httpx as _httpx
+
+        # 0) 媒体编排 (先于 prefilter, 与历史 trace 顺序一致)
+        dify_file_image_url = ""
+        dify_file_image_id = ""
+        dify_file_voice_id = ""
+        if inbound.media_ref:
+            try:
+                media_bytes: bytes = b""
+                if inbound.media_kind == "url":
+                    # bot image url: 不下载, 直接喂 Dify remote_url
+                    if inbound.msg_type in ("image", "mixed"):
+                        dify_file_image_url = inbound.media_ref
+                        if trace is not None:
+                            trace.event(
+                                "media", "ok",
+                                f"image remote_url len={len(inbound.media_ref)}",
+                            )
+                        logger.info(
+                            "[PROC] bot image remote_url: msgid=%s url=%s...",
+                            inbound.msgid, inbound.media_ref[:60],
+                        )
+                    else:
+                        # voice url (实测未触发, 保留通用下载)
+                        async with _httpx.AsyncClient(timeout=30.0) as ac:
+                            r = await ac.get(inbound.media_ref)
+                            r.raise_for_status()
+                            media_bytes = r.content
+                elif inbound.media_kind == "media_id":
+                    media_bytes = await self._wechat.download_media(
+                        inbound.media_ref
+                    )
+                else:
+                    raise RuntimeError(
+                        f"未知的 media_kind: {inbound.media_kind}"
+                    )
+
+                # image (media_id 路径) 上传
+                if inbound.msg_type in ("image", "mixed") and not dify_file_image_url and media_bytes:
+                    dify_file_image_id = await _upload_to_dify_file_store(
+                        self._ai, media_bytes, inbound.media_ref, "image"
+                    )
+                    if trace is not None:
+                        trace.event(
+                            "media", "ok",
+                            f"image uploaded size={len(media_bytes)}B",
+                        )
+                    logger.info(
+                        "[PROC] bot image 上传: msgid=%s dify_file_id=%s size=%dB",
+                        inbound.msgid, dify_file_image_id, len(media_bytes),
+                    )
+                # voice 上传 (media_id 路径)
+                elif inbound.msg_type in ("voice", "mixed") and media_bytes and not dify_file_image_id and not dify_file_image_url:
+                    dify_file_voice_id = await _upload_to_dify_file_store(
+                        self._ai, media_bytes, inbound.media_ref, "audio"
+                    )
+                    if trace is not None:
+                        trace.event(
+                            "media", "ok",
+                            f"voice uploaded size={len(media_bytes)}B",
+                        )
+                    logger.info(
+                        "[PROC] bot voice 上传: msgid=%s dify_file_id=%s size=%dB",
+                        inbound.msgid, dify_file_voice_id, len(media_bytes),
+                    )
+            except Exception as e:
+                logger.error(
+                    "[PROC] bot 媒体编排失败: msgid=%s, %s", inbound.msgid, e
+                )
+                if trace is not None:
+                    trace.event("media", "fail", str(e)[:80])
+        else:
+            if trace is not None:
+                trace.event("media", "skip", "无媒体")
+
+        # 1) 预过滤
+        is_unsupported = inbound.msg_type not in _BOT_SUPPORTED_TYPES
+        is_empty = inbound.msg_type in ("text", "mixed") and not inbound.text and not inbound.media_ref
+        if is_unsupported or is_empty:
+            canned = (
+                "收到不支持的消息类型" if is_unsupported else "收到空消息"
+            )
+            if trace is not None:
+                trace.event("prefilter", "fail", f"{inbound.msg_type} 不支持/空")
+                trace.event("knowledge", "skip", "无知识库检索")
+                trace.event("thinking", "skip", "无思考过程")
+                trace.event("ai", "skip", "无 AI 调用")
+            return PreparedInput(canned_reply=canned)
+
+        # prefilter ok
+        if trace is not None:
+            detail = ""
+            if inbound.text:
+                detail = f"text={len(inbound.text)}字"
+            if inbound.media_ref:
+                detail += f" media={inbound.msg_type}"
+            trace.event("prefilter", "ok", detail.strip() or "ok")
+            trace.event("context", "skip", "单轮模式,无历史")
+
+        # 2) input_data
+        input_data: dict = {"user_id": inbound.user_id}
+        if inbound.text:
+            input_data["text"] = inbound.text
+        if dify_file_image_url:
+            input_data["file_image_url"] = dify_file_image_url
+        elif dify_file_image_id:
+            input_data["file_image_id"] = dify_file_image_id
+        if dify_file_voice_id:
+            input_data["file_voice_id"] = dify_file_voice_id
+        if "text" not in input_data:
+            input_data["text"] = (
+                "[用户发了一张图片]"
+                if inbound.msg_type == "image"
+                else "[用户发了一段语音]"
+                if inbound.msg_type == "voice"
+                else ""
+            )
+        return PreparedInput(input_data=input_data)
 
     # ------------------------------------------------------------------
-    # Chatwoot 同步 (KF 路径)
+    # trace 辅助
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _trace_kb_thinking(trace: BotTrace, wf: dict) -> None:
+        """从 Dify outputs 提取知识库/思考, 发射对应 trace 阶段。"""
+        raw = (wf or {}).get("raw", {}) if isinstance(wf, dict) else {}
+        outputs = ((raw or {}).get("data") or {}).get("outputs") or {}
+
+        kb = extract_knowledge(outputs)
+        if kb is not None:
+            main, subs = format_knowledge_lines(kb)
+            trace.event("knowledge", "ok", main, sub_lines=subs)
+        else:
+            trace.event("knowledge", "skip", "无知识库检索")
+
+        thinking = extract_thinking(outputs)
+        if thinking:
+            main, subs = format_thinking_lines(thinking)
+            trace.event("thinking", "ok", main, sub_lines=subs)
+        else:
+            trace.event("thinking", "skip", "无思考过程")
+
+    @staticmethod
+    def _ai_detail(wf: dict) -> str:
+        """AI 阶段 trace detail: 文本长度 + 媒体计数。"""
+        reply_text = compose_multimodal_markdown(wf)
+        detail = f"text={len(reply_text)}字"
+        for kind in ("images", "videos", "files"):
+            cnt = len(wf.get(kind) or [])
+            if cnt:
+                detail += f" {kind[0]}{cnt}"
+        return detail
+
+    # ------------------------------------------------------------------
+    # Chatwoot 同步 (仅 KF)
     # ------------------------------------------------------------------
     async def _chatwoot_notify(
         self, inbound: InboundMessage, reply_text: str
     ) -> None:
-        """把 AI 回复同步到 Chatwoot (非致命, 失败仅日志)。"""
         try:
             from app.services.chatwoot_sync_service import ChatwootSyncService
 
@@ -235,4 +474,46 @@ class MessageProcessor:
             )
 
 
-__all__ = ["MessageProcessor"]
+async def _upload_to_dify_file_store(
+    ai_service: Any, content: bytes, wechat_media_ref: str, file_type: str
+) -> str:
+    """把微信临时素材字节流上传到 Dify 文件库, 拿 upload_file_id。
+
+    bot 路径专用 (与 KF 的 ``ai.upload_file`` 不同: 这里直接调
+    ``client.upload_file`` 并显式指定 filename/content_type, 与历史行为一致)。
+
+    Args:
+        ai_service: AI 后端实例 (需有 ``client.upload_file``)
+        content: 微信临时素材 bytes
+        wechat_media_ref: media_id 或 url (仅用于生成可读文件名)
+        file_type: "image" | "audio"
+    """
+    client = getattr(ai_service, "client", None)
+    if client is None or not hasattr(client, "upload_file"):
+        raise RuntimeError(
+            f"当前 AI 后端 ({type(ai_service).__name__}) 不支持文件上传, "
+            f"image/voice 消息转发无法工作"
+        )
+
+    ext_map = {"image": "jpg", "audio": "amr"}
+    ext = ext_map.get(file_type, "bin")
+    if "://" in wechat_media_ref:
+        from urllib.parse import urlparse
+
+        path = urlparse(wechat_media_ref).path
+        slug = path.rsplit("/", 1)[-1] or "file"
+        slug = slug[:20]
+        filename = f"wechat_{file_type}_{slug}.{ext}"
+    else:
+        filename = f"wechat_{file_type}_{wechat_media_ref[:12]}.{ext}"
+    mime_map = {"image": "image/jpeg", "audio": "audio/amr"}
+    content_type = mime_map.get(file_type, "application/octet-stream")
+
+    return await client.upload_file(
+        filename=filename,
+        content=content,
+        content_type=content_type,
+    )
+
+
+__all__ = ["MessageProcessor", "PreparedInput"]

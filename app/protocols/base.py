@@ -76,11 +76,17 @@ class ProtocolAdapter(ABC):
         ...
 
     @abstractmethod
-    async def send(self, inbound: InboundMessage, reply: OutboundReply) -> bool:
+    async def send(
+        self,
+        inbound: InboundMessage,
+        reply: OutboundReply,
+        trace: Any = None,
+    ) -> bool:
         """把回复投递回用户。
 
-        KF: 调 send_kf_msg (用 inbound.user_id + open_kfid)。
-        bot: POST response_url (markdown, 用 inbound.response_url)。
+        KF: 调 send_kf_msg (用 inbound.user_id + open_kfid); trace 忽略。
+        bot: POST response_url (markdown, 用 inbound.response_url); trace 非 None 时
+             按 ``settings.app.bot_trace_mode`` 渲染 inline / separate 决策日志。
         """
         ...
 
