@@ -1,20 +1,26 @@
 """微信回调路由"""
-from typing import Optional, Dict, Set, Any
+
 import asyncio
-from fastapi import APIRouter, Request, Query, HTTPException, BackgroundTasks, Response
-from fastapi.responses import PlainTextResponse
 import hashlib
-import xml.etree.ElementTree as ET
-import time
-from datetime import datetime
 import logging
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from typing import Any, Dict, Optional, Set
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
+from fastapi.responses import PlainTextResponse
 
 from app.core.config import settings
-from app.services.wechat import WeChatService
+from app.models.wechat import WeChatMessage, WeChatSyncRequest
 from app.services import get_ai_service
+from app.services.bot_trace import (
+    BotTrace,
+    format_knowledge_lines,
+    format_thinking_lines,
+)
 from app.services.multimodal import compose_multimodal_markdown
-from app.models.wechat import WeChatSyncRequest, WeChatMessage
-
+from app.services.wechat import WeChatService
 
 # 智能机器人后台任务 dedup: 同一 msgid 在 ttl 秒内不重复触发
 _bot_processed_msgs: Dict[str, float] = {}
@@ -31,7 +37,7 @@ async def wechat_callback_verify(
     msg_signature: str = Query(..., description="消息签名"),
     timestamp: str = Query(..., description="时间戳"),
     nonce: str = Query(..., description="随机数"),
-    echostr: str = Query(..., description="加密的验证字符串")
+    echostr: str = Query(..., description="加密的验证字符串"),
 ):
     """微信回调URL验证"""
     received_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -53,8 +59,8 @@ async def wechat_callback_verify(
             token = settings.wechat.kf_token.get_secret_value()
             params = [token, timestamp, nonce, echostr]
             params.sort()
-            tmp_str = ''.join(params)
-            expected_signature = hashlib.sha1(tmp_str.encode('utf-8')).hexdigest()
+            tmp_str = "".join(params)
+            expected_signature = hashlib.sha1(tmp_str.encode("utf-8")).hexdigest()
 
             if expected_signature != msg_signature:
                 raise Exception("signature verification failed")
@@ -72,7 +78,7 @@ async def wechat_callback_verify(
             decrypted_echostr = wechat_service.decrypt_message_custom(
                 echostr,
                 wechat_service.config.kf_encoding_aes_key,
-                wechat_service.config.corp_id
+                wechat_service.config.corp_id,
             )
 
             logger.info("[SUCCESS] echostr解密成功")
@@ -85,6 +91,7 @@ async def wechat_callback_verify(
         except Exception as decrypt_error:
             logger.error(f"[ERROR] echostr解密失败: {decrypt_error}")
             import traceback
+
             logger.error(traceback.format_exc())
 
             # 如果官方SDK解密失败，尝试备用方法
@@ -96,11 +103,14 @@ async def wechat_callback_verify(
                 return PlainTextResponse(content=echostr, media_type="text/plain")
             except Exception as fallback_error:
                 logger.error(f"[ERROR] 备用方案也失败: {fallback_error}")
-                return PlainTextResponse(content="verification failed", media_type="text/plain")
+                return PlainTextResponse(
+                    content="verification failed", media_type="text/plain"
+                )
 
     except Exception as e:
         logger.error(f"[ERROR] 验证过程异常: {str(e)}")
         import traceback
+
         logger.error(traceback.format_exc())
         logger.error("=" * 60)
         return PlainTextResponse(content="verification error", media_type="text/plain")
@@ -112,20 +122,20 @@ async def wechat_callback_handler(
     background_tasks: BackgroundTasks,
     msg_signature: str = Query(..., description="消息签名"),
     timestamp: str = Query(..., description="时间戳"),
-    nonce: str = Query(..., description="随机数")
+    nonce: str = Query(..., description="随机数"),
 ):
     """微信回调消息处理"""
     # 检查User-Agent
-    user_agent = request.headers.get('User-Agent')
+    user_agent = request.headers.get("User-Agent")
     # 允许微信相关的User-Agent
-    allowed_user_agents = ['WeChat', 'Mozilla/4.0']
-    is_allowed = any(agent in (user_agent or '') for agent in allowed_user_agents)
+    allowed_user_agents = ["WeChat", "Mozilla/4.0"]
+    is_allowed = any(agent in (user_agent or "") for agent in allowed_user_agents)
 
     if not is_allowed:
         logger.warning(f"无效的请求来源，User-Agent: {user_agent}")
         return PlainTextResponse(content="success", media_type="text/plain")
 
-    content_type = request.headers.get('Content-Type')
+    content_type = request.headers.get("Content-Type")
     received_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
@@ -136,35 +146,36 @@ async def wechat_callback_handler(
         # logger.info(f"Content-Type: {content_type}")
         # logger.info(f"消息签名: {msg_signature}")
 
-        if content_type == 'application/json':
+        if content_type == "application/json":
             # 处理JSON格式消息
             data = await request.json()
-            msg_type = data.get('MsgType')
+            msg_type = data.get("MsgType")
             logger.info(f"Received {msg_type} message via JSON")
 
-        elif content_type == 'text/xml':
+        elif content_type == "text/xml":
             # 处理XML格式消息
             body = await request.body()
-            xml_data = body.decode('utf-8')
+            xml_data = body.decode("utf-8")
 
             # 步骤0: 预解析XML获取Encrypt内容（用于签名验证）
             msg_encrypt = ""
             try:
                 root = ET.fromstring(xml_data)
-                encrypt_elem = root.find('Encrypt')
+                encrypt_elem = root.find("Encrypt")
                 if encrypt_elem is not None and encrypt_elem.text:
                     msg_encrypt = encrypt_elem.text
                 # print(f"[DEBUG] msg_encrypt: {encrypt_elem.text}")
             except Exception as e:
                 logger.warning(f"预解析XML失败: {e}")
 
-           
             # 调用解密函数处理加密XML
             try:
                 wechat_service = WeChatService()
                 # 步骤1: 验证签名
                 logger.info("验证签名...")
-                is_valid = wechat_service.verify_signature(msg_signature, timestamp, nonce, msg_encrypt)
+                is_valid = wechat_service.verify_signature(
+                    msg_signature, timestamp, nonce, msg_encrypt
+                )
 
                 if not is_valid:
                     logger.error("签名验证失败")
@@ -172,36 +183,52 @@ async def wechat_callback_handler(
 
                 # 解析XML并检查是否加密
                 root = ET.fromstring(xml_data)
-                encrypt_elem = root.find('Encrypt')
+                encrypt_elem = root.find("Encrypt")
 
                 if encrypt_elem is not None and encrypt_elem.text:
                     # 解密加密消息
                     try:
-                        logger.info(f"[DEBUG] 发现加密消息，Encrypt内容长度: {len(encrypt_elem.text)}")
+                        logger.info(
+                            f"[DEBUG] 发现加密消息，Encrypt内容长度: {len(encrypt_elem.text)}"
+                        )
 
                         # 使用统一的解密方法
                         decrypted_xml = wechat_service.decrypt_message_custom(
                             encrypt_elem.text,
                             wechat_service.config.kf_encoding_aes_key,
-                            wechat_service.config.corp_id
+                            wechat_service.config.corp_id,
                         )
 
                         # 解析解密后的XML
                         decrypted_root = ET.fromstring(decrypted_xml)
-                        msg_type = decrypted_root.find('MsgType').text if decrypted_root.find('MsgType') is not None else 'unknown'
-                    
+                        msg_type = (
+                            decrypted_root.find("MsgType").text
+                            if decrypted_root.find("MsgType") is not None
+                            else "unknown"
+                        )
+
                         for child in decrypted_root:
-                            logger.info(f"  - {child.tag}: {child.text if child.text else '(empty)'}")
+                            logger.info(
+                                f"  - {child.tag}: {child.text if child.text else '(empty)'}"
+                            )
                             for subchild in child:
-                                logger.info(f"    - {subchild.tag}: {subchild.text if subchild.text else '(empty)'}")
+                                logger.info(
+                                    f"    - {subchild.tag}: {subchild.text if subchild.text else '(empty)'}"
+                                )
 
                     except Exception as e:
                         logger.error(f"消息解密失败: {e}")
-                        return PlainTextResponse(content="success", media_type="text/plain")
+                        return PlainTextResponse(
+                            content="success", media_type="text/plain"
+                        )
 
                 else:
                     # 未加密消息
-                    msg_type = root.find('MsgType').text if root.find('MsgType') is not None else 'unknown'
+                    msg_type = (
+                        root.find("MsgType").text
+                        if root.find("MsgType") is not None
+                        else "unknown"
+                    )
                     logger.info(f"Received {msg_type} message via plain XML")
 
             except Exception as e:
@@ -213,14 +240,14 @@ async def wechat_callback_handler(
             return PlainTextResponse(content="success", media_type="text/plain")
 
         # 确保decrypted_xml已定义
-        if 'decrypted_xml' not in locals():
+        if "decrypted_xml" not in locals():
             logger.error("未找到解密后的XML数据")
             return PlainTextResponse(content="success", media_type="text/plain")
 
         # 解析解密后的XML
         root = ET.fromstring(decrypted_xml)
         # 检查消息类型
-        msg_type_elem = root.find('MsgType')
+        msg_type_elem = root.find("MsgType")
         if msg_type_elem is None:
             logger.warning("XML中未找到MsgType元素")
             return PlainTextResponse(content="success", media_type="text/plain")
@@ -229,19 +256,19 @@ async def wechat_callback_handler(
         logger.info(f"消息类型: {msg_type}")
 
         # 初始化服务（如果还没有创建）
-        if 'wechat_service' not in locals():
+        if "wechat_service" not in locals():
             wechat_service = WeChatService()
         ai_service = get_ai_service()
 
         # 处理event类型消息（主要是kf_msg_or_event事件）
-        if msg_type == 'event':
-            event_elem = root.find('Event')
-            if event_elem is not None and event_elem.text == 'kf_msg_or_event':
+        if msg_type == "event":
+            event_elem = root.find("Event")
+            if event_elem is not None and event_elem.text == "kf_msg_or_event":
                 logger.info("收到客服消息事件(kf_msg_or_event)，开始处理...")
 
                 # 从XML中提取Token和OpenKfid
-                token_elem = root.find('Token')
-                open_kfid_elem = root.find('OpenKfId')
+                token_elem = root.find("Token")
+                open_kfid_elem = root.find("OpenKfId")
 
                 if token_elem is None or not token_elem.text:
                     logger.error("XML中未找到Token，无法同步消息")
@@ -251,9 +278,13 @@ async def wechat_callback_handler(
                 open_kfid = open_kfid_elem.text if open_kfid_elem is not None else None
 
                 # 检查事件是否已处理，但即使已处理也尝试同步最新消息
-                event_already_processed = await wechat_service.is_event_processed(sync_token)
+                event_already_processed = await wechat_service.is_event_processed(
+                    sync_token
+                )
                 if event_already_processed:
-                    logger.info(f"事件 {sync_token[:20]}... 已处理过，但仍尝试同步最新消息（可能有新消息）")
+                    logger.info(
+                        f"事件 {sync_token[:20]}... 已处理过，但仍尝试同步最新消息（可能有新消息）"
+                    )
                     # 不返回，而是继续同步流程
 
                 logger.info(f"提取到Token: {sync_token[:20]}...")
@@ -261,72 +292,102 @@ async def wechat_callback_handler(
                     logger.info(f"提取到OpenKfId: {open_kfid}")
 
                     # 检查是否只处理指定客服的消息
-                    allowed_kfid = getattr(settings.wechat, 'allowed_open_kfid', None)
+                    allowed_kfid = getattr(settings.wechat, "allowed_open_kfid", None)
                     if allowed_kfid and open_kfid != allowed_kfid:
-                        logger.info(f"跳过非指定客服消息: {open_kfid} (只处理: {allowed_kfid})")
-                        return PlainTextResponse(content="success", media_type="text/plain")
+                        logger.info(
+                            f"跳过非指定客服消息: {open_kfid} (只处理: {allowed_kfid})"
+                        )
+                        return PlainTextResponse(
+                            content="success", media_type="text/plain"
+                        )
 
                 # 使用高效增量同步获取最新客户消息
                 # 每次收到新事件时，清除之前保存的cursor，确保从最新消息开始拉取
                 try:
                     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    logger.info(f"[{current_time}] 开始高效增量同步消息（清除之前保存的cursor，从最新开始），事件已处理: {event_already_processed}...")
+                    logger.info(
+                        f"[{current_time}] 开始高效增量同步消息（清除之前保存的cursor，从最新开始），事件已处理: {event_already_processed}..."
+                    )
                     all_customer_messages = await wechat_service.sync_latest_messages(
                         sync_token=sync_token,
                         open_kfid=open_kfid,
                         max_attempts=3,  # 增加到3次，确保能获取到最新消息
-                        clear_cursor=True  # 清除之前保存的cursor，确保获取最新消息
+                        clear_cursor=True,  # 清除之前保存的cursor，确保获取最新消息
                     )
 
                     if all_customer_messages:
-                        latest_msg_data = all_customer_messages[0]  # 已经按send_time降序排序，第一个就是最新的
+                        latest_msg_data = all_customer_messages[
+                            0
+                        ]  # 已经按send_time降序排序，第一个就是最新的
                         current_ts = int(datetime.now().timestamp())
-                        latest_ts = int(getattr(latest_msg_data, 'send_time', 0))
+                        latest_ts = int(getattr(latest_msg_data, "send_time", 0))
                         time_diff = current_ts - latest_ts
-                        logger.info(f"同步完成: {len(all_customer_messages)}条消息, 最新消息: msgid={latest_msg_data.msgid}, 发送时间: {datetime.fromtimestamp(latest_ts).strftime('%H:%M:%S')}, 距今: {time_diff}秒")
+                        logger.info(
+                            f"同步完成: {len(all_customer_messages)}条消息, 最新消息: msgid={latest_msg_data.msgid}, 发送时间: {datetime.fromtimestamp(latest_ts).strftime('%H:%M:%S')}, 距今: {time_diff}秒"
+                        )
                     else:
                         logger.info("未找到有效的客户消息")
-                        return PlainTextResponse(content="success", media_type="text/plain")
+                        return PlainTextResponse(
+                            content="success", media_type="text/plain"
+                        )
 
-                    msgtype_value = getattr(latest_msg_data, 'msgtype', None)
-                    msgtype_str = msgtype_value.value if (msgtype_value and hasattr(msgtype_value, 'value')) else str(msgtype_value) if msgtype_value else 'unknown'
+                    msgtype_value = getattr(latest_msg_data, "msgtype", None)
+                    msgtype_str = (
+                        msgtype_value.value
+                        if (msgtype_value and hasattr(msgtype_value, "value"))
+                        else str(msgtype_value) if msgtype_value else "unknown"
+                    )
 
-                    logger.info(f"选择处理最新消息: msgid={latest_msg_data.msgid}, 类型={msgtype_str}")
+                    logger.info(
+                        f"选择处理最新消息: msgid={latest_msg_data.msgid}, 类型={msgtype_str}"
+                    )
 
                     # 只记录关键信息，减少详细输出
-                    if msgtype_str == 'text' and getattr(latest_msg_data, 'text', None):
-                        content = latest_msg_data.text.get('content', '')
-                        logger.info(f"文本内容: {content[:50]}{'...' if len(content) > 50 else ''}")
-                    elif msgtype_str == 'image' and getattr(latest_msg_data, 'image', None):
-                        media_id = latest_msg_data.image.get('media_id', 'unknown')
+                    if msgtype_str == "text" and getattr(latest_msg_data, "text", None):
+                        content = latest_msg_data.text.get("content", "")
+                        logger.info(
+                            f"文本内容: {content[:50]}{'...' if len(content) > 50 else ''}"
+                        )
+                    elif msgtype_str == "image" and getattr(
+                        latest_msg_data, "image", None
+                    ):
+                        media_id = latest_msg_data.image.get("media_id", "unknown")
                         logger.info(f"图片消息: media_id={media_id[:20]}...")
-                    elif msgtype_str == 'voice' and getattr(latest_msg_data, 'voice', None):
-                        media_id = latest_msg_data.voice.get('media_id', 'unknown')
+                    elif msgtype_str == "voice" and getattr(
+                        latest_msg_data, "voice", None
+                    ):
+                        media_id = latest_msg_data.voice.get("media_id", "unknown")
                         logger.info(f"语音消息: media_id={media_id[:20]}...")
 
                     # 将消息处理移到后台，避免响应超时
                     logger.info(f"准备添加后台任务处理消息: {latest_msg_data.msgid}")
-                    background_tasks.add_task(process_message_background, latest_msg_data)
+                    background_tasks.add_task(
+                        process_message_background, latest_msg_data
+                    )
                     logger.info(f"消息已添加到后台处理队列: {latest_msg_data.msgid}")
                 except Exception as sync_error:
                     logger.error(f"同步消息失败: {sync_error}")
                     import traceback
+
                     logger.error(traceback.format_exc())
             else:
-                logger.info(f"收到其他类型事件: {event_elem.text if event_elem else 'unknown'}")
+                logger.info(
+                    f"收到其他类型事件: {event_elem.text if event_elem else 'unknown'}"
+                )
         else:
             logger.info(f"收到非事件类型消息: {msg_type}")
 
     except Exception as e:
         logger.error(f"处理回调消息异常: {str(e)}")
         import traceback
+
         logger.error(traceback.format_exc())
         return PlainTextResponse(content="success", media_type="text/plain")
 
     finally:
         # 清理资源（只清理验证过程中创建的服务实例）
         try:
-            if 'wechat_service' in locals() and wechat_service:
+            if "wechat_service" in locals() and wechat_service:
                 await wechat_service.close()
         except Exception as e:
             logger.warning(f"关闭wechat_service失败: {e}")
@@ -336,7 +397,7 @@ async def wechat_callback_handler(
 
 async def process_message_background(message_data):
     """后台处理消息"""
-    msgid = getattr(message_data, 'msgid', 'unknown')
+    msgid = getattr(message_data, "msgid", "unknown")
     logger.info(f"[后台任务开始] 开始处理消息: {msgid}")
 
     wechat_service = WeChatService()
@@ -347,6 +408,7 @@ async def process_message_background(message_data):
     except Exception as e:
         logger.error(f"[后台任务错误] 后台处理消息失败 {msgid}: {e}")
         import traceback
+
         logger.error(traceback.format_exc())
     finally:
         # 清理资源
@@ -371,6 +433,7 @@ async def test_endpoint():
 # 微信群机器人回调（区别于客服：明文 JSON 协议，无需 AES 解密）
 # ============================================================================
 
+
 @router.get("/bot/callback")
 async def bot_callback_verify(
     msg_signature: str = Query(..., description="消息签名(SHA1)"),
@@ -386,7 +449,9 @@ async def bot_callback_verify(
       2) AES 解密 echostr (receive_id="", 企业自建)
       3) 返回解密后的 msg 明文
     """
-    logger.info(f"[BOT VERIFY] timestamp={timestamp} nonce={nonce} echostr_len={len(echostr)}")
+    logger.info(
+        f"[BOT VERIFY] timestamp={timestamp} nonce={nonce} echostr_len={len(echostr)}"
+    )
     try:
         svc = WeChatService()
         # 1) 验签（用加密的 echostr 原文参与签名计算）
@@ -455,6 +520,7 @@ async def bot_callback_handler(
       - 防止同一 msgid 被多次处理 (errcode 60140 重复响应)
     """
     import json as _json
+
     body_str = (await request.body()).decode("utf-8", errors="ignore")
     logger.info(f"[BOT MSG] ts={timestamp} nonce={nonce} body_len={len(body_str)}")
 
@@ -493,9 +559,14 @@ async def bot_callback_handler(
         msg_type = msg.get("msgtype") or ""
         msg_id = msg.get("msgid") or ""
         text_obj = msg.get("text") or {}
-        content = (text_obj.get("content") if isinstance(text_obj, dict) else text_obj) or ""
+        content = (
+            text_obj.get("content") if isinstance(text_obj, dict) else text_obj
+        ) or ""
         content = str(content).strip()
         response_url = msg.get("response_url") or ""
+        # 会话类型: "single" (单聊) | "group" (群聊) — 用于 trace 头部标记
+        chattype_raw = (msg.get("chattype") or "single").strip().lower()
+        chattype = "group" if chattype_raw == "group" else "single"
 
         # 一期增强: 识别 image / voice / mixed 消息, 提取媒体定位符
         # 关键差异:
@@ -581,15 +652,21 @@ async def bot_callback_handler(
         now_ts = time.time()
         async with _bot_dedup_lock:
             # 清理过期记录
-            expired = [k for k, v in _bot_processed_msgs.items() if now_ts - v > _BOT_MSG_TTL]
+            expired = [
+                k for k, v in _bot_processed_msgs.items() if now_ts - v > _BOT_MSG_TTL
+            ]
             for k in expired:
                 _bot_processed_msgs.pop(k, None)
             if msg_id and msg_id in _bot_processed_msgs:
                 logger.info(
                     f"[BOT MSG] msgid {msg_id} 已处理过 (dedup), 立即返回占位 envelope"
                 )
-                placeholder = _build_bot_sync_envelope(svc, "AI 正在处理中...", timestamp, nonce)
-                return Response(status_code=200, content=placeholder, media_type="application/json")
+                placeholder = _build_bot_sync_envelope(
+                    svc, "AI 正在处理中...", timestamp, nonce
+                )
+                return Response(
+                    status_code=200, content=placeholder, media_type="application/json"
+                )
             # 标记处理中
             if msg_id:
                 _bot_processed_msgs[msg_id] = now_ts
@@ -610,13 +687,16 @@ async def bot_callback_handler(
                 nonce=nonce,
                 encoding_aes_key=svc.config.kf_encoding_aes_key,
                 kf_token=svc.config.kf_token,
+                chattype=chattype,
             ),
             name=f"bot-{msg_id[:8] if msg_id else 'noid'}",
         )
         logger.info(f"[BOT MSG] msgid={msg_id} 已创建后台任务, 立即返回占位 envelope")
 
         # 6) 立即返回占位 envelope (避免 WeChat 5s 超时重试)
-        placeholder = _build_bot_sync_envelope(svc, "AI 正在处理中...", timestamp, nonce)
+        placeholder = _build_bot_sync_envelope(
+            svc, "AI 正在处理中...", timestamp, nonce
+        )
         return Response(
             status_code=200,
             content=placeholder,
@@ -624,6 +704,7 @@ async def bot_callback_handler(
         )
     except Exception as e:
         import traceback
+
         logger.error(f"[BOT MSG] 处理异常: {e}\n{traceback.format_exc()}")
         return Response(status_code=500, content=f"error: {e}")
 
@@ -631,6 +712,7 @@ async def bot_callback_handler(
 # ============================================================================
 # 智能机器人后台处理 + dedup (一期重做: 避免 Dify 慢调用导致 5s 超时重试)
 # ============================================================================
+
 
 async def _process_bot_message_background(
     msg: dict,
@@ -646,6 +728,7 @@ async def _process_bot_message_background(
     nonce: str,
     encoding_aes_key: str,
     kf_token: str,
+    chattype: str = "single",
 ):
     """后台异步处理 bot 消息: 调 AI workflow → 拼 markdown → 推 response_url。
 
@@ -657,7 +740,19 @@ async def _process_bot_message_background(
         - wechat_media_kind="media_id"   → WeChatService.download_media 拿 bytes
     """
     import json as _json
+
     import httpx as _httpx
+
+    # 决策日志 trace (可拔插, 默认 off): 记录本次消息经过的关键阶段
+    # 渲染/推送由 settings.app.bot_trace_mode 决定
+    trace = BotTrace(chat_type=chattype, msg_type=msg_type)
+    trace.event(
+        "receive",
+        "ok",
+        f"from={from_user} id={(msg_id or '')[:12]}",
+    )
+    # dedup 在 bot_callback_handler 已通过 (否则不会进 bg 任务), 此处记 ok 作 7 阶段标记
+    trace.event("dedup", "ok", "首次处理")
     try:
         # 0) 一期增强: image / voice 媒体编排
         # 智能机器人 image (url 路径): 直接用微信 CDN URL 走 Dify remote_url 模式 (跳过上传)
@@ -674,6 +769,11 @@ async def _process_bot_message_background(
                     # 仅 voice 需要先下载(转码可能要考虑), 暂不在 url 路径做 voice
                     if effective_media_type == "image":
                         dify_file_image_url = wechat_media_ref
+                        trace.event(
+                            "media",
+                            "ok",
+                            f"image remote_url len={len(wechat_media_ref)}",
+                        )
                         logger.info(
                             f"[BOT BG] image 走 remote_url 模式: msgid={msg_id}, "
                             f"url={wechat_media_ref[:60]}..."
@@ -694,7 +794,14 @@ async def _process_bot_message_background(
                 if effective_media_type == "image" and not dify_file_image_url:
                     # 仅 media_id 路径需要上传 (url 路径已用 remote_url)
                     dify_file_image_id = await _upload_to_dify_file_store(
-                        media_bytes, wechat_media_ref, "image",
+                        media_bytes,
+                        wechat_media_ref,
+                        "image",
+                    )
+                    trace.event(
+                        "media",
+                        "ok",
+                        f"image uploaded size={len(media_bytes)}B",
                     )
                     logger.info(
                         f"[BOT BG] image 上传 Dify 成功: msgid={msg_id}, "
@@ -704,7 +811,14 @@ async def _process_bot_message_background(
                 elif effective_media_type == "voice":
                     # voice 当前只支持 media_id 路径
                     dify_file_voice_id = await _upload_to_dify_file_store(
-                        media_bytes, wechat_media_ref, "audio",
+                        media_bytes,
+                        wechat_media_ref,
+                        "audio",
+                    )
+                    trace.event(
+                        "media",
+                        "ok",
+                        f"voice uploaded size={len(media_bytes)}B",
                     )
                     logger.info(
                         f"[BOT BG] voice 上传 Dify 成功: msgid={msg_id}, "
@@ -712,6 +826,9 @@ async def _process_bot_message_background(
                     )
             except Exception as e:
                 logger.error(f"[BOT BG] 媒体编排失败: msgid={msg_id}, {e}")
+                trace.event("media", "fail", str(e)[:80])
+        else:
+            trace.event("media", "skip", "无媒体")
 
         # 1) 调 AI workflow
         # 支持的 msgtype: text / image / voice / mixed (图文混合, content + media_ref 都有)
@@ -723,7 +840,21 @@ async def _process_bot_message_background(
                 if msg_type not in ("text", "image", "voice", "mixed")
                 else "收到空消息"
             )
+            trace.event("prefilter", "fail", f"{msg_type} 不支持/空")
+            trace.event("knowledge", "skip", "无知识库检索")
+            trace.event("thinking", "skip", "无思考过程")
+            trace.event("ai", "skip", "无 AI 调用")
         else:
+            # 预过滤通过
+            detail_extra = ""
+            if content:
+                detail_extra = f"text={len(content)}字"
+            if wechat_media_ref:
+                detail_extra += f" media={effective_media_type or '?'}"
+            trace.event("prefilter", "ok", detail_extra.strip() or "ok")
+            # 单轮模式: 无历史/无会话
+            trace.event("context", "skip", "单轮模式,无历史")
+
             input_data: Dict[str, Any] = {"user_id": from_user}
             if content:
                 input_data["text"] = content
@@ -736,9 +867,9 @@ async def _process_bot_message_background(
             if "text" not in input_data:
                 # image/voice 没附文本时给个提示, 让 LLM 知道要看图/听音
                 input_data["text"] = (
-                    "[用户发了一张图片]" if msg_type == "image"
-                    else "[用户发了一段语音]" if msg_type == "voice"
-                    else ""
+                    "[用户发了一张图片]"
+                    if msg_type == "image"
+                    else "[用户发了一段语音]" if msg_type == "voice" else ""
                 )
 
             ai = get_ai_service()
@@ -748,10 +879,45 @@ async def _process_bot_message_background(
                     f"[BOT BG] AI 返回, msgid={msg_id}, 键="
                     f"{list(wf.keys()) if isinstance(wf, dict) else type(wf).__name__}"
                 )
+
+                # 提取 Dify workflow 原始 outputs (用于思考过程/知识库检索阶段)
+                _raw = (wf or {}).get("raw", {}) if isinstance(wf, dict) else {}
+                _outputs = ((_raw or {}).get("data") or {}).get("outputs") or {}
+
+                # 知识库检索: 从 Dify outputs 中提取检索结果, 渲染为多行 detail
+                _knowledge_data = _extract_knowledge_from_outputs(_outputs)
+                if _knowledge_data is not None:
+                    _kb_main, _kb_subs = format_knowledge_lines(_knowledge_data)
+                    trace.event("knowledge", "ok", _kb_main, sub_lines=_kb_subs)
+                else:
+                    trace.event("knowledge", "skip", "无知识库检索")
+
+                # 思考过程: 从 Dify outputs 中提取 LLM reasoning/thinking 文本, 拆分为步骤
+                _thinking_text = _extract_thinking_from_outputs(_outputs)
+                if _thinking_text:
+                    _th_main, _th_subs = format_thinking_lines(_thinking_text)
+                    trace.event("thinking", "ok", _th_main, sub_lines=_th_subs)
+                else:
+                    trace.event("thinking", "skip", "无思考过程")
+
                 reply_text = compose_multimodal_markdown(wf)
+                # AI 摘要: 文本长度 + 媒体计数
+                ai_detail = f"text={len(reply_text)}字"
+                if isinstance(wf, dict):
+                    media_counts = []
+                    for kind in ("images", "videos", "files"):
+                        cnt = len(wf.get(kind) or [])
+                        if cnt:
+                            media_counts.append(f"{kind[0]}{cnt}")
+                    if media_counts:
+                        ai_detail += " " + " ".join(media_counts)
+                trace.event("ai", "ok", ai_detail)
             except Exception as e:
                 logger.error(f"[BOT BG] AI 失败: msgid={msg_id}, {e}")
                 reply_text = f"AI 处理失败: {e}"
+                trace.event("knowledge", "skip", "无知识库检索")
+                trace.event("thinking", "skip", "无思考过程")
+                trace.event("ai", "fail", str(e)[:80])
 
         if not reply_text:
             reply_text = "（AI 未返回内容）"
@@ -761,8 +927,18 @@ async def _process_bot_message_background(
         )
 
         # 2) 推 response_url (msgtype 必须 markdown)
+        # 决策日志模式: off(默认) | inline(拼到主消息) | separate(再推一条)
+        trace_mode = (getattr(settings.app, "bot_trace_mode", "off") or "off").lower()
+        trace_max_len = getattr(settings.app, "bot_trace_max_len", 1500) or 1500
+
         if response_url:
-            payload = {"msgtype": "markdown", "markdown": {"content": reply_text}}
+            final_reply = reply_text
+            if trace_mode == "inline":
+                trace_text = trace.render("inline", max_len=trace_max_len)
+                if trace_text:
+                    final_reply = reply_text + trace_text
+
+            payload = {"msgtype": "markdown", "markdown": {"content": final_reply}}
             try:
                 async with _httpx.AsyncClient(timeout=30.0) as ac:
                     r = await ac.post(
@@ -774,15 +950,35 @@ async def _process_bot_message_background(
                     errcode = _json.loads(r.text).get("errcode")
                 except _json.JSONDecodeError:
                     errcode = None
+                push_ok = r.status_code == 200 and errcode in (0, None)
+                trace.event(
+                    "push",
+                    "ok" if push_ok else "fail",
+                    f"HTTP {r.status_code} errcode={errcode}",
+                )
                 logger.info(
                     f"[BOT BG] 异步推送: msgid={msg_id}, "
                     f"HTTP {r.status_code} errcode={errcode}"
                 )
             except Exception as e:
                 logger.error(f"[BOT BG] 异步推送异常: msgid={msg_id}, {e}")
+                trace.event("push", "fail", str(e)[:80])
+
+            # separate 模式: 主消息已发出, 第二次 POST 推 trace (失败仅 warning)
+            if trace_mode == "separate":
+                await _post_bot_trace_separate(
+                    response_url=response_url,
+                    trace=trace,
+                    max_len=trace_max_len,
+                    msg_id=msg_id,
+                    httpx_module=_httpx,
+                )
     except Exception as e:
         import traceback
-        logger.error(f"[BOT BG] 后台任务异常: msgid={msg_id}, {e}\n{traceback.format_exc()}")
+
+        logger.error(
+            f"[BOT BG] 后台任务异常: msgid={msg_id}, {e}\n{traceback.format_exc()}"
+        )
 
 
 def _build_bot_sync_envelope(svc, reply_text: str, timestamp: str, nonce: str) -> str:
@@ -792,6 +988,7 @@ def _build_bot_sync_envelope(svc, reply_text: str, timestamp: str, nonce: str) -
     内部明文是 {"msgtype": "markdown", "markdown": {"content": ...}}。
     """
     import json as _json
+
     try:
         envelope_xml = WeChatService.encrypt_message_custom(
             reply_xml=_json.dumps(
@@ -805,12 +1002,15 @@ def _build_bot_sync_envelope(svc, reply_text: str, timestamp: str, nonce: str) -
             token=svc.config.kf_token,
         )
         env_root = ET.fromstring(envelope_xml)
-        return _json.dumps({
-            "encrypt": env_root.findtext("Encrypt"),
-            "msgsignature": env_root.findtext("MsgSignature"),
-            "timestamp": timestamp,
-            "nonce": nonce,
-        }, ensure_ascii=False)
+        return _json.dumps(
+            {
+                "encrypt": env_root.findtext("Encrypt"),
+                "msgsignature": env_root.findtext("MsgSignature"),
+                "timestamp": timestamp,
+                "nonce": nonce,
+            },
+            ensure_ascii=False,
+        )
     except Exception as e:
         logger.error(f"[BOT] 同步 envelope 构建失败: {e}")
         return "{}"
@@ -853,6 +1053,7 @@ async def _upload_to_dify_file_store(
     if "://" in wechat_media_ref:
         # URL: 取最后一段路径, 去掉 query/fragment
         from urllib.parse import urlparse
+
         path = urlparse(wechat_media_ref).path
         slug = path.rsplit("/", 1)[-1] or "file"
         slug = slug[:20]  # 截短避免文件名过长
@@ -872,3 +1073,84 @@ async def _upload_to_dify_file_store(
         content_type=content_type,
     )
     return file_id
+
+
+async def _post_bot_trace_separate(
+    response_url: str,
+    trace: "BotTrace",
+    max_len: int,
+    msg_id: str,
+    httpx_module,
+) -> None:
+    """separate 模式: 主消息已发出后, 再单独 POST 一次 trace 消息。
+
+    这是 best-effort, 失败仅日志 warning, 不影响主消息。
+    依赖企业微信允许多次 aibot/response 推送; 文档未明确, 实测为准。
+    """
+    import json as _json
+
+    try:
+        trace_text = trace.render("separate", max_len=max_len)
+        if not trace_text:
+            return
+        payload = {"msgtype": "markdown", "markdown": {"content": trace_text}}
+        async with httpx_module.AsyncClient(timeout=15.0) as ac:
+            r = await ac.post(
+                response_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+        try:
+            errcode = _json.loads(r.text).get("errcode")
+        except _json.JSONDecodeError:
+            errcode = None
+        logger.info(
+            f"[BOT BG] trace 推送: msgid={msg_id}, "
+            f"HTTP {r.status_code} errcode={errcode}"
+        )
+    except Exception as e:
+        logger.warning(f"[BOT BG] trace 推送失败 (不影响主消息): msgid={msg_id}, {e}")
+
+
+def _extract_knowledge_from_outputs(outputs: dict) -> Any:
+    """从 Dify workflow outputs 中提取知识库检索结果。
+
+    按优先级尝试常见变量名:
+        - knowledge / retrieved_chunks / retrieval_result / context / knowledge_result
+
+    Returns:
+        检索结果 (list / str / dict), 未找到返回 None。
+    """
+    if not isinstance(outputs, dict):
+        return None
+    _knowledge_keys = [
+        "knowledge", "retrieved_chunks", "retrieval_result",
+        "context", "knowledge_result", "kb_result",
+    ]
+    for key in _knowledge_keys:
+        val = outputs.get(key)
+        if val is not None and val != "" and val != []:
+            return val
+    return None
+
+
+def _extract_thinking_from_outputs(outputs: dict) -> str:
+    """从 Dify workflow outputs 中提取 LLM 思考过程文本。
+
+    按优先级尝试常见变量名:
+        - reasoning_content / thinking / reasoning / thought_process / thought
+
+    Returns:
+        思考文本 (已 strip), 未找到返回空字符串。
+    """
+    if not isinstance(outputs, dict):
+        return ""
+    _thinking_keys = [
+        "reasoning_content", "thinking", "reasoning",
+        "thought_process", "thought", "cot",
+    ]
+    for key in _thinking_keys:
+        val = outputs.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""

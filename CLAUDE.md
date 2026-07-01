@@ -119,7 +119,18 @@ WeChat KF server ──POST /wechat/kf/callback──▶ FastAPI
 | `services/coze.py` | `CozeService`. Calls the Coze workflow via `httpx`; also holds a `cozepy.Coze` SDK client. `run_workflow()` accepts the simplified `{text, file_image_id, file_voice_id}` input and converts to Coze `parameters`. |
 | `services/media.py` | `MediaService`. Downloads temporary media from WeChat (uses `pydub` + `ffmpeg` for voice). Auto-detects `ffmpeg` on Windows. |
 | `services/standardization.py` | `DataStandardizationService`. WeChat message → `StandardizedMessage` (single-turn, no history). |
+| `services/bot_trace.py` | `BotTrace` + `render_trace()`. 智能机器人决策日志 (可拔插, 默认关闭), 记录每条消息经过的 7 个阶段 (接收/预过滤/去重/上下文/媒体/AI/推送) 并按 `APP_BOT_TRACE_MODE` 渲染。 |
 | `tasks/*.py` | Celery task definitions for `wechat`/`coze`/`media`. Unused in current single-round mode but kept for future use. |
+
+### Bot 决策日志 (可选, 智能机器人增强)
+
+`_process_bot_message_background` 在每个关键阶段调用 `trace.event(stage, status, detail)`, 最终按 `APP_BOT_TRACE_MODE` 渲染:
+
+- `off` (默认) — 完全不输出, 对现有行为零侵入
+- `inline` — 把 trace 作为灰色 markdown 块拼到 AI 回复文本末尾, 单次 POST
+- `separate` — 主回复发出后, 再单独 POST 一次 trace 消息; 失败仅 warning, 不影响主消息
+
+环境变量: `APP_BOT_TRACE_MODE` (`off`|`inline`|`separate`), `APP_BOT_TRACE_MAX_LEN` (默认 1500 字符截断上限, 避免超 4KB markdown 限制)。
 
 ### Configuration
 
@@ -127,6 +138,8 @@ All config is env-driven via `pydantic-settings`. Required keys for a working de
 
 - `WECHAT_CORP_ID`, `WECHAT_CORP_SECRET`, `WECHAT_KF_TOKEN`, `WECHAT_ENCODING_AES_KEY` (43 chars), `WECHAT_CALLBACK_BASE_URL`
 - `WECHAT_ALLOWED_OPEN_KFID` (optional) — if set, only that KF account's messages are processed.
+- `APP_BOT_TRACE_MODE` (optional) — `off` (默认) | `inline` | `separate`, 智能机器人决策日志开关
+- `APP_BOT_TRACE_MAX_LEN` (optional) — inline 模式 trace 块最大字符数 (默认 1500)
 - `COZE_API_TOKEN`, `COZE_BOT_ID` (default in code: `7599886499640147968`)
 - `APP_SECRET_KEY`, `APP_DEBUG`, `APP_HOST`, `APP_PORT`, `APP_LOG_LEVEL`
 

@@ -1,8 +1,10 @@
 """配置管理模块"""
-from typing import Optional, List
+
+from typing import List, Optional
+
 from pydantic import Field
-from pydantic_settings import BaseSettings
 from pydantic.types import SecretStr
+from pydantic_settings import BaseSettings
 
 
 class WeChatSettings(BaseSettings):
@@ -10,29 +12,41 @@ class WeChatSettings(BaseSettings):
 
     # 企业微信基础配置
     corp_id: str = Field("PLACEHOLDER_CORP_ID", description="企业微信CorpID")
-    corp_secret: SecretStr = Field(SecretStr("PLACEHOLDER_CORP_SECRET"), description="企业微信CorpSecret")
+    corp_secret: SecretStr = Field(
+        SecretStr("PLACEHOLDER_CORP_SECRET"), description="企业微信CorpSecret"
+    )
 
     # 微信客服配置
-    kf_token: SecretStr = Field(SecretStr("PLACEHOLDER_KEFUTOCKEN"), description="微信客服Token")
-    encoding_aes_key: SecretStr = Field(SecretStr("PLACEHOLDER_ENCODING_AES_KEY"), description="微信客服EncodingAESKey")
+    kf_token: SecretStr = Field(
+        SecretStr("PLACEHOLDER_KEFUTOCKEN"), description="微信客服Token"
+    )
+    encoding_aes_key: SecretStr = Field(
+        SecretStr("PLACEHOLDER_ENCODING_AES_KEY"), description="微信客服EncodingAESKey"
+    )
 
     # 回调URL配置
-    callback_base_url: str = Field("https://weixinkf.h5.qumall.qushiyun.com", description="回调基础URL")
+    callback_base_url: str = Field(
+        "https://weixinkf.h5.qumall.qushiyun.com", description="回调基础URL"
+    )
 
     # 指定客服配置（可选）
-    allowed_open_kfid: Optional[str] = Field(None, description="只处理指定客服的消息，为空则处理所有客服")
+    allowed_open_kfid: Optional[str] = Field(
+        None, description="只处理指定客服的消息，为空则处理所有客服"
+    )
 
     class Config:
         env_prefix = "WECHAT_"
-        env_file = ".env"       # 指定.env文件
-        env_file_encoding = 'utf-8'
+        env_file = ".env"  # 指定.env文件
+        env_file_encoding = "utf-8"
         extra = "ignore"
 
 
 class CozeSettings(BaseSettings):
     """Coze相关配置"""
 
-    api_token: SecretStr = Field(SecretStr("PLACEHOLDER_COZE_API_TOKEN"), description="Coze API Token")
+    api_token: SecretStr = Field(
+        SecretStr("PLACEHOLDER_COZE_API_TOKEN"), description="Coze API Token"
+    )
     bot_id: str = Field("7599886499640147968", description="Coze Bot ID")
 
     # API 根地址 — 国内站 api.coze.cn / 海外站 api.coze.com
@@ -44,9 +58,10 @@ class CozeSettings(BaseSettings):
 
     class Config:
         env_prefix = "COZE_"
-        env_file = ".env"       # 指定.env文件
-        env_file_encoding = 'utf-8'
+        env_file = ".env"  # 指定.env文件
+        env_file_encoding = "utf-8"
         extra = "ignore"
+
 
 class RedisSettings(BaseSettings):
     """Redis配置"""
@@ -62,7 +77,9 @@ class RedisSettings(BaseSettings):
 
     # 缓存配置
     cache_ttl: int = Field(7200, description="缓存过期时间(秒)")
-    token_cache_key: str = Field("wechat:access_token", description="Access Token缓存键")
+    token_cache_key: str = Field(
+        "wechat:access_token", description="Access Token缓存键"
+    )
 
     class Config:
         env_prefix = "REDIS_"
@@ -98,11 +115,33 @@ class CelerySettings(BaseSettings):
         env_prefix = "CELERY_"
 
 
+class ChatwootSettings(BaseSettings):
+    """Chatwoot 集成配置 (Phase 1)"""
+
+    base_url: str = Field("http://chatwoot:3000", description="Chatwoot base URL")
+    hmac_secret: SecretStr = Field(
+        SecretStr("PLACEHOLDER_CHATWOOT_HMAC_SECRET"),
+        description="与 Channel::Wecom.wecom_ai_secret 一致的 HMAC 密钥",
+    )
+    enabled: bool = Field(False, description="是否启用 Chatwoot 同步")
+
+    # 超时
+    request_timeout: int = Field(10, description="调用 Chatwoot 的 HTTP 超时 (秒)")
+
+    class Config:
+        env_prefix = "CHATWOOT_"
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "ignore"
+
+
 class DifySettings(BaseSettings):
     """Dify相关配置"""
 
     api_base: str = Field("https://api.dify.ai/v1", description="Dify API base URL")
-    api_key: SecretStr = Field(SecretStr("PLACEHOLDER_DIFY_API_KEY"), description="Dify API Key (app-xxx)")
+    api_key: SecretStr = Field(
+        SecretStr("PLACEHOLDER_DIFY_API_KEY"), description="Dify API Key (app-xxx)"
+    )
 
     # Workflow 输入变量名 — 与 Dify 工作流"开始"节点保持一致
     input_text: str = Field("input_text", description="Workflow 文本输入变量名")
@@ -110,19 +149,34 @@ class DifySettings(BaseSettings):
     input_audio: str = Field("input_audio_id", description="Workflow 语音输入变量名")
 
     # end-user 标识 (Dify 强制要求)。WeChat 场景下用 external_userid 覆盖
-    end_user_default: str = Field("wechat-default-user", description="Dify end-user 默认标识")
+    end_user_default: str = Field(
+        "wechat-default-user", description="Dify end-user 默认标识"
+    )
 
     # 工作流配置
-    workflow_timeout: int = Field(120, description="工作流超时时间(秒) — Dify 较 Coze 慢,默认 120s")
+    workflow_timeout: int = Field(
+        120, description="工作流超时时间(秒) — Dify 较 Coze 慢,默认 120s"
+    )
     upload_timeout: int = Field(60, description="文件上传超时(秒)")
 
     # 输出变量名 — workflow 结束节点里设置的变量
     output_text: str = Field("output", description="Workflow 文本输出变量名")
 
+    # App 类型 — 决定走哪个 Dify API 端点
+    # "workflow" : /v1/workflows/run (传统工作流, outputs 在 data.outputs 里)
+    # "chatflow" : /v1/chat-messages   (advanced-chat / Chatflow, answer 在顶层,
+    #                                   知识库在 metadata.retriever_resources)
+    app_mode: str = Field(
+        "chatflow",
+        description='Dify app 类型: "workflow" | "chatflow"',
+    )
+    # Chatflow 专用超时 (跟 workflow_timeout 同源, 但语义上是两种调用)
+    chatflow_timeout: int = Field(120, description="Chatflow 调用超时(秒)")
+
     class Config:
         env_prefix = "DIFY_"
         env_file = ".env"
-        env_file_encoding = 'utf-8'
+        env_file_encoding = "utf-8"
         extra = "ignore"
 
 
@@ -147,7 +201,9 @@ class AppSettings(BaseSettings):
     log_format: str = Field("json", description="日志格式")
 
     # 安全配置
-    secret_key: SecretStr = Field(SecretStr("PLACEHOLDER_APP_SECRET_KEY"), description="应用密钥")
+    secret_key: SecretStr = Field(
+        SecretStr("PLACEHOLDER_APP_SECRET_KEY"), description="应用密钥"
+    )
     allowed_hosts: List[str] = Field(["*"], description="允许的主机")
 
     # 性能配置
@@ -157,6 +213,19 @@ class AppSettings(BaseSettings):
     # 监控配置
     enable_metrics: bool = Field(True, description="启用指标收集")
     metrics_port: int = Field(9090, description="指标端口")
+
+    # Bot 决策日志 — 智能机器人每次回复后追加一条"决策日志"
+    # "off"      : 不输出 (默认, 零侵入)
+    # "inline"   : 把 trace 拼到 AI 回复文本末尾, 单次 POST
+    # "separate" : 主回复发出后, 再单独 POST 一次 trace 消息
+    bot_trace_mode: str = Field(
+        "off",
+        description='Bot 决策日志模式: "off" | "inline" | "separate"',
+    )
+    bot_trace_max_len: int = Field(
+        1500,
+        description="inline 模式下 trace 块最大字符数;超出截断",
+    )
 
     class Config:
         env_prefix = "APP_"
@@ -172,6 +241,7 @@ class Settings(BaseSettings):
     wechat: WeChatSettings = WeChatSettings()
     coze: CozeSettings = CozeSettings()
     dify: DifySettings = DifySettings()
+    chatwoot: ChatwootSettings = ChatwootSettings()
     redis: RedisSettings = RedisSettings()
     database: DatabaseSettings = DatabaseSettings()
     celery: CelerySettings = CelerySettings()
@@ -195,9 +265,11 @@ def load_settings():
         print("[INFO] 配置从.env文件加载成功")
 
         # 检查是否使用了占位符值
-        if (settings.wechat.corp_id.startswith("PLACEHOLDER") or
-            str(settings.wechat.corp_secret).startswith("PLACEHOLDER") or
-            str(settings.coze.api_token).startswith("PLACEHOLDER")):
+        if (
+            settings.wechat.corp_id.startswith("PLACEHOLDER")
+            or str(settings.wechat.corp_secret).startswith("PLACEHOLDER")
+            or str(settings.coze.api_token).startswith("PLACEHOLDER")
+        ):
             print("[WARNING] 检测到占位符配置值，请确保已正确配置生产环境变量")
 
         return
@@ -230,6 +302,7 @@ def load_settings():
     except Exception as e3:
         print(f"[ERROR] 即使使用默认配置也失败: {e3}")
     raise SystemExit(1)
+
 
 # 加载配置
 load_settings()
