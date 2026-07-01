@@ -414,3 +414,119 @@ async def test_bot_does_not_notify_chatwoot():
         cw_cls.return_value = sync_mock
         await proc.process(_bot_inbound(text="hi"), adapter)
     sync_mock.notify_incoming.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Chatwoot handoff (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+async def test_handoff_skips_ai_when_human_takes_over(monkeypatch):
+    """CHATWOOT_ENABLED + handoff=True → 跳过 AI, 不消耗 conversation_id。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings.chatwoot, "enabled", True)
+    proc, ai, wechat, media, conv = _make_processor()
+    ai.run_workflow = AsyncMock(
+        return_value={"content": "r", "text": "r", "conversation_id": "conv-x"}
+    )
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    sync_mock = MagicMock()
+    sync_mock.check_handoff = AsyncMock(return_value={"handoff": True})
+    sync_mock.aclose = AsyncMock()
+    with patch(
+        "app.services.chatwoot_sync_service.ChatwootSyncService",
+        return_value=sync_mock,
+    ):
+        await proc.process(_inbound(text="你好"), adapter)
+
+    ai.run_workflow.assert_not_awaited()  # AI 被跳过
+    assert adapter.sent == []  # 不发送回复 (人工接管)
+    # conversation_id 不被消耗 (store 仍空)
+    assert await conv.get("ext_u", "kf_1") is None
+    sync_mock.check_handoff.assert_awaited_once_with("kf_1", "ext_u")
+
+
+async def test_handoff_false_proceeds_to_ai(monkeypatch):
+    """handoff=False → 正常调 AI。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings.chatwoot, "enabled", True)
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    sync_mock = MagicMock()
+    sync_mock.check_handoff = AsyncMock(return_value={"handoff": False})
+    sync_mock.aclose = AsyncMock()
+    with patch(
+        "app.services.chatwoot_sync_service.ChatwootSyncService",
+        return_value=sync_mock,
+    ):
+        await proc.process(_inbound(text="你好"), adapter)
+
+    ai.run_workflow.assert_awaited_once()
+    assert len(adapter.sent) == 1
+
+
+async def test_handoff_not_checked_when_chatwoot_disabled(monkeypatch):
+    """CHATWOOT_ENABLED=false → 不调 check_handoff, 直接 AI。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings.chatwoot, "enabled", False)
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    sync_mock = MagicMock()
+    sync_mock.check_handoff = AsyncMock(return_value={"handoff": True})
+    sync_mock.notify_incoming = AsyncMock()
+    sync_mock.aclose = AsyncMock()
+    with patch(
+        "app.services.chatwoot_sync_service.ChatwootSyncService",
+        return_value=sync_mock,
+    ):
+        await proc.process(_inbound(text="你好"), adapter)
+    # enabled=False → check_handoff 不应被调用
+    sync_mock.check_handoff.assert_not_awaited()
+    ai.run_workflow.assert_awaited_once()
+
+
+async def test_handoff_not_checked_for_bot(monkeypatch):
+    """bot 路径无 open_kfid, 不检查 handoff。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings.chatwoot, "enabled", True)
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    with patch(
+        "app.services.chatwoot_sync_service.ChatwootSyncService"
+    ) as cw_cls:
+        await proc.process(_bot_inbound(text="你好"), adapter)
+    cw_cls.assert_not_called()
+    ai.run_workflow.assert_awaited_once()
+
+
+async def test_handoff_check_failure_fails_open_to_ai(monkeypatch):
+    """check_handoff 抛异常 → 默认不接管, 继续调 AI。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings.chatwoot, "enabled", True)
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    sync_mock = MagicMock()
+    sync_mock.check_handoff = AsyncMock(side_effect=RuntimeError("chatwoot down"))
+    sync_mock.aclose = AsyncMock()
+    with patch(
+        "app.services.chatwoot_sync_service.ChatwootSyncService",
+        return_value=sync_mock,
+    ):
+        await proc.process(_inbound(text="你好"), adapter)
+
+    ai.run_workflow.assert_awaited_once()

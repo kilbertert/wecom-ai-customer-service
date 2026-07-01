@@ -133,7 +133,7 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
 | `routes/wechat.py` | 薄分发器 (~170 行): `GET/POST /wechat/kf/callback`, `GET/POST /wechat/bot/callback`, `GET /wechat/test`。无业务逻辑。 |
 | `routes/monitoring.py` | `/monitoring/health`, `/health/detailed`, `/metrics`, `/stats`。 |
 | `services/wechat.py` | `WeChatService` + `WeChatConfig`. Wraps `wechatpy.enterprise.WeChatClient`/`WeChatCrypto`. Owns access_token, signature verify (委托 wecom_crypto), AES decrypt, message sync, send_kf, download_media, is_event_processed。crypto 方法是 `wecom_crypto` 的薄委托。 |
-| `services/message_processor.py` | `MessageProcessor`: 协议无关编排器 (KF+bot 合并)。dedup→媒体→conversation_id→AI→compose→send→chatwoot。bot 9 阶段 trace 门控发射。`_upload_to_dify_file_store` 在此 (bot 媒体上传)。 |
+| `services/message_processor.py` | `MessageProcessor`: 协议无关编排器 (KF+bot 合并)。dedup→媒体→Chatwoot handoff 检查→conversation_id→AI→compose→send→chatwoot notify。bot 9 阶段 trace 门控发射。`_upload_to_dify_file_store` 在此 (bot 媒体上传)。 |
 | `services/conversation_store.py` | `ConversationStore` ABC + `InMemory`/`Redis` 实现。薄 conversation_id 映射 (非历史存储)。 |
 | `services/trace_extract.py` | `extract_knowledge` / `extract_thinking` 纯函数 (从 Dify outputs 提取 trace 阶段数据)。 |
 | `services/coze.py` | `CozeService`. Calls the Coze workflow via `httpx` (`/v1/workflow/stream_run` SSE); also holds a `cozepy.Coze` SDK client. **Note**: `run_workflow()` currently sends `parameters: {}` and ignores `input_data`/`user_id`/`conversation_id` (the deployed Coze workflow takes no inputs); the documented `{text, file_image_id, file_voice_id}` contract is stale for Coze. `DifyService.run_workflow` consumes its inputs faithfully. |
@@ -151,6 +151,15 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
 - `separate` — 主回复发出后, 再单独 POST 一次 trace 消息; 失败仅 warning, 不影响主消息
 
 环境变量: `APP_BOT_TRACE_MODE` (`off`|`inline`|`separate`), `APP_BOT_TRACE_MAX_LEN` (默认 1500 字符截断上限, 避免超 4KB markdown 限制)。
+
+### Chatwoot handoff (人工接管, 仅 KF)
+
+`MessageProcessor.process` 在调 AI 前调 `ChatwootSyncService.check_handoff(open_kfid, external_userid)`:
+
+- 仅当 `CHATWOOT_ENABLED=true` 且 inbound 有 `open_kfid` (KF 路径) 时检查; bot 路径不检查。
+- `handoff=True` (人工 assignee + online) → **跳过 Dify 调用** (不消耗 conversation 轮次), 也不发送 AI 回复 (人工经 Chatwoot→wecom 另一条路径回复)。
+- 检查异常 fail-open (默认不接管, 继续调 AI), 不阻塞主流程。
+- 这是被动查询 (人工已接管则让出), 不做自动阈值转人工 (用户明确不做 AI 自动 escalation)。
 
 ### Configuration
 

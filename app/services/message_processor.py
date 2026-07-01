@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from app.protocols.base import InboundMessage, OutboundReply, ProtocolAdapter
+from app.core.config import settings
 from app.services.bot_trace import (
     BotTrace,
     format_knowledge_lines,
@@ -116,7 +117,15 @@ class MessageProcessor:
                 # bot 不支持/空消息: 跳过 AI, 直接回 canned (trace skip 已发射)
                 reply_text = prepared.canned_reply
             else:
-                # 3) conversation_id 续接 (薄映射, Dify chatflow 多轮)
+                # 3) Chatwoot handoff: 人工接管时跳过 AI (不消耗 conversation 轮次)
+                if await self._is_handoff(inbound):
+                    logger.info(
+                        "[PROC] handoff=True, 人工接管, 跳过 AI: msgid=%s", msgid
+                    )
+                    await dedup.mark_done(msgid)
+                    return
+
+                # 4) conversation_id 续接 (薄映射, Dify chatflow 多轮)
                 scope = (
                     "bot" if is_bot else (inbound.open_kfid or "kf")
                 )
@@ -124,7 +133,7 @@ class MessageProcessor:
                     inbound.user_id, scope
                 )
 
-                # 4) 调 AI 工作流
+                # 5) 调 AI 工作流
                 try:
                     wf = await self._ai.run_workflow(
                         prepared.input_data,
@@ -161,7 +170,7 @@ class MessageProcessor:
                         else ""
                     )
 
-            # 5) 空回复兜底
+            # 6) 空回复兜底
             if not reply_text or not reply_text.strip():
                 if is_bot:
                     reply_text = "（AI 未返回内容）"
@@ -171,7 +180,7 @@ class MessageProcessor:
                     )
                     return
 
-            # 6) 发送去重 + 投递
+            # 7) 发送去重 + 投递
             if not await dedup.mark_sent(msgid):
                 logger.info("[PROC] msgid=%s 回复已发送过, 跳过", msgid)
                 return
@@ -183,7 +192,7 @@ class MessageProcessor:
                 logger.warning("[PROC] msgid=%s 回复投递失败", msgid)
                 return
 
-            # 7) Chatwoot 同步 (仅 KF: 把 AI 回复同步到人工侧)
+            # 8) Chatwoot 同步 (仅 KF: 把 AI 回复同步到人工侧)
             if not is_bot and inbound.open_kfid:
                 await self._chatwoot_notify(inbound, reply_text)
 
@@ -446,8 +455,42 @@ class MessageProcessor:
         return detail
 
     # ------------------------------------------------------------------
-    # Chatwoot 同步 (仅 KF)
+    # Chatwoot handoff / 同步 (仅 KF)
     # ------------------------------------------------------------------
+    async def _is_handoff(self, inbound: InboundMessage) -> bool:
+        """Chatwoot handoff 检查: 人工已接管时返回 True (跳过 AI, 不消耗会话轮次)。
+
+        仅当 ``CHATWOOT_ENABLED=true`` 且 inbound 有 open_kfid (KF 路径) 时生效;
+        bot 路径无 open_kfid, 不检查。检查失败默认不接管 (fail-open, 不阻塞 AI)。
+        """
+        if not getattr(settings.chatwoot, "enabled", False):
+            return False
+        if not inbound.open_kfid or not inbound.user_id:
+            return False
+        try:
+            from app.services.chatwoot_sync_service import ChatwootSyncService
+
+            sync = ChatwootSyncService()
+            try:
+                result = await sync.check_handoff(
+                    inbound.open_kfid, inbound.user_id
+                )
+            finally:
+                await sync.aclose()
+        except Exception as e:
+            logger.warning(
+                "[PROC] handoff 检查异常 (默认不接管): msgid=%s, %s",
+                inbound.msgid, e,
+            )
+            return False
+        handoff = bool((result or {}).get("handoff"))
+        if handoff:
+            logger.info(
+                "[PROC] Chatwoot handoff=True (人工接管): msgid=%s",
+                inbound.msgid,
+            )
+        return handoff
+
     async def _chatwoot_notify(
         self, inbound: InboundMessage, reply_text: str
     ) -> None:
