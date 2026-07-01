@@ -16,6 +16,7 @@
 二期 (客服 native 多模态) 路径会扩展出:
     upload_multimodal(ai_payload) → media_id 列表 + 逐条 send_msg
 """
+
 from __future__ import annotations
 
 import json
@@ -34,6 +35,7 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # 文本提取
 # ---------------------------------------------------------------------------
 
+
 def _strip_thinking(text: str) -> str:
     """过滤 <think>...</think> 思考块。
 
@@ -43,6 +45,44 @@ def _strip_thinking(text: str) -> str:
     if not isinstance(text, str) or not text:
         return ""
     return _THINK_BLOCK_RE.sub("", text).strip()
+
+
+# 图片扩展名 (用于扫描 text 里的裸图片 URL)
+_IMAGE_EXTS = ("png", "jpg", "jpeg", "gif", "webp", "bmp", "svg")
+# 匹配 text 中的裸图片 URL 并包装为 markdown image 语法
+# 负向后行 (?<!\]\()  : 跳过已经在 ![..](..) 或 [..](..) 内的 URL, 避免嵌套
+# 前瞻 (?=[\s,;.。、，;；!！?？]|$) : URL 必须以空白/标点/字符串结尾
+_INLINE_IMAGE_URL_RE = re.compile(
+    r"(?<!\]\()"
+    r"(https?://[^\s]+?\.(?:" + "|".join(_IMAGE_EXTS) + r")"
+    r"(?:[?#][^\s]*?)?)"
+    r"(?=[\s,;.。、，;；!！?？]|$)",
+    re.IGNORECASE,
+)
+
+
+def _convert_inline_image_urls(text: str, image_alt: str = "图片") -> str:
+    """扫描 text, 把裸的 ``.png/.jpg/.jpeg/.gif/.webp/.bmp/.svg`` URL 转成 markdown 图片语法。
+
+    解决 Dify workflow 把图片 URL 嵌在 text 字符串里返回的场景 — 不包装的话
+    WeChat 把 URL 当成普通链接显示, 而不是渲染图片。
+
+    已经包装在 ``![alt](url)`` 内的 URL 不会被重复包装 (用负向后行 ``](`` 排除)。
+
+    Examples:
+        >>> _convert_inline_image_urls("看 https://x.com/a.png 完")
+        '看 ![图片](https://x.com/a.png) 完'
+        >>> _convert_inline_image_urls("![](https://x.com/a.png)")
+        '![](https://x.com/a.png)'
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    def _wrap(match: "re.Match[str]") -> str:
+        url = match.group(1)
+        return f"![{image_alt}]({url})"
+
+    return _INLINE_IMAGE_URL_RE.sub(_wrap, text)
 
 
 def _extract_text_from_nested_json(value: str) -> str:
@@ -126,6 +166,7 @@ def _extract_text_from_workflow_result(wf: Dict[str, Any]) -> str:
 # 多模态 URL 提取
 # ---------------------------------------------------------------------------
 
+
 def _split_media(value: Any) -> Tuple[List[str], List[str], List[str]]:
     """从 media 数组(或 urls 数组)按 type 分到 (images, videos, files)。
 
@@ -208,7 +249,9 @@ def _collect_candidate_outputs(wf: Dict[str, Any]) -> List[Any]:
     return candidates
 
 
-def _extract_multimodal_from_wf(wf: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+def _extract_multimodal_from_wf(
+    wf: Dict[str, Any],
+) -> Tuple[List[str], List[str], List[str]]:
     """从工作流结果 dict 提取多模态 URL, 返回 (images, videos, files) 元组。
 
     支持来源:
@@ -301,6 +344,7 @@ def _extract_multimodal_from_wf(wf: Dict[str, Any]) -> Tuple[List[str], List[str
 # 对外主接口 (保留旧签名, 行为增强)
 # ---------------------------------------------------------------------------
 
+
 def extract_multimodal_payload(wf: Dict[str, Any]) -> Dict[str, Any]:
     """从 AI 工作流结果里提取统一的多模态字段。
 
@@ -354,9 +398,18 @@ def compose_multimodal_markdown(
     """
     payload = extract_multimodal_payload(wf)
 
-    parts: List[str] = []
+    # 处理 text 里的裸图片 URL (Dify 常见场景: 把图链嵌在 text 字符串里)
+    # 包装后, 同步剔除 images 数组中已在 text 里出现过的, 避免末尾重复附加
     if payload["text"]:
-        parts.append(payload["text"])
+        wrapped_text = _convert_inline_image_urls(payload["text"], image_alt=image_alt)
+        inline_urls = set(_INLINE_IMAGE_URL_RE.findall(payload["text"]))
+        payload["images"] = [u for u in payload["images"] if u not in inline_urls]
+    else:
+        wrapped_text = ""
+
+    parts: List[str] = []
+    if wrapped_text:
+        parts.append(wrapped_text)
 
     for url in payload["images"]:
         parts.append(f"\n\n![{image_alt}]({url})")
@@ -391,6 +444,7 @@ def has_multimodal_payload(wf: Dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 # 兼容旧 API: _coerce_url_list (coze.py 还在用, 保留)
 # ---------------------------------------------------------------------------
+
 
 def _coerce_url_list(value: Any) -> List[str]:
     """把可能是 list[str] / 单个 str / None 都归一化成 list[str]，并简单清洗。
