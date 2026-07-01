@@ -1,9 +1,10 @@
-"""Dify API 客户端 (dataclass-based, immutable)."""
+"""Dify API 客户端 (dataclass-based, immutable)。"""
+
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import httpx
 
@@ -15,10 +16,12 @@ class DifyError(RuntimeError):
 @dataclass(frozen=True)
 class DifyClient:
     api_base: str  # e.g. https://api.dify.ai/v1
-    api_key: str   # app-xxx
+    api_key: str  # app-xxx
     end_user: str  # Dify requires a user identifier on every call
     upload_timeout: float = 60.0
     workflow_timeout: float = 120.0
+    chatflow_timeout: float = 120.0
+    app_mode: str = "chatflow"  # "workflow" | "chatflow"
 
     def _headers(self, *, content_type: Optional[str] = None) -> dict[str, str]:
         h = {"Authorization": f"Bearer {self.api_key}"}
@@ -47,11 +50,17 @@ class DifyClient:
         when referencing the file in a workflow ``inputs`` file array.
         """
         url = f"{self.api_base.rstrip('/')}/files/upload"
-        files = {"file": (filename, content, content_type or "application/octet-stream")}
+        files = {
+            "file": (filename, content, content_type or "application/octet-stream")
+        }
         data = {"user": self.end_user}
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(self.upload_timeout)) as client:
-            resp = await client.post(url, headers=self._headers(), files=files, data=data)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.upload_timeout)
+        ) as client:
+            resp = await client.post(
+                url, headers=self._headers(), files=files, data=data
+            )
 
         if resp.status_code >= 400:
             raise DifyError(f"Dify upload failed: HTTP {resp.status_code} {resp.text}")
@@ -88,7 +97,9 @@ class DifyClient:
             "user": self.end_user,
         }
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(self.workflow_timeout)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.workflow_timeout)
+        ) as client:
             resp = await client.post(
                 url,
                 headers=self._headers(content_type="application/json"),
@@ -105,8 +116,74 @@ class DifyClient:
             # partial-succeeded is included as a soft failure: the workflow
             # ran but at least one node errored. Surface it to the caller.
             err = data.get("error") or "(no error detail)"
-            raise DifyError(f"Dify workflow {status}: {err}; outputs={data.get('outputs')}")
+            raise DifyError(
+                f"Dify workflow {status}: {err}; outputs={data.get('outputs')}"
+            )
         return body
+
+    # ------------------------------------------------------------------
+    # 3. Chatflow execution (advanced-chat / Chatflow app)
+    # ------------------------------------------------------------------
+    async def run_chatflow(
+        self,
+        *,
+        query: str,
+        inputs: Optional[dict[str, Any]] = None,
+        files: Optional[List[dict]] = None,
+        response_mode: str = "blocking",
+        conversation_id: str = "",
+    ) -> dict[str, Any]:
+        """
+        Run a Chatflow (advanced-chat) app via the ``/v1/chat-messages`` endpoint.
+
+        与 workflow API 不同:
+            - 用户文本走 ``query`` 字段 (不是 ``inputs``)
+            - 文件走顶层 ``files`` 数组 (不是 ``inputs[<file_var>]``)
+            - 响应扁平: ``{event, answer, metadata.retriever_resources, ...}``
+              (没有 ``data.outputs`` 嵌套, ``answer`` 直接在顶层)
+
+        Args:
+            query:       用户输入/提问内容 (必填)
+            inputs:      App 定义的各变量值 (默认 ``{}``)
+            files:       文件列表, 每项形如
+                ``{"type": "image", "transfer_method": "remote_url", "url": "..."}``
+                或 ``{"type": "image", "transfer_method": "local_file", "upload_file_id": "..."}``
+            response_mode: ``blocking`` 或 ``streaming``
+            conversation_id: 传之前消息的 conversation_id 可续接上下文 (留空 = 新会话)
+
+        Returns:
+            blocking 模式: 完整 JSON, 含 ``answer``, ``metadata.retriever_resources`` 等
+            streaming 模式: 原始 SSE event 流 (此处仅 blocking 测试覆盖)
+
+        Raises:
+            DifyError: HTTP 4xx/5xx (Dify 已认证过 key, 仅在 app 类型不匹配
+                       或参数错误时返回 400)
+        """
+        url = f"{self.api_base.rstrip('/')}/chat-messages"
+        payload: dict[str, Any] = {
+            "query": query,
+            "inputs": inputs or {},
+            "response_mode": response_mode,
+            "user": self.end_user,
+        }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
+        if files:
+            payload["files"] = files
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.chatflow_timeout)
+        ) as client:
+            resp = await client.post(
+                url,
+                headers=self._headers(content_type="application/json"),
+                json=payload,
+            )
+
+        if resp.status_code >= 400:
+            raise DifyError(f"Dify chatflow HTTP error: {resp.status_code} {resp.text}")
+
+        return resp.json()
 
     # ------------------------------------------------------------------
     # Helpers
