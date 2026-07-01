@@ -33,8 +33,8 @@ def get_ai_service() -> AIService:
 
     两个服务实现同名同形接口:
         - ``upload_file(content: bytes, file_name: str) -> str``
-        - ``run_workflow(input_data: dict, user_id: str) -> dict``
-    因此 ``WeChatService.process_single_message`` 不需要关心后端。
+        - ``run_workflow(input_data: dict, user_id: str, conversation_id: str | None) -> dict``
+    因此 ``MessageProcessor`` 不需要关心后端。
     """
     backend = (settings.app.ai_backend or "coze").lower()
     if backend == "dify":

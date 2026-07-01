@@ -4,7 +4,6 @@ from app.core.celery_app import celery_app
 import asyncio
 
 from app.services.coze import CozeService
-from app.services.standardization import DataStandardizationService
 
 
 @celery_app.task(bind=True, max_retries=3)
@@ -12,7 +11,6 @@ async def trigger_coze_workflow(self, standardized_data: Dict[str, Any]) -> Dict
     """触发Coze工作流"""
     try:
         coze_service = CozeService()
-        standardization_service = DataStandardizationService(None)
 
         # 转换数据格式
         from app.models.coze import StandardizedMessage

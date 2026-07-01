@@ -3,7 +3,6 @@ from typing import Dict, Any
 from app.core.celery_app import celery_app
 
 from app.services.wechat import WeChatService
-from app.services.standardization import DataStandardizationService
 
 
 @celery_app.task(bind=True, max_retries=3)
@@ -12,7 +11,6 @@ def process_wechat_message(self, message_data: Dict[str, Any]) -> Dict[str, Any]
     try:
         # 初始化服务（单轮对话模式）
         wechat_service = WeChatService()
-        standardization_service = DataStandardizationService()  # 无会话服务
 
         # 这里实现消息处理逻辑
         # 由于需要异步上下文，这里简化处理

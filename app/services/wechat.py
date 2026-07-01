@@ -1,14 +1,11 @@
 """微信服务模块"""
 import time
 import traceback
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Dict, Any
 import httpx
 import logging
 from datetime import datetime, timedelta
 import asyncio
-
-if TYPE_CHECKING:
-    from app.services.coze import CozeService
 
 # 微信客服官方SDK
 from wechatpy.enterprise.crypto import WeChatCrypto
@@ -28,7 +25,6 @@ from app.models.wechat import (
     MessageType,
 )
 from app.core.exceptions import WeChatAPIError
-from app.services.multimodal import compose_multimodal_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -148,15 +144,6 @@ except Exception as e:
 # 创建统一的微信服务类
 class WeChatService:
     """微信客服官方SDK服务"""
-
-    # 全局消息去重字典，所有实例共享
-    _processed_messages: Dict[str, datetime] = {}
-    # 正在处理中的消息集合（防止并发处理）
-    _processing_messages: set = set()
-    # 已发送回复的消息集合（防止重复发送）
-    _sent_replies: set = set()
-    # 并发锁保护全局字典
-    _lock = asyncio.Lock()
 
     # 同步状态缓存：为每个open_kfid维护last_cursor
     _sync_states: Dict[str, str] = {}
@@ -571,284 +558,6 @@ class WeChatService:
 
         except Exception as e:
             raise WeChatAPIError(f"获取用户信息异常: {str(e)}")
-
-    async def process_single_message(self, message: WeChatMessage, ai_service: 'AIService'):
-        """处理单条微信消息
-
-        Args:
-            message: 微信消息对象
-            ai_service: AI 后端服务实例 (CozeService 或 DifyService, 接口同形)
-        """
-        from app.services import AIService  # noqa: F401  (用于类型注解)
-
-        # 消息去重检查
-        msgid = getattr(message, 'msgid', None)
-        if not msgid:
-            logger.warning("消息缺少msgid，跳过处理")
-            return
-
-        # 使用锁保护去重逻辑，避免并发问题
-        async with WeChatService._lock:
-            # 检查是否正在处理中
-            if msgid in WeChatService._processing_messages:
-                logger.info(f"消息 {msgid} 正在处理中，跳过重复处理")
-                return
-
-            # 检查是否已处理过（5分钟内）
-            now = datetime.now()
-            if msgid in WeChatService._processed_messages:
-                processed_time = WeChatService._processed_messages[msgid]
-                if now - processed_time < timedelta(minutes=5):
-                    logger.info(f"消息 {msgid} 已处理过，跳过重复处理")
-                    return
-
-            # 立即标记为"处理中"，防止并发处理
-            WeChatService._processing_messages.add(msgid)
-            logger.info(f"消息 {msgid} 标记为处理中")
-
-            # 清理过期记录（只在处理新消息时清理，避免频繁操作）
-            expired_keys = [k for k, v in WeChatService._processed_messages.items()
-                           if now - v > timedelta(minutes=5)]
-            for k in expired_keys:
-                del WeChatService._processed_messages[k]
-                # 同时清理已发送回复记录
-                WeChatService._sent_replies.discard(k)
-
-        try:
-            msgtype = getattr(message, 'msgtype', None)
-            if not msgtype:
-                logger.error("消息类型为空")
-                return
-
-            msgtype_value = msgtype.value if hasattr(msgtype, 'value') else str(msgtype)
-            logger.info(f"处理消息类型: {msgtype_value}")
-
-            # 构建输入数据
-            input_data = {}
-            
-            if msgtype_value == 'text':
-                # 处理文本消息
-                text_content = getattr(message, 'text', None)
-                if text_content and isinstance(text_content, dict):
-                    content = text_content.get('content', '')
-                    input_data['text'] = content
-                    logger.info(f"文本消息内容: {content}")
-                else:
-                    logger.warning("文本消息内容为空")
-                    return
-
-            elif msgtype_value == 'image':
-                # 处理图片消息
-                image_data = getattr(message, 'image', None)
-                if image_data and isinstance(image_data, dict):
-                    media_id = image_data.get('media_id')
-                    if media_id:
-                        logger.info(f"[图片消息] 开始处理，media_id: {media_id}")
-                        try:
-                            # 下载图片
-                            logger.info(f"[图片消息] 开始下载图片...")
-                            image_content = await self.download_media(media_id)
-                            logger.info(f"[图片消息] 图片下载成功，大小: {len(image_content)} 字节")
-                            
-                            # 上传到Coze并获取文件ID
-                            file_name = f"wechat_image_{media_id}.jpg"
-                            logger.info(f"[图片消息] 开始上传图片到Coze，文件名: {file_name}")
-                            image_file_id = await ai_service.upload_file(image_content, file_name)
-                            logger.info(f"[图片消息] 图片上传到Coze成功，文件ID: {image_file_id}")
-                            
-                            input_data['file_image_id'] = image_file_id
-                            logger.info(f"[图片消息] 处理完成，input_data: {input_data}")
-                        except Exception as e:
-                            logger.error(f"[图片消息] 处理失败: {e}")
-                            import traceback
-                            logger.error(traceback.format_exc())
-                            # 图片处理失败，不继续处理，但会在后续标记为已处理以避免无限重试
-                            return
-                    else:
-                        logger.warning("[图片消息] 未找到media_id")
-                        return
-                else:
-                    logger.warning("[图片消息] 数据为空或格式错误")
-                    return
-
-            elif msgtype_value == 'voice':
-                # 处理语音消息
-                voice_data = getattr(message, 'voice', None)
-                if voice_data and isinstance(voice_data, dict):
-                    media_id = voice_data.get('media_id')
-                    if media_id:
-                        logger.info(f"开始下载语音，media_id: {media_id}")
-                        try:
-                            # 下载语音
-                            voice_content = await self.download_media(media_id)
-                            logger.info(f"语音下载成功，大小: {len(voice_content)} 字节")
-                            
-                            # 上传到Coze（使用CozeService的process_wechat_message方法处理语音转换）
-                            # 先尝试使用MediaService进行格式转换
-                            from app.services.media import MediaService
-                            media_service = MediaService(self)
-                            
-                            media_info = await media_service.download_and_process_media(media_id, 'voice')
-                            
-                            if media_info.get('error'):
-                                # 如果处理失败，使用原始文件
-                                logger.warning("语音格式转换失败，使用原始文件")
-                                file_name = f"wechat_voice_{media_id}.amr"
-                                voice_file_id = await ai_service.upload_file(voice_content, file_name)
-                            else:
-                                # 使用转换后的文件
-                                if media_info.get('converted') and media_info.get('wav_path'):
-                                    import aiofiles
-                                    async with aiofiles.open(media_info['wav_path'], 'rb') as f:
-                                        wav_content = await f.read()
-                                    file_name = f"wechat_voice_{media_id}.wav"
-                                    voice_file_id = await ai_service.upload_file(wav_content, file_name)
-                                else:
-                                    file_name = f"wechat_voice_{media_id}.amr"
-                                    voice_file_id = await ai_service.upload_file(voice_content, file_name)
-                            
-                            logger.info(f"语音上传到Coze成功，文件ID: {voice_file_id}")
-                            input_data['file_voice_id'] = voice_file_id
-                            logger.info(f"语音消息处理完成，input_data: {input_data}")
-                        except Exception as e:
-                            logger.error(f"处理语音消息失败: {e}")
-                            import traceback
-                            logger.error(traceback.format_exc())
-                            return
-                    else:
-                        logger.warning("语音消息中未找到media_id")
-                        return
-                else:
-                    logger.warning("语音消息数据为空")
-                    return
-            else:
-                logger.warning(f"不支持的消息类型: {msgtype_value}")
-                return
-
-            # 如果没有有效内容，不触发工作流
-            if not input_data:
-                logger.warning("输入数据为空，跳过工作流触发")
-                return
-
-            # 消息内容处理成功（图片/语音已下载上传，或文本已提取），标记为已处理
-            # 这样可以避免重复处理，即使后续工作流执行失败也不重复处理
-            async with WeChatService._lock:
-                WeChatService._processed_messages[msgid] = datetime.now()
-                # 从"处理中"集合中移除
-                WeChatService._processing_messages.discard(msgid)
-                logger.info(f"消息 {msgid} 内容处理成功，已标记为已处理")
-
-            # 获取用户ID
-            external_userid = getattr(message, 'external_userid', None) or "wechat_user"
-            # 触发Coze工作流
-            logger.info(f"触发Coze工作流，用户ID: {external_userid}, 输入数据: {input_data}")
-            try:
-                
-                workflow_result = await ai_service.run_workflow(input_data, user_id=external_userid)
-                logger.info("工作流执行成功")
-
-                # 检查数据类型（保留必要的类型检查）
-                if isinstance(workflow_result, str):
-                    logger.warning("工作流返回字符串，尝试解析JSON")
-                    try:
-                        import json
-                        workflow_result = json.loads(workflow_result)
-                        logger.info("JSON解析成功")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON解析失败: {e}")
-                        return
-
-                # 提取工作流返回的内容并发送回微信客服
-                logger.info(f"最终检查workflow_result类型: {type(workflow_result)}, 是否为dict: {isinstance(workflow_result, dict)}")
-                if isinstance(workflow_result, dict):
-                    logger.info(f"workflow_result包含的键: {list(workflow_result.keys())}")
-
-                    # 一期改造: 用 compose_multimodal_markdown 统一从工作流结果里
-                    # 提取 text + 自动把 images/videos/files 数组拼成 markdown 图片语法
-                    # (兼容旧的 content / reply_content / data 字段)
-                    reply_text = compose_multimodal_markdown(workflow_result)
-                    if reply_text:
-                        logger.info(
-                            f"composed markdown 长度={len(reply_text)}, "
-                            f"images={len(workflow_result.get('images', []))}, "
-                            f"videos={len(workflow_result.get('videos', []))}, "
-                            f"files={len(workflow_result.get('files', []))}"
-                        )
-                    else:
-                        logger.warning(f"工作流返回的内容为空: {workflow_result}")
-
-                    if reply_text and reply_text.strip():
-                        # 检查是否已经发送过回复（防止重复发送）
-                        async with WeChatService._lock:
-                            if msgid in WeChatService._sent_replies:
-                                logger.warning(f"消息 {msgid} 的回复已发送过，跳过重复发送")
-                                return
-                            # 立即标记为已发送，防止并发发送
-                            WeChatService._sent_replies.add(msgid)
-                            logger.info(f"消息 {msgid} 标记为已发送回复")
-
-                        # 获取客服ID
-                        open_kfid = getattr(message, 'open_kfid', None)
-                        logger.info(f"获取到open_kfid: {open_kfid}")
-                        if open_kfid:
-                            try:
-                                # 再次确认reply_text的值
-                                logger.info(f"准备发送内容类型: {type(reply_text)}, 值: {repr(reply_text[:100])}")
-                                # 发送回复消息回微信客服
-                                # 一期: 用 text msgtype 发送 markdown 文本（含内嵌图片 URL）
-                                # 二期: 改成 native 多模态 (image/voice/video/file msgtype + media_id)
-                                logger.info(f"发送回复消息到微信客服，用户: {external_userid}, 客服: {open_kfid}, 内容: {reply_text[:50]}...")
-                                send_result = await self.send_message_simple(external_userid, open_kfid, reply_text)
-                                logger.info(f"回复消息发送成功: {msgid}")
-
-                                # Phase 1: 同步该消息到 Chatwoot (一次性把 customer 消息 + AI 回复都传过去)
-                                # Sprint 2 改 handoff_status 路径
-                                try:
-                                    from app.services.chatwoot_sync_service import ChatwootSyncService
-                                    sync = ChatwootSyncService()
-                                    try:
-                                        await sync.notify_incoming(
-                                            open_kfid=open_kfid,
-                                            external_userid=external_userid,
-                                            message_data={
-                                                "msgid": msgid,
-                                                "msgtype": "text",
-                                                "text": {"content": reply_text},
-                                                "origin": 2,
-                                            },
-                                        )
-                                    finally:
-                                        await sync.aclose()
-                                except Exception as sync_err:
-                                    logger.error(f"[ChatwootSync] 同步失败 (非致命, 不影响 WeCom 流程): {sync_err}")
-
-                            except Exception as send_error:
-                                logger.error(f"发送回复消息失败: {send_error}")
-                                import traceback
-                                logger.error(traceback.format_exc())
-                                # 发送失败时，从已发送集合中移除，允许重试
-                                async with WeChatService._lock:
-                                    WeChatService._sent_replies.discard(msgid)
-                                    logger.info(f"消息 {msgid} 发送失败，已从已发送集合移除，允许重试")
-                        else:
-                            logger.warning("消息中未找到open_kfid，无法发送回复")
-                    else:
-                        logger.warning("工作流返回的文本内容为空")
-
-            except Exception as workflow_error:
-                logger.error(f"工作流执行失败: {workflow_error}")
-                import traceback
-                logger.error(traceback.format_exc())
-
-        except Exception as e:
-            logger.error(f"处理消息异常: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            # 处理失败时，从"处理中"集合中移除，允许重试
-            async with WeChatService._lock:
-                WeChatService._processing_messages.discard(msgid)
-                logger.info(f"消息 {msgid} 处理失败，已从处理中集合移除，允许重试")
-            raise
 
     async def close(self):
         """关闭HTTP客户端"""
