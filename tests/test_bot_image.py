@@ -176,7 +176,10 @@ class TestDifyRunWorkflowAcceptsFileInputs:
 
             call_kwargs = mock_client.run_workflow.call_args.kwargs
             inputs = call_kwargs["inputs"]
-            assert inputs == {"input_text": "纯文本"}
+            # input_text 必须传, user_id 透传是正常的 (一期改造: _NON_FILE_KEYS)
+            assert inputs["input_text"] == "纯文本"
+            assert "input_img_id" not in inputs
+            assert "input_audio_id" not in inputs
 
     @pytest.mark.asyncio
     async def test_file_image_url_remote_url_mode(self, monkeypatch):

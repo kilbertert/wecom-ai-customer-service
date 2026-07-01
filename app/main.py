@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.config import settings
-from app.routes import wechat_router, monitoring_router
+from app.routes import wechat_router, monitoring_router, chatwoot_internal_router
 from app.core.exceptions import (
     WeChatAPIError,
     CozeAPIError,
@@ -94,6 +94,7 @@ async def session_exception_handler(request: Request, exc: SessionError):
 # 注册路由
 app.include_router(wechat_router)
 app.include_router(monitoring_router)
+app.include_router(chatwoot_internal_router)
 
 
 @app.get("/")

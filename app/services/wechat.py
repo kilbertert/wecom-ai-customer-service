@@ -976,6 +976,27 @@ class WeChatService:
                                 send_result = await self.send_message_simple(external_userid, open_kfid, reply_text)
                                 logger.info(f"回复消息发送成功: {msgid}")
 
+                                # Phase 1: 同步该消息到 Chatwoot (一次性把 customer 消息 + AI 回复都传过去)
+                                # Sprint 2 改 handoff_status 路径
+                                try:
+                                    from app.services.chatwoot_sync_service import ChatwootSyncService
+                                    sync = ChatwootSyncService()
+                                    try:
+                                        await sync.notify_incoming(
+                                            open_kfid=open_kfid,
+                                            external_userid=external_userid,
+                                            message_data={
+                                                "msgid": msgid,
+                                                "msgtype": "text",
+                                                "text": {"content": reply_text},
+                                                "origin": 2,
+                                            },
+                                        )
+                                    finally:
+                                        await sync.aclose()
+                                except Exception as sync_err:
+                                    logger.error(f"[ChatwootSync] 同步失败 (非致命, 不影响 WeCom 流程): {sync_err}")
+
                             except Exception as send_error:
                                 logger.error(f"发送回复消息失败: {send_error}")
                                 import traceback
