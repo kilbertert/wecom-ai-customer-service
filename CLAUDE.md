@@ -97,7 +97,7 @@ WeChat KF server ──POST /wechat/kf/callback──▶ FastAPI
 3. The encrypted payload is decrypted via `WeChatService.decrypt_message_custom` (custom AES wrapper around `wechatpy`'s `WeChatCrypto`).
 4. The decrypted XML's `MsgType == 'event' && Event == 'kf_msg_or_event'` triggers a pull-style sync: `WeChatService.sync_latest_messages` paginates the WeChat sync API to grab the latest customer message. Plain messages (text/image/voice) are supported; other types are logged and dropped.
 5. Actual processing is dispatched into `BackgroundTasks` (`process_message_background`) so the HTTP response returns `success` immediately to WeChat.
-6. The background coroutine standardizes the message (`DataStandardizationService`), invokes `CozeService.run_workflow` with `{text | file_image_id | file_voice_id, user_id}`, and posts the result back via `WeChatService.send_kf_message`.
+6. The background coroutine extracts text/image/voice inline (no separate standardization service — `DataStandardizationService` is dead code slated for removal), invokes `CozeService.run_workflow` / `DifyService.run_workflow` with `{text | file_image_id | file_voice_id, user_id}`, and posts the result back via `WeChatService.send_kf_message`.
 
 ### Single-round mode — what that means in code
 
@@ -116,10 +116,10 @@ WeChat KF server ──POST /wechat/kf/callback──▶ FastAPI
 | `routes/wechat.py` | `GET /wechat/kf/callback` (URL verify), `POST /wechat/kf/callback` (message), `GET /wechat/test`. |
 | `routes/monitoring.py` | `/monitoring/health`, `/health/detailed`, `/metrics`, `/stats`. |
 | `services/wechat.py` | `WeChatService` + `WeChatConfig`. Wraps `wechatpy.enterprise.WeChatClient` and `wechatpy.enterprise.crypto.WeChatCrypto`. Owns signature verify, AES decrypt, message sync, single-message processing, KF message send. |
-| `services/coze.py` | `CozeService`. Calls the Coze workflow via `httpx`; also holds a `cozepy.Coze` SDK client. `run_workflow()` accepts the simplified `{text, file_image_id, file_voice_id}` input and converts to Coze `parameters`. |
+| `services/coze.py` | `CozeService`. Calls the Coze workflow via `httpx` (`/v1/workflow/stream_run` SSE); also holds a `cozepy.Coze` SDK client. **Note**: `run_workflow()` currently sends `parameters: {}` and ignores `input_data`/`user_id` (the deployed Coze workflow takes no inputs); the documented `{text, file_image_id, file_voice_id}` contract is stale for Coze. `DifyService.run_workflow` consumes its inputs faithfully. |
 | `services/media.py` | `MediaService`. Downloads temporary media from WeChat (uses `pydub` + `ffmpeg` for voice). Auto-detects `ffmpeg` on Windows. |
-| `services/standardization.py` | `DataStandardizationService`. WeChat message → `StandardizedMessage` (single-turn, no history). |
-| `services/bot_trace.py` | `BotTrace` + `render_trace()`. 智能机器人决策日志 (可拔插, 默认关闭), 记录每条消息经过的 7 个阶段 (接收/预过滤/去重/上下文/媒体/AI/推送) 并按 `APP_BOT_TRACE_MODE` 渲染。 |
+| `services/standardization.py` | `DataStandardizationService`. **Dead code at runtime** — no caller; `process_single_message` inlines its own extraction. Slated for removal. |
+| `services/bot_trace.py` | `BotTrace` + `render_trace()`. 智能机器人决策日志 (可拔插, 默认关闭), 记录每条消息经过的 9 个阶段 (接收/预过滤/去重/上下文/媒体/知识库/思考/AI/推送) 并按 `APP_BOT_TRACE_MODE` 渲染。 |
 | `tasks/*.py` | Celery task definitions for `wechat`/`coze`/`media`. Unused in current single-round mode but kept for future use. |
 
 ### Bot 决策日志 (可选, 智能机器人增强)
@@ -145,7 +145,7 @@ All config is env-driven via `pydantic-settings`. Required keys for a working de
 
 The `Settings` classes use `env_prefix` so group names map directly: `WECHAT_*` → `WeChatSettings`, `COZE_*` → `CozeSettings`, etc. The `Settings` aggregator also reads `.env` directly.
 
-The Coze workflow contract is documented in `COZE_WORKFLOW_GUIDE.md` — the workflow must accept `{user_id, text?, file_image_id?, file_voice_id?}` and return `{action, reply_content: {msgtype, text: {content}}, metadata}`. `run_workflow` JSON-stringifies `file_image_id` / `file_voice_id` values as `{"file_id": ...}` before posting.
+The Coze workflow contract is documented in `COZE_WORKFLOW_GUIDE.md` — the workflow was designed to accept `{user_id, text?, file_image_id?, file_voice_id?}` and return `{action, reply_content: {msgtype, text: {content}}, metadata}`. In practice `CozeService.run_workflow` sends `parameters: {}` (the deployed workflow takes no inputs); `DifyService.run_workflow` implements the documented input contract. The `file_image_id` / `file_voice_id` JSON-stringification as `{"file_id": ...}` applies to Coze; Dify uses `{type, transfer_method, upload_file_id}` file-object arrays.
 
 ## Code conventions
 

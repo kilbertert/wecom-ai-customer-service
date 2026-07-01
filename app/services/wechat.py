@@ -1,5 +1,6 @@
 """微信服务模块"""
 import time
+import traceback
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
 import httpx
 import logging
@@ -15,16 +16,7 @@ from wechatpy.exceptions import InvalidSignatureException
 from wechatpy.enterprise import WeChatClient
 from wechatpy.session.memorystorage import MemoryStorage
 
-import os
 from app.core.config import settings
-
-
-from flask import request
-import xml.etree.ElementTree as ET
-import base64
-from Crypto.Cipher import AES
-import struct
-import hashlib
 
 
 from app.models.wechat import (
@@ -185,31 +177,19 @@ class WeChatService:
 
         # 检查组件是否可用
         if not self.client:
-            print("[WARNING] WeChat客户端不可用，某些功能将被禁用")
+            logger.warning("WeChat客户端不可用，某些功能将被禁用")
         if not self.crypto:
-            print("[WARNING] WeChat加密工具不可用，消息解密功能将被禁用")
+            logger.warning("WeChat加密工具不可用，消息解密功能将被禁用")
 
     def verify_signature(self, signature: str, timestamp: str, nonce: str, msg_encrypt: str = "") -> bool:
-        """验证签名"""
-        try:
-            
-            # 手动实现签名验证
-            import hashlib
-            token = self.config.kf_token  # 确保获取字符串值
-
-            params = [token, timestamp, nonce, msg_encrypt]
-            
-            params.sort()
-            tmp_str = ''.join(params)
-            expected_signature = hashlib.sha1(tmp_str.encode('utf-8')).hexdigest()
-
-            return expected_signature == signature
-        except Exception as e:
-            logger.error(f"签名验证异常: {e}")
-            return False
+        """验证签名 (委托 ``WeComCrypto``)。"""
+        from app.crypto import wecom_crypto
+        return wecom_crypto.verify_signature(
+            self.config.kf_token, timestamp, nonce, msg_encrypt, signature
+        )
 
     def verify_bot_signature(self, signature: str, timestamp: str, nonce: str, msg_body: str = "") -> bool:
-        """验证群机器人回调签名
+        """验证群机器人回调签名 (与 KF 同算法, 委托 ``WeComCrypto``)。
 
         微信群机器人签名算法: SHA1( sort([token, timestamp, nonce, msg_body]) )
         消息体明文 JSON,不加密。
@@ -223,16 +203,10 @@ class WeChatService:
         Returns:
             签名是否匹配
         """
-        try:
-            token = self.config.kf_token
-            params = [token, timestamp, nonce, msg_body]
-            params.sort()
-            tmp = "".join(params)
-            expected = hashlib.sha1(tmp.encode("utf-8")).hexdigest()
-            return expected == signature
-        except Exception as e:
-            logger.error(f"群机器人签名验证异常: {e}")
-            return False
+        from app.crypto import wecom_crypto
+        return wecom_crypto.verify_signature(
+            self.config.kf_token, timestamp, nonce, msg_body, signature
+        )
 
     def decrypt_message(self, encrypted_msg: str, signature: str = "", timestamp: str = "", nonce: str = "") -> str:
         """解密消息"""
@@ -245,178 +219,29 @@ class WeChatService:
         except Exception as e:
             logger.error(f"消息解密失败: {e}")
             return encrypted_msg
+
     @staticmethod
     def decrypt_message_custom(encrypted_msg: str, encoding_aes_key: str, corp_id: str) -> str:
-        try:
-            print("=" * 60)
-            print("开始解密...")
-            print(f"加密消息长度: {len(encrypted_msg)}")
-            
-            # 1. 准备AES Key
-            # 补全=号（43位 -> 44位，能被4整除）
-            if len(encoding_aes_key) != 43:
-                raise ValueError(f"EncodingAESKey应该是43位，实际是{len(encoding_aes_key)}位")
+        """AES 解密 (委托 ``app.crypto.wecom_crypto.decrypt_message``)。
 
-            aes_key = encoding_aes_key + "="
-            key = base64.b64decode(aes_key)
-
-
-            # IV是key的前16字节
-            iv = key[:16]
-            
-            
-            # 2. Base64解码
-            encrypted_data = base64.b64decode(encrypted_msg)
-          
-            
-            # 3. AES-256-CBC解密
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            decrypted = cipher.decrypt(encrypted_data)
-            
-            
-            # 4. 调试：查看解密后的前100字节
-            
-            
-            # 5. 尝试不同的填充处理方式
-            # 方式1：标准PKCS7去除填充
-            try:
-                pad = decrypted[-1]
-                print(f"最后字节（可能为填充）: {pad}")
-                
-                if 1 <= pad <= 32:
-                    # 正常去除填充
-                    unpadded = decrypted[:-pad]
-                    print(f"方式1: 去除{pad}字节填充")
-                    result = unpadded
-                else:
-                    # 填充字节无效，尝试其他方式
-                    print("方式1: 填充字节无效，尝试方式2")
-                    result = decrypted
-            except Exception as e:
-                print(f"方式1失败: {e}")
-                result = decrypted
-            
-            # 6. 尝试解析数据结构
-            try:
-                # 企业微信格式：16字节随机数 + 4字节消息长度 + 消息内容 + corp_id
-                if len(result) >= 20:
-                    random_str = result[:16]
-                    msg_len_bytes = result[16:20]
-                    msg_len = struct.unpack('>I', msg_len_bytes)[0]
-                    
-                    print(f"随机字符串长度: 16字节")
-                    print(f"消息长度字段: {msg_len}字节")
-                    
-                    if 20 + msg_len <= len(result):
-                        msg_content = result[20:20+msg_len]
-                        corp_id_from_msg = result[20+msg_len:]
-                        
-                        print(f"提取的消息长度: {len(msg_content)}字节")
-                        print(f"提取的CorpID长度: {len(corp_id_from_msg)}字节")
-                        
-                        # 转换为字符串
-                        try:
-                            msg_str = msg_content.decode('utf-8')
-                            corp_str = corp_id_from_msg.decode('utf-8')
-                            
-                            print(f"提取的CorpID: {corp_str}")
-                            
-                            # 验证corp_id
-                            if corp_str == corp_id:
-                                print("✓ CorpID验证通过")
-                                return msg_str
-                            else:
-                                print(f"⚠ CorpID不匹配: 期望={corp_id}, 实际={corp_str}")
-                                # 仍然返回内容用于调试
-                                return msg_str
-                        except UnicodeDecodeError:
-                            print("UTF-8解码失败，尝试其他编码")
-                    else:
-                        print(f"数据长度不足: 需要{20+msg_len}字节，实际{len(result)}字节")
-            except Exception as e:
-                print(f"结构化解析失败: {e}")
-            
-            # 7. 如果结构化解析失败，尝试直接查找XML
-            print("尝试直接查找XML内容...")
-            try:
-                # 尝试UTF-8解码
-                content = result.decode('utf-8', errors='ignore')
-            except:
-                content = str(result)
-            
-            # 查找<xml>标签
-            xml_start = content.find('<xml>')
-            xml_end = content.find('</xml>')
-            
-            if xml_start != -1 and xml_end != -1:
-                xml_content = content[xml_start:xml_end+6]  # +6 是</xml>的长度
-                print(f"✓ 成功提取XML片段")
-                return xml_content
-            else:
-                # 返回原始内容用于调试
-                print(f"✗ 未找到XML标签，返回原始内容")
-                return content[:500]  # 只返回前500字符避免过长
-                
-        except Exception as e:
-            print(f"解密过程异常: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+        保留静态方法签名以兼容现有调用方 (route 层 ``WeChatService.decrypt_message_custom(...)``)。
+        """
+        from app.crypto import wecom_crypto
+        return wecom_crypto.decrypt_message(encrypted_msg, encoding_aes_key, corp_id)
 
     @staticmethod
     def encrypt_message_custom(reply_xml: str, encoding_aes_key: str, corp_id: str, timestamp: str, nonce: str, token: str) -> str:
-        """加密回复并返回 XML 信封
+        """加密回复并返回 XML 信封 (委托 ``app.crypto.wecom_crypto.encrypt_message``)。
 
-        微信智能机器人/客服的回复格式:
-          <xml>
-             <Encrypt><![CDATA[B64_...]]></Encrypt>
-             <MsgSignature>SHA1(sort([token, timestamp, nonce, encrypt]))</MsgSignature>
-             <TimeStamp>...</TimeStamp>
-             <Nonce>...</Nonce>
-          </xml>
-        其中 encrypt = base64( AES-256-CBC( pkcs7( 16随机 + 4字节len + reply_xml + corp_id ) ) )
-        AES key = base64decode(encoding_aes_key + "="), IV = key[:16]
+        保留静态方法签名以兼容现有调用方 (route 层 ``_build_bot_sync_envelope``)。
         """
+        from app.crypto import wecom_crypto
         try:
-            import struct, os
-            if len(encoding_aes_key) != 43:
-                raise ValueError(f"EncodingAESKey 必须是 43 位，实际 {len(encoding_aes_key)}")
-
-            key = base64.b64decode(encoding_aes_key + "=")
-            iv = key[:16]
-
-            rand16 = os.urandom(16)
-            msg_bytes = reply_xml.encode("utf-8")
-            msg_len = struct.pack(">I", len(msg_bytes))
-            corp_bytes = corp_id.encode("utf-8")
-            body = rand16 + msg_len + msg_bytes + corp_bytes
-
-            # PKCS7 填充到 32 字节边界
-            pad_len = 32 - (len(body) % 32)
-            if pad_len == 0:
-                pad_len = 32
-            body = body + bytes([pad_len] * pad_len)
-
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            encrypted = cipher.encrypt(body)
-            encrypt_b64 = base64.b64encode(encrypted).decode("utf-8")
-
-            # 计算 MsgSignature
-            sig_items = sorted([token, timestamp, nonce, encrypt_b64])
-            msg_signature = hashlib.sha1("".join(sig_items).encode("utf-8")).hexdigest()
-
-            envelope = (
-                f"<xml>"
-                f"<Encrypt><![CDATA[{encrypt_b64}]]></Encrypt>"
-                f"<MsgSignature><![CDATA[{msg_signature}]]></MsgSignature>"
-                f"<TimeStamp>{timestamp}</TimeStamp>"
-                f"<Nonce><![CDATA[{nonce}]]></Nonce>"
-                f"</xml>"
+            return wecom_crypto.encrypt_message(
+                reply_xml, encoding_aes_key, corp_id, timestamp, nonce, token
             )
-            return envelope
         except Exception as e:
             logger.error(f"encrypt_message_custom 失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             raise
 
@@ -429,7 +254,7 @@ class WeChatService:
             # wechatpy 会自动管理 access token，直接返回当前的 token
             return self.client.access_token
         except Exception as e:
-            print(f"[ERROR] 获取Access Token失败: {e}")
+            logger.error(f"获取Access Token失败: {e}")
             raise
 
 

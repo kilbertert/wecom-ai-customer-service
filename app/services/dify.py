@@ -162,6 +162,7 @@ class DifyService:
         self,
         input_data: Any,
         client: "DifyClient",
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Chatflow (advanced-chat) app 调用路径。
 
@@ -170,6 +171,11 @@ class DifyService:
             - 文件走顶层 ``files`` 数组, 不放在 ``inputs[<file_var>]`` 里
             - 响应扁平: ``answer`` + ``metadata.retriever_resources``,
               没有 ``data.outputs`` 嵌套
+
+        多轮续接:
+            - 传入上次会话的 ``conversation_id`` (首次为 None/空串 → Dify 新建会话)
+            - 响应里的 ``conversation_id`` 通过返回 dict 顶层字段回传, 供
+              ``ConversationStore.save`` 持久化, 下一轮续接。
 
         响应归一化: 把 chatflow 的扁平响应写到 ``raw.data.outputs.text``
         和 ``raw.data.outputs.knowledge``, 让现有 ``extract_assistant_text`` /
@@ -215,13 +221,14 @@ class DifyService:
         if not query:
             query = "收到您的消息"
 
-        # 2) 调 chatflow
+        # 2) 调 chatflow (透传 conversation_id 续接多轮)
         try:
             raw = await client.run_chatflow(
                 query=query,
                 inputs={},
                 files=files or None,
                 response_mode="blocking",
+                conversation_id=conversation_id or "",
             )
         except DifyError as e:
             logger.error("Dify chatflow error: %s", e)
@@ -270,11 +277,15 @@ class DifyService:
             "images": [],
             "videos": [],
             "files": [],
+            "conversation_id": raw.get("conversation_id") or "",
             "raw": normalized_raw,
         }
 
     async def run_workflow(
-        self, input_data: Any, user_id: str = "wechat_user"
+        self,
+        input_data: Any,
+        user_id: str = "wechat_user",
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """触发 Dify workflow。
 
@@ -309,7 +320,7 @@ class DifyService:
 
         # 路由: chatflow / advanced-chat app 用 run_chatflow
         if (client.app_mode or "chatflow") == "chatflow":
-            return await self._run_chatflow(input_data, client)
+            return await self._run_chatflow(input_data, client, conversation_id)
 
         # 构造 workflow inputs
         inputs: Dict[str, Any] = {}
@@ -460,6 +471,8 @@ class DifyService:
             "images": images,
             "videos": videos,
             "files": files,
+            # workflow 模式一般无 conversation_id (非 chatflow), 留空保持接口一致
+            "conversation_id": (raw or {}).get("conversation_id") or "",
             "raw": raw,
         }
 

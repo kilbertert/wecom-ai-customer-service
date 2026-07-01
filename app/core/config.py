@@ -1,10 +1,13 @@
 """配置管理模块"""
 
+import logging
 from typing import List, Optional
 
 from pydantic import Field
 from pydantic.types import SecretStr
 from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
 
 
 class WeChatSettings(BaseSettings):
@@ -227,6 +230,13 @@ class AppSettings(BaseSettings):
         description="inline 模式下 trace 块最大字符数;超出截断",
     )
 
+    # conversation_id 映射存储 (非 SessionService, 仅存一个 id 字符串让 Dify chatflow 续接)
+    # "memory" (默认, 单 worker) | "redis" (多 worker 抗重启)
+    conversation_store: str = Field(
+        "memory",
+        description='conversation_id 映射存储: "memory" | "redis"',
+    )
+
     class Config:
         env_prefix = "APP_"
         env_file = ".env"  # 必需: 否则 APP_* 字段不会从 .env 读取
@@ -262,7 +272,7 @@ def load_settings():
     # 1. 首先尝试从.env文件加载
     try:
         settings = Settings()
-        print("[INFO] 配置从.env文件加载成功")
+        logger.info("配置从.env文件加载成功")
 
         # 检查是否使用了占位符值
         if (
@@ -270,37 +280,37 @@ def load_settings():
             or str(settings.wechat.corp_secret).startswith("PLACEHOLDER")
             or str(settings.coze.api_token).startswith("PLACEHOLDER")
         ):
-            print("[WARNING] 检测到占位符配置值，请确保已正确配置生产环境变量")
+            logger.warning("检测到占位符配置值，请确保已正确配置生产环境变量")
 
         return
     except Exception as e:
-        print(f"[WARNING] 从.env文件加载配置失败: {e}")
+        logger.warning("从.env文件加载配置失败: %s", e)
 
     # 2. 尝试从env.example加载
-    print("[INFO] 尝试从env.example文件加载配置...")
+    logger.info("尝试从env.example文件加载配置...")
     try:
         # 临时修改配置以从env.example加载
         original_env_file = Settings.Config.env_file
         Settings.Config.env_file = "env.example"
 
         settings = Settings()
-        print("[INFO] 配置从env.example文件加载成功")
-        print("[WARNING] ⚠️  您正在使用示例配置!")
-        print("[WARNING] 生产环境请创建.env文件并填入真实配置值")
+        logger.info("配置从env.example文件加载成功")
+        logger.warning("您正在使用示例配置!")
+        logger.warning("生产环境请创建.env文件并填入真实配置值")
 
         # 恢复原始配置
         Settings.Config.env_file = original_env_file
         return
     except Exception as e2:
-        print(f"[ERROR] 从env.example加载配置也失败: {e2}")
+        logger.error("从env.example加载配置也失败: %s", e2)
         Settings.Config.env_file = original_env_file
 
     # 3. 使用默认配置（含占位符）
-    print("[INFO] 使用默认配置（含占位符值）...")
+    logger.info("使用默认配置（含占位符值）...")
     try:
         settings = Settings()
     except Exception as e3:
-        print(f"[ERROR] 即使使用默认配置也失败: {e3}")
+        logger.error("即使使用默认配置也失败: %s", e3)
     raise SystemExit(1)
 
 

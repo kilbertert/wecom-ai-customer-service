@@ -115,13 +115,14 @@ async def service_info():
     return {
         "service": settings.app.app_name,
         "version": settings.app.version,
-        "description": "微信客服接入Coze智能体",
+        "description": "微信客服/智能机器人接入 AI 智能体 (Coze / Dify 可切换)",
+        "ai_backend": (settings.app.ai_backend or "coze").lower(),
         "features": [
-            "微信回调处理",
-            "消息标准化",
-            "Coze工作流集成",
-            "会话管理",
-            "媒体文件处理",
+            "微信回调处理 (客服 KF + 智能机器人)",
+            "媒体文件处理 (图片/语音)",
+            "多模态回复 (markdown)",
+            "Coze / Dify 双后端可切换",
+            "Chatwoot 双向集成",
             "监控和健康检查"
         ],
         "endpoints": {

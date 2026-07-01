@@ -295,6 +295,31 @@ async def test_chatflow_mode_calls_run_chatflow(chatflow_service):
     client.run_workflow.assert_not_awaited()
 
 
+async def test_chatflow_passes_conversation_id_for_continuation(chatflow_service):
+    """传入 conversation_id 时应透传给 run_chatflow, 续接多轮会话。"""
+    svc, client = chatflow_service
+    await svc.run_workflow(
+        {"text": "第二轮"}, user_id="wx-user-1", conversation_id="cf-conv-001"
+    )
+    call_kwargs = client.run_chatflow.await_args.kwargs
+    assert call_kwargs["conversation_id"] == "cf-conv-001"
+
+
+async def test_chatflow_first_turn_passes_empty_conversation_id(chatflow_service):
+    """首次会话 (conversation_id=None) 应传空串, Dify 新建会话。"""
+    svc, client = chatflow_service
+    await svc.run_workflow({"text": "首轮"}, user_id="wx-user-1")
+    call_kwargs = client.run_chatflow.await_args.kwargs
+    assert call_kwargs["conversation_id"] == ""
+
+
+async def test_chatflow_returns_conversation_id_for_persistence(chatflow_service):
+    """chatflow 返回 dict 顶层应携带 conversation_id, 供 ConversationStore 持久化。"""
+    svc, _client = chatflow_service
+    result = await svc.run_workflow({"text": "首轮"}, user_id="wx-user-1")
+    assert result["conversation_id"] == "cf-conv-001"
+
+
 async def test_chatflow_mode_passes_query_field(chatflow_service):
     """chatflow 请求的 query 字段 = 用户文本 (不是 inputs.input_text)。"""
     svc, client = chatflow_service

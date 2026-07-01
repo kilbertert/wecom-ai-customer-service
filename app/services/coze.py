@@ -63,13 +63,14 @@ class CozeService:
         """
         return await self.run_workflow(input_data, user_id)
 
-    async def run_workflow(self, input_data: Dict[str, Any], user_id: str = "wechat_user") -> Dict[str, Any]:
+    async def run_workflow(self, input_data: Dict[str, Any], user_id: str = "wechat_user", conversation_id: Optional[str] = None) -> Dict[str, Any]:
         """运行Coze工作流 - 使用 stream_run API（SSE 流式响应）
 
         Args:
             input_data: 兼容旧字段，目前**不传给新工作流**（新工作流用空 parameters），
                         保留参数签名以便将来再扩展
             user_id: 用户ID，目前**不传给新工作流**
+            conversation_id: 兼容 DifyService 同形接口; Coze workflow 模式无会话续接概念, 忽略
 
         Returns:
             工作流执行结果，统一为下游可识别的格式：
