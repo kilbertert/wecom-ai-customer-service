@@ -54,10 +54,16 @@ class KfAdapter(ProtocolAdapter):
     dedup_ttl: int = KF_DEDUP_TTL
 
     async def receive(self, request: Any) -> List[InboundMessage]:
-        """解析 KF 回调, 返回最新一条客户消息 (单元素列表)。
+        """解析 KF 回调, 返回本次同步的全部客户消息 (按时间升序)。
 
         流程: 取 body → 预解析 Encrypt → 验签 → 解密 → 找 ``kf_msg_or_event``
-        事件 → ``sync_latest_messages`` 拉最新 → 归一为 ``InboundMessage``。
+        事件 → ``sync_latest_messages`` 拉最新 → 全部归一为 ``InboundMessage``。
+
+        ``sync_latest_messages`` 返回按 ``send_time`` **降序** (最新在前); 这里
+        反转为**升序** (最旧在前) 返回, 让 route 层 BackgroundTasks 按时间顺序
+        串行处理, Dify chatflow 多轮 ``conversation_id`` 才能正确续接。
+        旧版只取 ``messages[0]`` (最新一条), 一次回调内多条客户消息静默丢弃
+        (修复 A5)。每条独立 dedup, 已处理过的由 ``MessageProcessor`` 跳过。
 
         任何环节失败 (验签不过 / 解密失败 / 非目标事件 / 同步无消息) 返回空列表,
         route 层统一回 ``"success"`` 给微信。
@@ -155,13 +161,25 @@ class KfAdapter(ProtocolAdapter):
             logger.info("[KF] 未找到有效的客户消息")
             return []
 
-        latest = messages[0]
-        inbound = self._to_inbound(latest)
+        # A5: 派发本次同步的全部客户消息 (旧版只取 messages[0]=最新, 其余丢弃)。
+        # messages 按 send_time 降序 (最新在前) → 反转为升序 (最旧在前), 让多轮
+        # conversation_id 按时间顺序续接。无 msgid 的脏数据无法 dedup, 跳过。
+        inbound_list: List[InboundMessage] = []
+        for msg in reversed(messages):
+            inbound = self._to_inbound(msg)
+            if not inbound.msgid:
+                logger.warning("[KF] 跳过无 msgid 的消息: type=%s", inbound.msg_type)
+                continue
+            inbound_list.append(inbound)
+        if not inbound_list:
+            logger.info("[KF] 同步到的消息均无 msgid, 无可派发")
+            return []
         logger.info(
-            "[KF] 选中最新消息: msgid=%s type=%s user=%s",
-            inbound.msgid, inbound.msg_type, inbound.user_id,
+            "[KF] 选中 %d 条客户消息 (按时间升序派发): %s",
+            len(inbound_list),
+            [m.msgid for m in inbound_list],
         )
-        return [inbound]
+        return inbound_list
 
     async def send(
         self,

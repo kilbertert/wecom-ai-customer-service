@@ -195,15 +195,18 @@ class MessageProcessor:
                         else ""
                     )
 
-            # 6) 空回复兜底
+            # 6) 空回复兜底 (B1): KF 与 bot 都给用户一个兜底文案, 不再静默丢弃
+            #    (旧版 KF 只记日志+return, 用户什么都收不到; Dify data.status=failed
+            #    经 compose 变空串时尤甚)。兜底后正常走 step 7 投递 + mark_done。
             if not reply_text or not reply_text.strip():
-                if is_bot:
-                    reply_text = "（AI 未返回内容）"
-                else:
-                    logger.warning(
-                        "[PROC] msgid=%s 工作流返回空内容, 跳过发送", msgid
-                    )
-                    return
+                reply_text = (
+                    "抱歉，我暂时无法处理该消息，请稍后重试。"
+                    if not is_bot
+                    else "（AI 未返回内容）"
+                )
+                logger.warning(
+                    "[PROC] msgid=%s 工作流返回空内容, 使用兜底文案", msgid
+                )
 
             # 7) 发送去重 + 投递
             if not await dedup.mark_sent(msgid):

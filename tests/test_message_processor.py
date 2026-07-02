@@ -283,14 +283,16 @@ async def test_send_failure_skips_chatwoot():
     sync_mock.notify_incoming.assert_not_awaited()
 
 
-async def test_empty_workflow_result_skips_send():
+async def test_empty_workflow_result_uses_kf_fallback():
+    """B1: KF 工作流返回空内容时, 给用户兜底文案 (不再静默丢弃)。"""
     proc, ai, wechat, media, conv = _make_processor()
     ai.run_workflow = AsyncMock(return_value={"content": "", "text": ""})
     dedup = InMemoryDedupStore()
     adapter = _FakeAdapter(dedup)
 
     await proc.process(_inbound(text="hi"), adapter)
-    assert adapter.sent == []
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0][1].text == "抱歉，我暂时无法处理该消息，请稍后重试。"
 
 
 # ---------------------------------------------------------------------------

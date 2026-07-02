@@ -200,6 +200,54 @@ async def test_receive_no_messages_returns_empty():
     assert await adapter.receive(req) == []
 
 
+async def test_receive_multiple_messages_returns_all_in_chronological_order():
+    """A5: 一次回调多条客户消息全部派发, 按时间升序 (最旧在前)。
+
+    sync_latest_messages 返回降序 (最新在前); receive 反转为升序, 让多轮
+    conversation_id 按时间顺序续接。旧版只取 messages[0] 会丢弃其余。
+    """
+    svc = _make_svc()
+    # 降序: 最新 m_newest (send_time 最大) 在前
+    svc.sync_latest_messages = AsyncMock(
+        return_value=[
+            _msg(msgid="m_newest", text={"content": "第三条"}, send_time=1705254002),
+            _msg(msgid="m_middle", text={"content": "第二条"}, send_time=1705254001),
+            _msg(msgid="m_oldest", text={"content": "第一条"}, send_time=1705254000),
+        ]
+    )
+    adapter = KfAdapter(svc, InMemoryDedupStore())
+    envelope = _kf_event_xml("tok", "kf_1")
+    encrypt = ET.fromstring(envelope).findtext("Encrypt")
+    ts, nonce = "1700000004", "nc5b"
+    req = _make_request(envelope, ts, nonce)
+    req.query_params["msg_signature"] = _sig(ts, nonce, encrypt)
+
+    result = await adapter.receive(req)
+
+    assert [m.msgid for m in result] == ["m_oldest", "m_middle", "m_newest"]
+    assert [m.text for m in result] == ["第一条", "第二条", "第三条"]
+
+
+async def test_receive_skips_messages_without_msgid():
+    """A5: 无 msgid 的脏数据无法 dedup, 跳过 (不混入返回列表)。"""
+    svc = _make_svc()
+    svc.sync_latest_messages = AsyncMock(
+        return_value=[
+            _msg(msgid="m1", text={"content": "ok"}, send_time=1705254001),
+            _msg(msgid="", text={"content": "脏数据"}, send_time=1705254000),
+        ]
+    )
+    adapter = KfAdapter(svc, InMemoryDedupStore())
+    envelope = _kf_event_xml("tok", "kf_1")
+    encrypt = ET.fromstring(envelope).findtext("Encrypt")
+    ts, nonce = "1700000004", "nc5c"
+    req = _make_request(envelope, ts, nonce)
+    req.query_params["msg_signature"] = _sig(ts, nonce, encrypt)
+
+    result = await adapter.receive(req)
+    assert [m.msgid for m in result] == ["m1"]
+
+
 async def test_receive_skips_non_allowed_kfid(monkeypatch):
     """settings.wechat.allowed_open_kfid 命中时跳过其他客服。"""
     from app.core.config import settings

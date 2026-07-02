@@ -12,9 +12,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -221,11 +220,40 @@ class DifyService:
         if not query:
             query = "收到您的消息"
 
+        # F3) chatflow user_input_form select 字段 (input_language /
+        # input_hint_endpoint / input_hint_region) 决定 chatflow 内 L1 板块路由。
+        # 旧版恒传 inputs={} → Dify 全用字段 default="" → 路由精度受损。
+        # 取值优先级: input_data 透传 (language/hint_endpoint/hint_region) > 部署级
+        # 配置 (DIFY_CHATFLOW_INPUT_*) > 不传 (Dify 用 default)。仅传非空值。
+        inputs: Dict[str, Any] = {}
+        if isinstance(input_data, dict):
+            lang = str(input_data.get("language") or "").strip()
+            endpoint = str(input_data.get("hint_endpoint") or "").strip()
+            region = str(input_data.get("hint_region") or "").strip()
+        else:
+            lang = endpoint = region = ""
+        if not lang:
+            lang = (getattr(settings.dify, "chatflow_input_language", "") or "").strip()
+        if not endpoint:
+            endpoint = (
+                getattr(settings.dify, "chatflow_input_hint_endpoint", "") or ""
+            ).strip()
+        if not region:
+            region = (
+                getattr(settings.dify, "chatflow_input_hint_region", "") or ""
+            ).strip()
+        if lang:
+            inputs["input_language"] = lang
+        if endpoint:
+            inputs["input_hint_endpoint"] = endpoint
+        if region:
+            inputs["input_hint_region"] = region
+
         # 2) 调 chatflow (透传 conversation_id 续接多轮)
         try:
             raw = await client.run_chatflow(
                 query=query,
-                inputs={},
+                inputs=inputs,
                 files=files or None,
                 response_mode="blocking",
                 conversation_id=conversation_id or "",
@@ -399,12 +427,6 @@ class DifyService:
             inputs[settings.dify.input_text] = "收到您的消息"
 
         logger.info("Dify workflow inputs keys=%s", list(inputs.keys()))
-        # DEBUG: dump 实际发送给 Dify 的 inputs (诊断 input_img_id 格式)
-        import json as _json
-
-        logger.warning(
-            f"[DIAG] inputs payload: {_json.dumps(inputs, ensure_ascii=False)[:500]}"
-        )
 
         # 调用 workflow
         try:
@@ -420,30 +442,6 @@ class DifyService:
             "Dify workflow 成功: assistant_text_len=%d",
             len(assistant_text) if assistant_text else 0,
         )
-        # 一期诊断: dump raw 头尾到日志, 看真实结构
-        try:
-            raw_str = json.dumps(raw, ensure_ascii=False)
-            logger.warning(
-                "DIAG raw head (300): %s",
-                raw_str[:300].replace("\n", " "),
-            )
-            logger.warning(
-                "DIAG raw tail (300): %s",
-                raw_str[-300:].replace("\n", " "),
-            )
-            # 检查 output 字段的真实形态
-            outputs_check = ((raw or {}).get("data") or {}).get("outputs") or {}
-            for k, v in outputs_check.items():
-                v_str = str(v)
-                logger.warning(
-                    "DIAG outputs[%s] type=%s len=%d head=%.120s",
-                    k,
-                    type(v).__name__,
-                    len(v_str),
-                    v_str[:120].replace("\n", " "),
-                )
-        except Exception as diag_err:
-            logger.error(f"DIAG 失败: {diag_err}")
 
         # 一期新增: 从 Dify 工作流 outputs 节点提取多模态字段。
         # Dify 工作流结束节点声明 images/videos/files (Array[String]) 后,

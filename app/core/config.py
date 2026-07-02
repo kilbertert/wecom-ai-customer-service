@@ -176,6 +176,20 @@ class DifySettings(BaseSettings):
     # Chatflow 专用超时 (跟 workflow_timeout 同源, 但语义上是两种调用)
     chatflow_timeout: int = Field(120, description="Chatflow 调用超时(秒)")
 
+    # Chatflow user_input_form select 字段 — 决定 chatflow 内 L1 板块路由。
+    # 部署级常量 (这个 wecom-ai 实例服务哪种端类型/地域/语言); 默认空=不传, Dify 用
+    # 字段 default=""。线上 charge_charging_v16 定义了这三个 select (见 /parameters)。
+    # 逐消息可在 input_data 里用 language/hint_endpoint/hint_region 覆盖 (见 _run_chatflow)。
+    chatflow_input_language: str = Field(
+        "", description='Chatflow select: input_language (zh|en|vi)'
+    )
+    chatflow_input_hint_endpoint: str = Field(
+        "", description='Chatflow select: input_hint_endpoint (user|butler|pc)'
+    )
+    chatflow_input_hint_region: str = Field(
+        "", description='Chatflow select: input_hint_region (cn|overseas)'
+    )
+
     class Config:
         env_prefix = "DIFY_"
         env_file = ".env"

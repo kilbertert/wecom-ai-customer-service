@@ -429,6 +429,71 @@ async def test_chatflow_mode_no_retriever_resources(chatflow_service):
     assert result["content"] == "纯回答,无检索"
 
 
+async def test_chatflow_inputs_empty_when_no_config_no_passthrough(chatflow_service):
+    """F3: 无配置且 input_data 无 hint → inputs 为空 (行为不变, Dify 用字段 default)。"""
+    svc, client = chatflow_service
+    await svc.run_workflow({"text": "你好"}, user_id="u")
+    call_kwargs = client.run_chatflow.await_args.kwargs
+    assert call_kwargs["inputs"] == {}
+
+
+async def test_chatflow_inputs_from_deployment_config(chatflow_service, monkeypatch):
+    """F3: 部署级配置 (DIFY_CHATFLOW_INPUT_*) 注入到 chatflow inputs。"""
+    monkeypatch.setattr(
+        "app.services.dify.settings.dify.chatflow_input_language", "zh"
+    )
+    monkeypatch.setattr(
+        "app.services.dify.settings.dify.chatflow_input_hint_endpoint", "user"
+    )
+    monkeypatch.setattr(
+        "app.services.dify.settings.dify.chatflow_input_hint_region", "cn"
+    )
+    svc, client = chatflow_service
+    await svc.run_workflow({"text": "你好"}, user_id="u")
+    call_kwargs = client.run_chatflow.await_args.kwargs
+    assert call_kwargs["inputs"] == {
+        "input_language": "zh",
+        "input_hint_endpoint": "user",
+        "input_hint_region": "cn",
+    }
+
+
+async def test_chatflow_inputs_passthrough_overrides_config(chatflow_service, monkeypatch):
+    """F3: input_data 透传值 (language/hint_endpoint/hint_region) 覆盖部署级配置。"""
+    monkeypatch.setattr(
+        "app.services.dify.settings.dify.chatflow_input_language", "zh"
+    )
+    monkeypatch.setattr(
+        "app.services.dify.settings.dify.chatflow_input_hint_region", "cn"
+    )
+    svc, client = chatflow_service
+    await svc.run_workflow(
+        {"text": "你好", "language": "en", "hint_endpoint": "butler"},
+        user_id="u",
+    )
+    call_kwargs = client.run_chatflow.await_args.kwargs
+    # 透传优先: language=en 覆盖 zh; hint_endpoint=butler (配置未设); region 走配置 cn
+    assert call_kwargs["inputs"] == {
+        "input_language": "en",
+        "input_hint_endpoint": "butler",
+        "input_hint_region": "cn",
+    }
+
+
+async def test_chatflow_inputs_only_non_empty_passed(chatflow_service, monkeypatch):
+    """F3: 空值不进 inputs (避免覆盖 Dify 字段 default)。"""
+    monkeypatch.setattr(
+        "app.services.dify.settings.dify.chatflow_input_hint_endpoint", "  "
+    )
+    svc, client = chatflow_service
+    await svc.run_workflow(
+        {"text": "你好", "language": "  ", "hint_region": ""},
+        user_id="u",
+    )
+    call_kwargs = client.run_chatflow.await_args.kwargs
+    assert call_kwargs["inputs"] == {}
+
+
 async def test_chatflow_mode_error_wrapped(chatflow_service):
     """chatflow 错误包装成 AIBackendError。"""
     from app.services.dify_client import DifyError
