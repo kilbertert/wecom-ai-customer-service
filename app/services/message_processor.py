@@ -95,7 +95,9 @@ class MessageProcessor:
         dedup = adapter.dedup
         ttl = getattr(adapter, "dedup_ttl", 300)
 
-        # 1) 去重
+        # 1) 去重: 进入 _processing (处理中, 可重试)。mark_done 仅在回复成功发送后
+        # 才调 (见 step 7) —— 此前若崩溃/取消, release_processing 清 _processing,
+        # 微信重试可重新 acquire, 不会丢消息 (修复 A1/A2/A3)。
         acquired = await dedup.acquire(msgid, ttl)
         if not acquired:
             logger.info("[PROC] msgid=%s 已处理过/处理中, 跳过", msgid)
@@ -103,14 +105,18 @@ class MessageProcessor:
         if trace is not None:
             trace.event("dedup", "ok", "首次处理")
 
+        # 记录是否已完成 (mark_done 已调), 供 finally 决定是否 release。
+        # 用 list 包一层供闭包写入 (Python 闭包不能直接赋值外层不可变)。
+        done_flag = [False]
         try:
             # 2) 媒体编排 + 预过滤 → input_data 或 canned_reply
             prepared = await self._prepare_input(inbound, trace)
             if not prepared.input_data and not prepared.canned_reply:
                 logger.info("[PROC] msgid=%s 无有效内容, 跳过", msgid)
+                # 无内容: 不发送, 直接 mark_done (无回复可丢, 也不必让重试再跑一遍)
                 await dedup.mark_done(msgid)
+                done_flag[0] = True
                 return
-            await dedup.mark_done(msgid)
 
             reply_text = ""
             if prepared.canned_reply:
@@ -122,7 +128,10 @@ class MessageProcessor:
                     logger.info(
                         "[PROC] handoff=True, 人工接管, 跳过 AI: msgid=%s", msgid
                     )
+                    # 人工接管: 不发 AI 回复 (人工经 Chatwoot 另一条路径回复)。
+                    # mark_done 防重试; 不消耗 conversation_id。
                     await dedup.mark_done(msgid)
+                    done_flag[0] = True
                     return
 
                 # 4) conversation_id 续接 (薄映射, Dify chatflow 多轮)
@@ -132,6 +141,16 @@ class MessageProcessor:
                 conversation_id = await self._conv.get(
                     inbound.user_id, scope
                 )
+                # context trace: 反映真实多轮状态 (替换 _prepare_input 里过时的
+                # "单轮模式,无历史" 文案 —— chatflow 透传 conversation_id 续接多轮)。
+                if trace is not None:
+                    if conversation_id:
+                        trace.event(
+                            "context", "ok",
+                            f"续接多轮 conv={conversation_id[:12]}…",
+                        )
+                    else:
+                        trace.event("context", "ok", "首次会话, 新建多轮")
 
                 # 5) 调 AI 工作流
                 try:
@@ -141,14 +160,20 @@ class MessageProcessor:
                         conversation_id=conversation_id,
                     )
                 except Exception as e:
+                    # B3: 对用户只回固定脱敏文案, 详细错误只进日志 (不发内部异常细节)
                     logger.error(
-                        "[PROC] AI 工作流失败: msgid=%s, %s", msgid, e
+                        "[PROC] AI 工作流失败: msgid=%s, %s", msgid, e,
+                        exc_info=True,
                     )
                     if trace is not None:
                         trace.event("knowledge", "skip", "无知识库检索")
                         trace.event("thinking", "skip", "无思考过程")
                         trace.event("ai", "fail", str(e)[:80])
-                    reply_text = f"AI 处理失败: {e}"
+                    reply_text = (
+                        "抱歉，AI 服务暂时不可用，请稍后重试。"
+                        if not is_bot
+                        else "AI 服务暂时不可用，请稍后重试"
+                    )
 
                 else:
                     # 持久化新 conversation_id
@@ -190,7 +215,12 @@ class MessageProcessor:
             )
             if not sent_ok:
                 logger.warning("[PROC] msgid=%s 回复投递失败", msgid)
+                # 发送失败: 释放 _processing 允许微信重试 (不 mark_done)
                 return
+
+            # 发送成功后才 mark_done (修复 A1): 此前任何崩溃/取消 → release → 可重试
+            await dedup.mark_done(msgid)
+            done_flag[0] = True
 
             # 8) Chatwoot 同步 (仅 KF: 把 AI 回复同步到人工侧)
             if not is_bot and inbound.open_kfid:
@@ -202,7 +232,19 @@ class MessageProcessor:
             logger.error(
                 "[PROC] 编排异常: msgid=%s, %s", msgid, e, exc_info=True
             )
-            await dedup.release_processing(msgid)
+        except BaseException as e:
+            # A3: CancelledError 等 BaseException 也要 release, 否则 msgid 卡
+            # _processing (且 _processing 旧版无 TTL 清理 → 永久泄漏)。记日志后重抛。
+            logger.warning(
+                "[PROC] 编排被中断 (BaseException): msgid=%s, %s", msgid,
+                type(e).__name__,
+            )
+            raise
+        finally:
+            # 未完成 (未走 mark_done) → 释放 _processing, 允许微信重试。
+            # 已 mark_done 的 msgid 已不在 _processing, release 是 no-op, 安全。
+            if not done_flag[0]:
+                await dedup.release_processing(msgid)
 
     # ------------------------------------------------------------------
     # 媒体编排 + 预过滤: InboundMessage → PreparedInput
@@ -398,7 +440,8 @@ class MessageProcessor:
             if inbound.media_ref:
                 detail += f" media={inbound.msg_type}"
             trace.event("prefilter", "ok", detail.strip() or "ok")
-            trace.event("context", "skip", "单轮模式,无历史")
+            # context trace 移到 process() 里 ConversationStore.get 之后发射,
+            # 以反映真实多轮状态 (续接/首次), 而非过时的"单轮模式,无历史"。
 
         # 2) input_data
         input_data: dict = {"user_id": inbound.user_id}
@@ -478,9 +521,13 @@ class MessageProcessor:
             finally:
                 await sync.aclose()
         except Exception as e:
+            # B2: fail-open —— Chatwoot 异常时默认不接管, 继续调 AI。
+            # 风险: 若人工实际已接管, AI 会抢答。保留 fail-open (避免 Chatwoot 抖动
+            # 时 AI 全面停摆), 但用 HANDOFF_FAIL_OPEN 标记提升可观测性, 便于告警/统计。
             logger.warning(
-                "[PROC] handoff 检查异常 (默认不接管): msgid=%s, %s",
-                inbound.msgid, e,
+                "[PROC] HANDOFF_FAIL_OPEN handoff 检查异常, 默认不接管 (AI 可能抢答): "
+                "msgid=%s, open_kfid=%s, %s",
+                inbound.msgid, inbound.open_kfid, e,
             )
             return False
         handoff = bool((result or {}).get("handoff"))

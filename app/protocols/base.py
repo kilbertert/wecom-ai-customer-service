@@ -113,21 +113,43 @@ class DedupStore(ABC):
 
     统一 KF 与 bot 两套原本互不相干的去重机制。
     防止微信重试风暴导致同一 msgid 被多次处理 / 多次回复。
+
+    状态机 (两态, 带 TTL):
+
+        [无] --acquire--> _processing (处理中, 可重试)
+                         |
+            失败/异常: release_processing --> [无]  (允许微信重试进来)
+            成功发送:  mark_done ----------> _processed (已发送, 防重发, ttl 内拒)
+                         |
+            ttl 过期:  -------------------> [无]
+
+    关键不变量 (修复 A1/A2/A3/A4):
+        - ``mark_done`` 必须在回复**成功发送之后**调用, 之前只持有
+          ``_processing``。这样处理中崩溃/取消 → ``release_processing`` 清
+          ``_processing`` → 微信重试可重新 ``acquire`` 成功, 不会丢消息。
+        - ``_processing`` 也带 TTL 并在 ``acquire`` 时清理, 防止取消/硬崩导致
+          的永久泄漏 (旧版只清 ``_processed``)。
+        - ``_processed`` 才是"防重发"标记 (ttl 内第二次 send 被拒);
+          ``_processing`` 只是"防并发处理"标记。
     """
 
     @abstractmethod
     async def acquire(self, msgid: str, ttl: float) -> bool:
-        """尝试占有 msgid 的处理权。
+        """尝试占有 msgid 的处理权 (进入 ``_processing``)。
 
         Returns:
             True = 首次占有, 调用方可继续处理;
-            False = 已被占有 (在 ttl 内), 调用方应跳过。
+            False = 已被占有 (在 ttl 内, 处理中或已发送), 调用方应跳过。
         """
         ...
 
     @abstractmethod
     async def mark_done(self, msgid: str) -> None:
-        """标记 msgid 处理完成 (从"处理中"移除)。"""
+        """标记 msgid 已成功发送回复 (``_processing`` → ``_processed``)。
+
+        必须在 ``adapter.send`` 成功后调用 —— 此前消息可被重试, 此后 ttl 内
+        拒绝重复处理 (防微信重试导致重发)。
+        """
         ...
 
     @abstractmethod
@@ -141,7 +163,7 @@ class DedupStore(ABC):
 
     @abstractmethod
     async def release_processing(self, msgid: str) -> None:
-        """处理失败时释放"处理中"标记, 允许重试。"""
+        """处理失败/取消时释放 ``_processing`` 标记, 允许微信重试。"""
         ...
 
 
@@ -150,14 +172,19 @@ class InMemoryDedupStore(DedupStore):
 
     与历史 ``WeChatService._processed_messages`` / route 模块 ``_bot_processed_msgs``
     行为一致: 进程级, 不抗重启 / 多 worker。多 worker 部署需换 Redis 实现。
+
+    状态 (见 ``DedupStore`` 文档):
+        - ``_processing``: msgid -> 进入时间戳 (处理中, 可重试; 带 ttl 清理防泄漏)
+        - ``_processed`` : msgid -> 完成时间戳 (已发送, ttl 内防重发)
+        - ``_sent``      : 已发送回复的 msgid 集合 (与 ``_processed`` 同生命周期)
     """
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        # msgid -> 处理完成时间戳 (用于 ttl 判断)
+        # msgid -> 完成时间戳 (已成功发送, 用于 ttl 防重发判断)
         self._processed: Dict[str, float] = {}
-        # 正在处理中的 msgid 集合
-        self._processing: set[str] = set()
+        # msgid -> 进入处理时间戳 (处理中, 带 ttl 清理防永久泄漏)
+        self._processing: Dict[str, float] = {}
         # 已发送回复的 msgid 集合
         self._sent: set[str] = set()
 
@@ -166,17 +193,21 @@ class InMemoryDedupStore(DedupStore):
             return True
         now = time.time()
         async with self._lock:
-            # 清理过期记录
+            # 清理过期 _processed (含 _sent)
             expired = [k for k, t in self._processed.items() if now - t > ttl]
             for k in expired:
                 self._processed.pop(k, None)
                 self._sent.discard(k)
+            # 清理过期 _processing (取消/硬崩导致的泄漏兜底)
+            stuck = [k for k, t in self._processing.items() if now - t > ttl]
+            for k in stuck:
+                self._processing.pop(k, None)
 
             if msgid in self._processing:
                 return False
             if msgid in self._processed and (now - self._processed[msgid]) < ttl:
                 return False
-            self._processing.add(msgid)
+            self._processing[msgid] = now
             return True
 
     async def mark_done(self, msgid: str) -> None:
@@ -184,7 +215,7 @@ class InMemoryDedupStore(DedupStore):
             return
         async with self._lock:
             self._processed[msgid] = time.time()
-            self._processing.discard(msgid)
+            self._processing.pop(msgid, None)
 
     async def mark_sent(self, msgid: str) -> bool:
         if not msgid:
@@ -199,7 +230,7 @@ class InMemoryDedupStore(DedupStore):
         if not msgid:
             return
         async with self._lock:
-            self._processing.discard(msgid)
+            self._processing.pop(msgid, None)
 
 
 __all__ = [

@@ -530,3 +530,102 @@ async def test_handoff_check_failure_fails_open_to_ai(monkeypatch):
         await proc.process(_inbound(text="你好"), adapter)
 
     ai.run_workflow.assert_awaited_once()
+    # B2: fail-open 仍调 AI, 但应有 HANDOFF_FAIL_OPEN 告警日志 (可观测性)
+
+
+# ---------------------------------------------------------------------------
+# A1/B3 修复回归 (dedup 时序 + AI 异常脱敏)
+# ---------------------------------------------------------------------------
+
+
+async def test_send_failure_allows_retry():
+    """A1: adapter.send 失败 → 不 mark_done → 微信重试可重新 acquire → AI 重跑。
+
+    旧版 mark_done 在 AI 之前就调用, send 失败后重试会被 _processed 挡住, 丢消息。
+    """
+    proc, ai, wechat, media, conv = _make_processor()
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+    adapter.send_ok = False  # 第一次发送失败
+
+    await proc.process(_inbound(msgid="retry1", text="你好"), adapter)
+    # send 失败 → 没有 mark_done, msgid 应可重新 acquire
+    assert await dedup.acquire("retry1", 300) is True
+
+
+async def test_crash_during_processing_keeps_retryable():
+    """A1/A2: 处理中抛未捕获异常 (非媒体失败) → msgid 不卡 _processed → 可重试。
+
+    媒体失败被 _prepare_kf_input 捕获转 PreparedInput() (设计如此: 微信临时
+    媒体过期, 重试无意义, 走 mark_done 丢弃)。本测试用 conversation_store 抛
+    异常模拟 _prepare_input 之外的崩溃, 验证 except → release_processing 路径。
+    """
+    proc, ai, wechat, media, conv = _make_processor()
+    conv.get = AsyncMock(side_effect=RuntimeError("conv store down"))
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    await proc.process(_inbound(msgid="crash1", text="你好"), adapter)
+    # 异常后未 mark_done → 重试可重新 acquire
+    assert await dedup.acquire("crash1", 300) is True
+
+
+async def test_cancelled_releases_processing():
+    """A3: CancelledError (BaseException) 也释放 _processing, 允许重试。"""
+    import asyncio as _asyncio
+
+    proc, ai, wechat, media, conv = _make_processor()
+    ai.run_workflow = AsyncMock(side_effect=_asyncio.CancelledError())
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    with pytest.raises(_asyncio.CancelledError):
+        await proc.process(_inbound(msgid="cancel1", text="你好"), adapter)
+
+    # CancelledError 被重抛但 finally 已 release → 重试可 acquire
+    assert await dedup.acquire("cancel1", 300) is True
+
+
+async def test_processing_ttl_prevents_permanent_leak():
+    """A4: _processing 带 TTL, acquire 时清理过期项 (不再永久泄漏)。"""
+    import time as _time
+
+    dedup = InMemoryDedupStore()
+    # 模拟一个卡死的 _processing (手工塞入)
+    async with dedup._lock:
+        dedup._processing["stuck"] = _time.time() - 999  # 远过期
+    # acquire 同一 msgid 应能成功 (过期 _processing 被清)
+    assert await dedup.acquire("stuck", 300) is True
+
+
+async def test_ai_exception_reply_is_sanitized():
+    """B3: AI 失败时回复固定脱敏文案, 不含异常细节。"""
+    proc, ai, wechat, media, conv = _make_processor()
+    ai.run_workflow = AsyncMock(
+        side_effect=RuntimeError("Dify workflow 500: outputs={secret:'x'}")
+    )
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    await proc.process(_inbound(msgid="err1", text="你好"), adapter)
+
+    assert len(adapter.sent) == 1
+    reply = adapter.sent[0][1].text
+    assert "secret" not in reply  # 不泄露内部 outputs
+    assert "500" not in reply  # 不泄露错误细节
+    assert "不可用" in reply or "重试" in reply  # 脱敏兜底文案
+
+
+async def test_bot_ai_exception_reply_is_sanitized():
+    """B3: bot 路径 AI 失败同样脱敏。"""
+    proc, ai, wechat, media, conv = _make_processor()
+    ai.run_workflow = AsyncMock(side_effect=RuntimeError("internal: outputs={db_conn}"))
+    dedup = InMemoryDedupStore()
+    adapter = _FakeAdapter(dedup)
+
+    await proc.process(_bot_inbound(msgid="berr1", text="你好"), adapter)
+
+    assert len(adapter.sent) == 1
+    reply = adapter.sent[0][1].text
+    assert "db_conn" not in reply
+    assert "不可用" in reply
