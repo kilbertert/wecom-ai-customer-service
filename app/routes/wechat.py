@@ -134,16 +134,8 @@ async def bot_callback_handler(
 
         inbound = inbound_list[0]
 
-        # dedup: 同一 msgid 在 ttl 内不重复处理 (立即回占位 envelope)
-        dedup = adapter.dedup
-        if not await dedup.acquire(inbound.msgid, adapter.dedup_ttl):
-            logger.info(
-                f"[BOT] msgid={inbound.msgid} 已处理过 (dedup), 返回占位 envelope"
-            )
-            placeholder = adapter.build_sync_ack(timestamp, nonce)
-            return Response(
-                status_code=200, content=placeholder, media_type="application/json"
-            )
+        # 去重由 MessageProcessor.process 统一负责 (与 KF 路径一致); route 层不再
+        # 重复 acquire —— 否则 process() 的 acquire 必然返回 False, 整条消息被跳过。
 
         # 后台异步处理 (Dify 跑 30-50s, 不能同步等)
         asyncio.create_task(
