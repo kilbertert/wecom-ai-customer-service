@@ -118,6 +118,33 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
 - `app/core/config.py:Settings` keeps `RedisSettings` and `CelerySettings` classes defined for config compatibility, but they are not wired into the runtime. `monitoring/health/detailed` reports `mode: "single_round_conversation"`.
 - `Celery`/`flower`/`prometheus_client`/`sentry-sdk` are pinned in `requirements.txt` but not currently wired in — leave them unless the task is to enable them.
 
+### 二阶段 bug 反馈超时机制 (Phase 2 — Celery 已接入)
+
+二阶段架构 (见 `china_charge_kf/二阶段架构设计蓝图.md`) 引入了"客户反馈 → bug 表 → 多轮确认 → 30 分钟超时缓存"的状态机。Dify chatflow 管同步多轮 (cv_flow_state 跨轮续接), **本后端管异步超时** (Celery 真定时器)。这与 single-round mode **不冲突** —— 仍不持有会话历史。
+
+- **`PendingTimerStore` (非会话历史)**: 存 `(user_id, scope) → {task_id, state, record_id, armed_at, payload}` 待办定时器元数据, 性质同 `ConversationStore` (一个 id + 少量协调字段, 不存消息内容)。`app/services/pending_timer_store.py`, memory/redis 实现。生产多 worker (FastAPI + Celery 分进程) 必须用 redis 模式共享。
+- **Celery 已接入运行时**: `app/core/celery_app.py` + `app/tasks/bugtrack_tasks.py:bugtrack_timeout`。worker 由 systemd `wecom-celery-worker.service` 保活, 队列 `wecom_timers`, concurrency=1。broker/result 用 `192.168.0.40:6379` db1/db2 (`CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND`)。
+- **Dify ↔ 后端握手通道**: Dify 在进入待确认态时, 由结束节点 code 在 answer 末尾追加 `<!--SYS:TIMER|action=arm|state=await_confirm_*|record_id=...|feedback_zh=...-->` 标记 (或 `action=cancel`)。`MessageProcessor` 经 `app/services/timer_coordinator.py` 解析+剥离标记 (用户不可见) → arm/cancel Celery 倒计时。入站时 (用户又说话) 主动 cancel 旧 timer (N17 同步路径)。
+- **arm/cancel 规则**: 进入 AWAIT_* 态 arm (countdown=1800s, fire 时 `bugtrack_timeout` 写缓存表 N19); 转 IDLE/确认完成 cancel。fire 时若 PendingTimerStore 已无 pending (用户已在窗口内回应) 则跳过, 防重复写入。
+- **写表**: N16 新增/N14 修改走 webhook key (`app/services/smartsheet_writer.py`, 无需 access_token); N19 超时缓存由 Celery 任务写第二张表。N2 查表/N9 读旧行需 access_token, 走 `app/services/smartsheet_query_service.py` + `app/routes/bugtrack_internal.py` 内部接口 (Dify HTTP 节点调, Bearer `BUGTRACK_INTERNAL_TOKEN` 鉴权)。
+
+### 二阶段表格层: 企微智能表格 → 飞书多维表格 (2026-07-03 转变)
+
+企微智能表格查表是死路 (webhook 无 query / MCP 无 get_records / wedoc REST 48002, 见 memory wecom-smartsheet-deadend), 二阶段 bug 表改用**飞书多维表格**:
+- `app/services/feishu_bitable.py` — 飞书客户端 (tenant_access_token 缓存 + records/search contains 查表 + add/update 写表 + 建表/建字段初始化), httpx 同步实现
+- `app/services/smartsheet_query_service.py` — 改用 feishu_bitable 查表 (类名保留避免改调用方)
+- `app/tasks/bugtrack_tasks.py` — 写缓存表改飞书 (字段名中文标题作 key, 单选传选项名字符串)
+- `app/routes/bugtrack_internal.py` — health 接口加飞书配置状态
+- 鉴权: `tenant_access_token` (FEISHU_APP_ID + FEISHU_APP_SECRET 换, 2h 有效)
+- 两层权限: 应用有 `bitable:app` scope + 是目标表协作者 (成员建表后加应用为协作者, 或应用自建)
+- ⚠️ 飞书同一表不支持并发写 (报 1254291), Celery worker concurrency=1 天然串行
+- 企微 smartsheet_mcp.py / smartsheet_writer.py 保留作历史, 不再使用
+- 配置: `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_APP_TOKEN` / `FEISHU_TABLE_ID` (BugtrackSettings.feishu_*)
+- Dify 侧 N2 查表/N16 写表 HTTP 节点不变 (仍调后端 /internal/bugtrack/search, 底层已切飞书)
+- **配置**: `BugtrackSettings` (env_prefix `BUGTRACK_`): `BUGTRACK_ENABLED` / `BUGTRACK_MAIN_WEBHOOK_KEY` / `BUGTRACK_CACHE_WEBHOOK_KEY` / `BUGTRACK_MAIN_DOC_ID` / `BUGTRACK_MAIN_SHEET_ID` / `BUGTRACK_INTERNAL_TOKEN` / `BUGTRACK_TIMEOUT_SECONDS`。`CELERY_*` 现从 .env 读取 (CelerySettings 已加 env_file)。
+
+**与 single-round 边界**: 仍不引入消息历史存储; `PendingTimerStore` 存的是定时器元数据 (非会话内容), 与 `ConversationStore` 同性质, 不违反无状态约束。
+
 ### Module layout (`app/`)
 
 | Path | Responsibility |

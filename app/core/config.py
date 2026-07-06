@@ -86,6 +86,9 @@ class RedisSettings(BaseSettings):
 
     class Config:
         env_prefix = "REDIS_"
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class DatabaseSettings(BaseSettings):
@@ -116,6 +119,53 @@ class CelerySettings(BaseSettings):
 
     class Config:
         env_prefix = "CELERY_"
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "ignore"
+
+
+class BugtrackSettings(BaseSettings):
+    """二阶段 bug 反馈表配置 (智能表格 webhook key + 查表 corp 凭据)。
+
+    - ``main_webhook_key``: 主表 (bug 反馈数据表) webhook key, N16 新增 / N14 修改
+    - ``cache_webhook_key``: 缓存表 (第二张表) webhook key, N19 超时暂存
+    - 查表 (N2/N9) 需 access_token, 复用企微 corp_id/corp_secret 换取
+      (与 WeChatSettings 同源), 见 SmartSheetQueryService。
+    - ``main_doc_id`` / ``main_sheet_id``: 主表文档id/子表id (查询记录 API 需要)
+    """
+
+    enabled: bool = Field(False, description="是否启用二阶段 bug 反馈流程")
+    main_webhook_key: str = Field("", description="主表 (bug反馈表) webhook key")
+    cache_webhook_key: str = Field("", description="缓存表 webhook key")
+
+    # 查表 API (101158 查询记录) 所需定位参数
+    main_doc_id: str = Field("", description="主表 doc_id (查询记录用)")
+    main_sheet_id: str = Field("", description="主表 sheet_id (查询记录用)")
+
+    # 内部接口鉴权 token (Dify HTTP 节点调 /internal/bugtrack/* 时携带)
+    internal_token: str = Field("", description="内部接口 Bearer token")
+
+    # MCP 通道 (智能机器人文档能力, 查表/写表走此通道, 绕开 wedoc REST 48002)
+    mcp_apikey: str = Field("", description="企微 MCP robot-doc apikey")
+    mcp_url: str = Field(
+        "https://qyapi.weixin.qq.com/mcp/robot-doc",
+        description="MCP StreamableHttp 端点 (不含 apikey)",
+    )
+
+    # 飞书多维表格 (二阶段 bug 表, 替代企微智能表格 — 企微查表是死路)
+    feishu_app_id: str = Field("", description="飞书自建应用 App ID (cli_xxx)")
+    feishu_app_secret: str = Field("", description="飞书自建应用 App Secret")
+    feishu_app_token: str = Field("", description="飞书多维表格 app_token")
+    feishu_table_id: str = Field("", description="飞书多维表格 table_id")
+
+    # 超时窗口 (秒)
+    timeout_seconds: int = Field(1800, description="待确认超时窗口 (秒, 默认30分钟)")
+
+    class Config:
+        env_prefix = "BUGTRACK_"
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class ChatwootSettings(BaseSettings):
@@ -266,6 +316,7 @@ class Settings(BaseSettings):
     coze: CozeSettings = CozeSettings()
     dify: DifySettings = DifySettings()
     chatwoot: ChatwootSettings = ChatwootSettings()
+    bugtrack: BugtrackSettings = BugtrackSettings()
     redis: RedisSettings = RedisSettings()
     database: DatabaseSettings = DatabaseSettings()
     celery: CelerySettings = CelerySettings()

@@ -8,7 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.config import settings
-from app.routes import wechat_router, monitoring_router, chatwoot_internal_router
+from app.routes import (
+    wechat_router,
+    monitoring_router,
+    chatwoot_internal_router,
+    bugtrack_internal_router,
+)
 from app.core.exceptions import (
     WeChatAPIError,
     CozeAPIError,
@@ -22,6 +27,7 @@ from app.protocols.kf_adapter import KfAdapter
 from app.protocols.bot_adapter import BotAdapter
 from app.services import WeChatService, MediaService, get_ai_service
 from app.services.conversation_store import create_conversation_store
+from app.services.pending_timer_store import create_pending_timer_store
 from app.services.message_processor import MessageProcessor
 
 # 配置标准日志
@@ -48,11 +54,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 共享去重存储 + 薄 conversation_id 映射 (默认 InMemory, 单 worker)
     app.state.dedup_store = InMemoryDedupStore()
     app.state.conversation_store = create_conversation_store()
+    # 二阶段: 待办定时器元数据存储 (非会话历史, 类比 ConversationStore)
+    app.state.pending_timer_store = create_pending_timer_store()
     app.state.message_processor = MessageProcessor(
         wechat_service=app.state.wechat_service,
         media_service=app.state.media_service,
         ai_service=app.state.ai_service,
         conversation_store=app.state.conversation_store,
+        pending_timer_store=app.state.pending_timer_store,
     )
     app.state.kf_adapter = KfAdapter(
         app.state.wechat_service, app.state.dedup_store
@@ -117,6 +126,7 @@ async def session_exception_handler(request: Request, exc: SessionError):
 app.include_router(wechat_router)
 app.include_router(monitoring_router)
 app.include_router(chatwoot_internal_router)
+app.include_router(bugtrack_internal_router)
 
 
 @app.get("/")

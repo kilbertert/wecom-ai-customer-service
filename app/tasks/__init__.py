@@ -3,6 +3,7 @@
 from .wechat_tasks import *
 from .coze_tasks import *
 from .media_tasks import *
+from .bugtrack_tasks import *
 
 __all__ = [
     # WeChat tasks
@@ -17,4 +18,7 @@ __all__ = [
     # Media tasks
     "process_media_file",
     "cleanup_temp_files",
+
+    # Bug track tasks (二阶段超时)
+    "bugtrack_timeout",
 ]

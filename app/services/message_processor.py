@@ -31,6 +31,12 @@ from app.services.bot_trace import (
     format_thinking_lines,
 )
 from app.services.conversation_store import ConversationStore
+from app.services.pending_timer_store import PendingTimerStore
+from app.services.timer_coordinator import (
+    apply_markers,
+    cancel_pending_timer,
+    parse_timer_markers,
+)
 from app.services.multimodal import compose_multimodal_markdown
 from app.services.trace_extract import extract_knowledge, extract_thinking
 
@@ -62,11 +68,14 @@ class MessageProcessor:
         media_service: Any,
         ai_service: Any,
         conversation_store: ConversationStore,
+        pending_timer_store: Optional[PendingTimerStore] = None,
     ) -> None:
         self._wechat = wechat_service
         self._media = media_service
         self._ai = ai_service
         self._conv = conversation_store
+        # 二阶段: 待办定时器存储 (非会话历史)。None 时跳过 timer 协调 (向后兼容)。
+        self._timers = pending_timer_store
 
     async def process(
         self, inbound: InboundMessage, adapter: ProtocolAdapter
@@ -104,6 +113,12 @@ class MessageProcessor:
             return
         if trace is not None:
             trace.event("dedup", "ok", "首次处理")
+
+        # 二阶段: 用户在 30 分钟窗口内又说话了 → cancel 旧的待确认倒计时 (N17 同步路径)。
+        # Dify chatflow 会靠 cv_flow_state 自行做相关性分发, 后端只需让旧 timer 作废。
+        if self._timers is not None:
+            scope = "bot" if is_bot else (inbound.open_kfid or "kf")
+            await cancel_pending_timer(self._timers, inbound.user_id, scope)
 
         # 记录是否已完成 (mark_done 已调), 供 finally 决定是否 release。
         # 用 list 包一层供闭包写入 (Python 闭包不能直接赋值外层不可变)。
@@ -208,6 +223,12 @@ class MessageProcessor:
                     "[PROC] msgid=%s 工作流返回空内容, 使用兜底文案", msgid
                 )
 
+            # 二阶段: 从 AI 回复末尾解析 TIMER 握手标记, 剥离后用户不可见。
+            # markers 收集起来, send 成功后再 arm/cancel (不阻塞回复投递)。
+            timer_markers: list = []
+            if self._timers is not None:
+                reply_text, timer_markers = parse_timer_markers(reply_text)
+
             # 7) 发送去重 + 投递
             if not await dedup.mark_sent(msgid):
                 logger.info("[PROC] msgid=%s 回复已发送过, 跳过", msgid)
@@ -224,6 +245,14 @@ class MessageProcessor:
             # 发送成功后才 mark_done (修复 A1): 此前任何崩溃/取消 → release → 可重试
             await dedup.mark_done(msgid)
             done_flag[0] = True
+
+            # 二阶段: 回复已投递, 处理 TIMER 标记 (arm/cancel 30 分钟倒计时)。
+            # 放在 send 成功后: 若回复投递失败, 不应 arm 定时器 (用户没收到待确认问题)。
+            if self._timers is not None and timer_markers:
+                scope = "bot" if is_bot else (inbound.open_kfid or "kf")
+                await apply_markers(
+                    self._timers, inbound.user_id, scope, timer_markers
+                )
 
             # 8) Chatwoot 同步 (仅 KF: 把 AI 回复同步到人工侧)
             if not is_bot and inbound.open_kfid:
