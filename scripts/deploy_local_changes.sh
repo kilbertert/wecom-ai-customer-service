@@ -13,6 +13,7 @@
 #   4) 调远端的 /root/start_uvicorn.sh 重启 uvicorn
 #   5) /monitoring/health 健康检查
 #   6) 自动清理 /tmp/.sshpw 密码文件 (如果由本脚本创建)
+#   7) 可选 --observe N: 部署后 ssh 远端跑 queue_observe.py 灰度观察 N 秒 (默认 300)
 #
 # 环境变量 (都有默认值):
 #   REMOTE_HOST        默认 120.55.45.59
@@ -37,12 +38,17 @@ SSH_PW_FILE="${SSH_PW_FILE:-/tmp/.sshpw}"
 # ----- 参数解析 -----
 FROM_COMMIT=""
 FILES=""
+OBSERVE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --from-commit)
             FROM_COMMIT="$2"; shift 2 ;;
+        --observe)
+            OBSERVE=300
+            case "${2:-}" in ''|*[!0-9]*) ;; *) OBSERVE="$2"; shift ;; esac
+            shift ;;
         --help|-h)
-            sed -n '2,21p' "$0"; exit 0 ;;
+            sed -n '2,25p' "$0"; exit 0 ;;
         *)
             FILES="$FILES $1"; shift ;;
     esac
@@ -182,3 +188,14 @@ fi
 
 echo ""
 echo "==> 部署完成!"
+
+# 5) 灰度观察 (可选: --observe [N])
+if [ "${OBSERVE:-0}" != "0" ]; then
+    echo ""
+    echo "==> [5] 灰度观察 ${OBSERVE}s (远端 queue_observe.py)..."
+    if ssh_run "cd $REMOTE_DIR && python3 scripts/queue_observe.py --duration $OBSERVE"; then
+        echo "    [OK] 灰度观察无告警"
+    else
+        echo "    [WARN] 灰度观察发现告警或异常 (看上方输出)"
+    fi
+fi

@@ -3,6 +3,11 @@
 .env.local
 .env.production
 .env.staging
+.env.bak*
+.env.backup*
+
+# Dify chatflow 导出 (含 webhook key 等密钥, 属 Dify 侧配置, 不入后端仓库)
+charge_charging*.yml
 
 # 备份文件
 *.backup
