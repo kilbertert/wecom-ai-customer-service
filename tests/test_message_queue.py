@@ -11,6 +11,8 @@ import asyncio
 import json
 from dataclasses import asdict
 
+import pytest
+
 from app.protocols.base import InboundMessage
 from app.services.dedup_store import RedisDedupStore
 from app.services.message_queue import RedisMessageQueue
@@ -167,7 +169,12 @@ class FakeProcessor:
 
 
 class FakeAdapter:
-    pass
+    """带 dedup 的假 adapter (orphan sweep 会调 adapter.dedup.release_processing)。"""
+
+    def __init__(self, dedup=None):
+        from app.protocols.base import InMemoryDedupStore
+
+        self.dedup = dedup if dedup is not None else InMemoryDedupStore()
 
 
 def _inbound(msgid="m1", text="hi", protocol="kf", user_id="u1", open_kfid="k1"):
@@ -340,3 +347,114 @@ async def test_redis_dedup_state_machine():
     # release_processing 后可重新 acquire
     await ds.release_processing("m2")
     assert await ds.acquire("m2", 300) is True
+
+
+# ----------------------------------------------------------------------
+# 审查 P1 修复回归测试 (#1 序列化 / #2 入队兜底 / #4 崩溃恢复+dedup)
+# ----------------------------------------------------------------------
+
+
+def test_to_serializable_makes_pydantic_json_safe():
+    """审查 P1 #1: Pydantic 模型经 to_serializable 后可 json.dumps。
+
+    未转换时 asdict 保留对象实例 -> json.dumps 抛 TypeError (KF 丢消息根因)。
+    """
+    import json as _json
+    from pydantic import BaseModel
+
+    from app.protocols.base import to_serializable
+
+    class _M(BaseModel):
+        a: int = 1
+        b: str = "x"
+
+    # 未转换: 直接 json.dumps 抛 TypeError (复现 P1 #1)
+    with pytest.raises(TypeError):
+        _json.dumps({"message": _M()})
+
+    # 转换后: dict, 可序列化
+    out = to_serializable(_M())
+    assert out == {"a": 1, "b": "x"}
+    _json.dumps({"message": out})  # 不抛
+
+
+def test_kf_to_inbound_is_json_serializable():
+    """审查 P1 #1: KfAdapter._to_inbound 产出的 InboundMessage 经 asdict+json.dumps 不抛。"""
+    import json as _json
+    from dataclasses import asdict as _asdict
+
+    from app.models.wechat import WeChatMessage
+    from app.protocols.kf_adapter import KfAdapter
+
+    wm = WeChatMessage(msgid="m1", msgtype="text", send_time=0, origin=0)
+    inbound = KfAdapter._to_inbound(wm)
+    # raw 已是 dict (model_dump), asdict + json.dumps 不再抛 TypeError
+    raw = _json.dumps({"payload": _asdict(inbound)})
+    assert "m1" in raw
+
+
+async def test_enqueue_serialize_failure_goes_to_dead():
+    """审查 P1 #1 兜底: 入队序列化失败 -> 入死信 + 返回 False (不静默丢)。"""
+    fake = FakeRedis()
+    q = RedisMessageQueue(fake, {"kf": FakeAdapter()}, FakeProcessor())
+    im = InboundMessage(protocol="kf", msgid="bad1", msg_type="text", text="hi",
+                        user_id="u1", open_kfid="k1", raw={"bad": object()})
+    ok = await q.enqueue(im, "kf")
+    assert ok is False
+    assert len(await fake.lrange(q.Q_DEAD, 0, -1)) == 1
+    assert len(await fake.lrange(q.Q_MAIN, 0, -1)) == 0
+
+
+async def test_enqueue_lpush_failure_returns_false():
+    """审查 P1 #2: LPUSH 失败 (Redis 宕机) -> 返回 False (路由回退内存派发)。"""
+    class _BoomRedis(FakeRedis):
+        async def lpush(self, key, *vals):
+            raise ConnectionRefusedError("redis down")
+
+    q = RedisMessageQueue(_BoomRedis(), {"kf": FakeAdapter()}, FakeProcessor())
+    ok = await q.enqueue(_inbound("m1", "hi"), "kf")
+    assert ok is False
+
+
+async def test_orphan_sweep_clears_stale_dedup_key():
+    """审查 P1 #4: 硬崩留 proc 消息 + stale dedup proc key; orphan sweep 回灌 main
+    同时清 stale key, 使重投递能重新 acquire (否则 acquire=False -> 跳过 -> 丢)。"""
+    fake = FakeRedis()
+    ds = RedisDedupStore(fake)
+    adapter = FakeAdapter(dedup=ds)
+    q = RedisMessageQueue(fake, {"kf": adapter}, FakeProcessor())
+
+    # 模拟硬崩: msgid=m1 已 acquire (proc key set) + env 留在 Q_PROC (process 没 release)
+    assert await ds.acquire("m1", 300) is True
+    assert await ds.acquire("m1", 300) is False  # 处理中, 占有
+    await fake.lpush(q.Q_PROC, _env(_inbound("m1", "hi")))
+
+    await q._requeue_orphans()
+
+    # 回灌到 main
+    assert len(await fake.lrange(q.Q_MAIN, 0, -1)) == 1
+    assert len(await fake.lrange(q.Q_PROC, 0, -1)) == 0
+    # stale dedup proc key 已清 -> 重投递可重新 acquire (P1 #4 修复点)
+    assert await ds.acquire("m1", 300) is True
+
+
+async def test_create_message_queue_ping_failure_returns_none(monkeypatch):
+    """审查 P1 #2: 启动期 Redis PING 失败 -> 返回 None (回退内存派发)。"""
+    import redis.asyncio as aioredis
+    from app.core.config import settings
+    from app.services.message_queue import create_message_queue
+
+    class _DeadRedis:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def ping(self):
+            raise ConnectionRefusedError("no redis")
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(settings.app, "message_queue", "redis")
+    monkeypatch.setattr(aioredis, "Redis", _DeadRedis)
+    result = await create_message_queue({"kf": FakeAdapter()}, FakeProcessor())
+    assert result is None
