@@ -165,7 +165,7 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
 | `services/wechat.py` | `WeChatService` + `WeChatConfig`. Wraps `wechatpy.enterprise.WeChatClient`/`WeChatCrypto`. Owns access_token, signature verify (委托 wecom_crypto), AES decrypt, message sync, send_kf, download_media, is_event_processed。crypto 方法是 `wecom_crypto` 的薄委托。 |
 | `services/message_processor.py` | `MessageProcessor`: 协议无关编排器 (KF+bot 合并)。dedup→媒体→Chatwoot handoff 检查→conversation_id→AI→compose→send→chatwoot notify。bot 9 阶段 trace 门控发射。`_upload_to_dify_file_store` 在此 (bot 媒体上传)。 |
 | `services/conversation_store.py` | `ConversationStore` ABC + `InMemory`/`Redis` 实现。薄 conversation_id 映射 (非历史存储)。 |
-| `services/dedup_store.py` | `RedisDedupStore` + `create_dedup_store()` 工厂 (`APP_DEDUP_STORE=redis`)。崩溃重投递幂等去重; ABC/InMemory 在 `protocols/base.py`。 |
+| `services/dedup_store.py` | `RedisDedupStore` + `create_dedup_store()` 工厂 (`APP_DEDUP_STORE=redis`)。两态 (proc/done) + TTL; done key 防重复发送; ABC/InMemory 在 `protocols/base.py`。 |
 | `services/message_queue.py` | `RedisMessageQueue` + `create_message_queue()` 工厂 (`APP_MESSAGE_QUEUE=redis`)。持久 list 队列 + 每(user,scope)分布式锁 + orphan sweep + 死信。 |
 | `services/trace_extract.py` | `extract_knowledge` / `extract_thinking` 纯函数 (从 Dify outputs 提取 trace 阶段数据)。 |
 | `services/dify.py` | `DifyService` (workflow / chatflow 双模式, `settings.dify.app_mode` 切换)。chatflow 透传 `conversation_id` 续接多轮。 |
@@ -196,10 +196,10 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
 
 默认 `APP_MESSAGE_QUEUE=memory`: 路由层用 `BackgroundTasks` (KF) / `asyncio.create_task` (bot) 派发, 进程内, 无持久化无锁 (单进程 dev)。设 `APP_MESSAGE_QUEUE=redis` 启用持久队列 + 分布式锁:
 
-- **持久队列** (`app/services/message_queue.py:RedisMessageQueue`): 入站消息 `LPUSH wecom:msgq`, worker `BLMOVE` 弹到 `wecom:msgq:proc` 消费, FIFO。进程重启/崩溃不丢消息 (启动+关闭时 `proc` 列表 orphan sweep 回灌 `main`, 至少一次投递); 不可解析/未知 adapter/真异常重试耗尽入 `wecom:msgq:dead`。worker 在 `lifespan` 启动 (`APP_QUEUE_WORKERS` 协程), 关闭时取消 worker + 回灌 in-flight。
+- **持久队列** (`app/services/message_queue.py:RedisMessageQueue`): 入站消息 `LPUSH wecom:msgq`, worker `BLMOVE` 弹到 `wecom:msgq:proc` 消费, FIFO。进程重启/崩溃不丢消息: orphan sweep 用单 EVAL 原子把 `proc` 回灌 `main` (防多进程误删在途) 并逐条 `release_processing` 清崩溃残留的 stale dedup proc key (否则重投递 acquire=False 跳过 -> LREM -> 丢); `MessageProcessor.process` 真异常重抛 -> 队列据此走 retry/dead-letter (不再被 process 内部吞掉当 success)。不可解析/未知 adapter/重试耗尽入 `wecom:msgq:dead`。worker 在 `lifespan` 启动 (`APP_QUEUE_WORKERS` 协程), 关闭时取消 worker + 回灌 in-flight。
 - **分布式锁 (#17B, 与队列共享同一 Redis client)**: worker 调 `process()` 前 `SET wecom:lock:{user}:{scope} NX EX APP_QUEUE_LOCK_TTL(600)` 串行化同用户消息 (消除 read->Dify->save 竞态); Lua(token 比对)释放。**锁被占** -> 消息回队尾 (不计失败); **Redis 异常** -> fail-open; TTL > 最坏 4 轮 Dify (MAX_ROUTES=3 × chatflow_timeout 120 = 480)。
-- **幂等**: 配 `APP_DEDUP_STORE=redis` 用 `RedisDedupStore` (崩溃重投递幂等; `app/services/dedup_store.py`)。load_settings 会告警: `message_queue=redis` + `dedup_store=memory` -> 崩溃重投递可能产生 Dify 重复轮次。
-- **路由层**: `app/routes/wechat.py` 检 `app.state.message_queue`; 非空则 `await queue.enqueue(inbound, "kf"|"bot")` 后立即 ACK, 否则走原 BackgroundTasks/create_task。
+- **去重 (非崩溃幂等)**: 配 `APP_DEDUP_STORE=redis` 用 `RedisDedupStore` (`app/services/dedup_store.py`)。崩溃重投递不是幂等跳过: orphan sweep 清 stale proc key 后重投递会重新处理 (at-least-once); `done` key 仅在完成后防重复发送。`KF/BOT_DEDUP_TTL=600` 须 > 最坏 4 轮 Dify (480s), 否则处理中 proc key 提前过期致重复。load_settings 告警: `message_queue=redis` + `dedup_store=memory` -> 崩溃重投递可能产生 Dify 重复轮次。
+- **路由层 + 启动连通性**: `create_message_queue` (async) 创建 client 后 `PING`, Redis 不可达返回 `None` 回退内存派发 (不启动连不上的队列)。`enqueue` 返回 `bool`: LPUSH/序列化失败返回 `False` -> 路由回退 BackgroundTasks/create_task (不再微信已 ACK 却丢消息)。bot 内存派发经 `_safe_process` 兜底 (process 现重抛异常)。
 - ⚠️ **send 重试**: 不在 send 失败时重跑整个 process (会令 Dify chatflow 重复一轮污染上下文); 仅做崩溃恢复重投递。瞬态 send_kf/response_url 失败仍按 process 内既有逻辑 (release 去重 + 记日志)。
 - ⚠️ **bot response_url TTL**: 同用户连续消息被锁串行化, 靠后者回复延迟, 其 response_url 可能过期 (KF send_kf 无 TTL, 不受影响)。
 
