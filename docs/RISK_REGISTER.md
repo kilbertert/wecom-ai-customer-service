@@ -161,7 +161,7 @@
 - **现状(已查)**: `contact_inboxes` 已有 `(inbox_id, source_id)` 唯一索引;生产 DB 三项均无重复数据(2026-07-02 复查)。
 - **修复 (Chatwoot commit 94be8b050)**: E7-2 用 Redis mutex(`MutexApplicationJob` + `(inbox_id, external_userid)` key, 5s TTL)串行化同一客户消息处理;锁耗尽走 `process_without_lock` 但重新校验 channel/account/HMAC。E7-1(wecom-ai dedup 已够,未做 DB 兜底)。
 - **未覆盖 (E7-3, known gap)**: per-user Contact 按 `userid`(群成员)创建,mutex key 是 `external_userid`,群聊场景下不同 `external_userid` 同 `userid` 的并发消息走不同 mutex → 仍可能重复创建 Contact。`set_sender_contact` 仍无 rescue,无 DB 唯一索引。当前未做 JSONB 唯一索引是因为 `social_wecom_user_id` 在主 Contact 和 per-user Contact 上双写,直接 account 级唯一索引会误伤合法多群/多 contact 场景 → 需要先重构 Contact attribute 语义(主/group 用 group/external 标识,per-user Contact 独占 user id),再加并发唯一索引。这是后续 DB 兜底专项,不在当前 PR 范围。服务层 `rescue RecordNotUnique` 在没有对应唯一索引时是死代码,因此暂不补。
-- **已确认 (2026-07-03, 同 PR spec 加固)**: 
+- **已确认 (2026-07-03, 同 PR spec 加固)**:
   - `process_without_lock(*args, **kwargs)` 的 retry_on 真实参数形态已覆盖 spec:用 `job.process_without_lock(job_args_hash)` 验证 `args.first` 分支(因 ActiveJob 序列化后 `job.arguments` 是 `[{kwargs}]`,splat 后 hash 进入 `args.first`)。`job.public_send(:process_without_lock, *job.arguments)` 才是基类 retry_on 真实调用形态,两者等价。
   - mutex 5s TTL 假设成立:wecom 消息处理在 Chatwoot 侧无外部下载(wecom-ai 已把附件 base64 嵌进 post_body),主要耗时是 contact/conversation 查找 + message 写库 + dispatcher,正常远小于 5s。
 - **状态**: 🟡 部分修复 (E7-2 ✅ commit 94be8b050; E7-3 ❌ 仍为 known gap,留作后续 DB 兜底专项; E7-1 可选未做; retry_on 参数解包 + TTL 假设已 spec 覆盖并经审查确认)

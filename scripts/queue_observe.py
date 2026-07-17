@@ -3,12 +3,12 @@
 
 部署 (#15 持久队列) 后用于灰度观察:
   - wecom:msgq      主队列深度 (积压)
-  - wecom:msgq:proc 处理中深度 (持续 > 0 且增长 = 处理跟不上 / 锁卡死)
+  - wecom:msgq:proc 处理中深度 (> workers 持续 = 超容量积压/锁卡死; 正常在途不告警)
   - wecom:msgq:dead 死信 (> 0 = 有消息反复失败, 需排查)
   - /monitoring/health       存活
   - /monitoring/health/ready 就绪 (配置占位 / Dify 不可达 -> 503)
 
-任一告警 (dead>0 / proc 持续堆积 / 非 200) -> 退出码非零, 可作 canary gate:
+任一告警 (dead>0 / proc 超 workers 持续 / 非 200) -> 退出码非零, 可作 canary gate:
   python3 scripts/queue_observe.py --duration 300   # 观察 5 分钟, 有告警则 exit 1
 
 默认读 app settings (prod .env) 取 redis 与端口; 也可 --redis-url / --health-url 覆盖。
@@ -45,7 +45,11 @@ def main() -> int:
     ap.add_argument("--health-url", default="",
                     help="健康基址 (默认 http://localhost:{APP_PORT})")
     ap.add_argument("--proc-stuck-polls", type=int, default=6,
-                    help="proc 连续非零多少轮判为堆积卡死 (默认 6 ≈ 30s)")
+                    help="proc 连续超容量多少轮判为卡死 (默认 6 ≈ 30s)")
+    ap.add_argument("--workers", type=int,
+                    default=int(getattr(settings.app, "queue_workers", 2) or 2),
+                    help="worker 协程数; proc>workers 持续才判卡死 (默认读 "
+                         "APP_QUEUE_WORKERS, 正常在途 proc<=workers 不告警)")
     args = ap.parse_args()
 
     # ---- redis 客户端 ----
@@ -84,7 +88,7 @@ def main() -> int:
         except Exception:
             return 0
 
-    proc_nonzero = 0          # proc 连续非零轮数
+    proc_over = 0             # proc 连续超容量 (>workers) 轮数
     ever_alert = False
     start = time.time()
     QM, QP, QD = RedisMessageQueue.Q_MAIN, RedisMessageQueue.Q_PROC, RedisMessageQueue.Q_DEAD
@@ -110,12 +114,16 @@ def main() -> int:
             alerts = []
             if dead_len > 0:
                 alerts.append(f"DEAD={dead_len}")
-            if proc_len > 0:
-                proc_nonzero += 1
-                if proc_nonzero >= args.proc_stuck_polls:
-                    alerts.append(f"PROC 卡死({proc_len}@{proc_nonzero}轮)")
+            # proc>workers 持续 = 超容量积压 (审查 P1 #8): 正常在途 proc<=workers
+            # 不告警; 单条 Dify 可跑最长 ~lock_ttl=600s, 仅 proc>0 会大量误报。
+            if proc_len > args.workers:
+                proc_over += 1
+                if proc_over >= args.proc_stuck_polls:
+                    alerts.append(
+                        f"PROC 超容量卡死({proc_len}>w{args.workers}@{proc_over}轮)"
+                    )
             else:
-                proc_nonzero = 0
+                proc_over = 0
             if health != 200:
                 alerts.append(f"health={health}")
             if ready != 200:
