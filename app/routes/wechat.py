@@ -67,12 +67,17 @@ async def wechat_callback_handler(
 
     adapter = request.app.state.kf_adapter
     processor = request.app.state.message_processor
+    queue = getattr(request.app.state, "message_queue", None)
 
     try:
         inbound_list = await adapter.receive(request)
         for inbound in inbound_list:
-            logger.info(f"[KF] 入后台处理: msgid={inbound.msgid}")
-            background_tasks.add_task(processor.process, inbound, adapter)
+            if queue is not None:
+                await queue.enqueue(inbound, "kf")
+                logger.info(f"[KF] 入持久队列: msgid={inbound.msgid}")
+            else:
+                logger.info(f"[KF] 入后台处理: msgid={inbound.msgid}")
+                background_tasks.add_task(processor.process, inbound, adapter)
     except Exception as e:
         logger.error(f"[KF] 回调处理异常: {e}", exc_info=True)
 
@@ -126,6 +131,7 @@ async def bot_callback_handler(
     """
     adapter = request.app.state.bot_adapter
     processor = request.app.state.message_processor
+    queue = getattr(request.app.state, "message_queue", None)
 
     try:
         inbound_list = await adapter.receive(request)
@@ -137,14 +143,17 @@ async def bot_callback_handler(
         # 去重由 MessageProcessor.process 统一负责 (与 KF 路径一致); route 层不再
         # 重复 acquire —— 否则 process() 的 acquire 必然返回 False, 整条消息被跳过。
 
-        # 后台异步处理 (Dify 跑 30-50s, 不能同步等)
-        asyncio.create_task(
-            processor.process(inbound, adapter),
-            name=f"bot-{inbound.msgid[:8] if inbound.msgid else 'noid'}",
-        )
-        logger.info(
-            f"[BOT] msgid={inbound.msgid} 已创建后台任务, 返回占位 envelope"
-        )
+        if queue is not None:
+            # 持久队列模式 (#15): 入队后立即返回占位 envelope, worker 异步消费。
+            await queue.enqueue(inbound, "bot")
+            logger.info(f"[BOT] msgid={inbound.msgid} 入持久队列, 返回占位 envelope")
+        else:
+            # 内存派发: Dify 跑 30-50s, 不能同步等
+            asyncio.create_task(
+                processor.process(inbound, adapter),
+                name=f"bot-{inbound.msgid[:8] if inbound.msgid else 'noid'}",
+            )
+            logger.info(f"[BOT] msgid={inbound.msgid} 已创建后台任务, 返回占位 envelope")
 
         placeholder = adapter.build_sync_ack(timestamp, nonce)
         return Response(

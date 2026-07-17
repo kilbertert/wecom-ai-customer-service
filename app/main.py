@@ -20,12 +20,13 @@ from app.core.exceptions import (
     handle_wechat_error,
     handle_session_error
 )
-from app.protocols.base import InMemoryDedupStore
 from app.protocols.kf_adapter import KfAdapter
 from app.protocols.bot_adapter import BotAdapter
 from app.services import WeChatService, MediaService, get_ai_service
 from app.services.conversation_store import create_conversation_store
 from app.services.pending_timer_store import create_pending_timer_store
+from app.services.dedup_store import create_dedup_store
+from app.services.message_queue import create_message_queue
 from app.services.message_processor import MessageProcessor
 
 # 配置标准日志
@@ -51,7 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 协议适配器 + 编排器 (Phase 3)
     # 共享去重存储 (默认 InMemory 单进程; APP_DEDUP_STORE=redis 多进程/崩溃安全)
     # + 薄 conversation_id 映射 (默认 InMemory, 单 worker)
-    app.state.dedup_store = InMemoryDedupStore()
+    app.state.dedup_store = create_dedup_store()
     app.state.conversation_store = create_conversation_store()
     # 二阶段: 待办定时器元数据存储 (非会话历史, 类比 ConversationStore)
     app.state.pending_timer_store = create_pending_timer_store()
@@ -69,10 +70,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.wechat_service, app.state.dedup_store
     )
 
+    # 持久消息队列 + 分布式锁 (#15+#17B): APP_MESSAGE_QUEUE=redis 时启用, 否则 None
+    # (路由层回退 BackgroundTasks/create_task)。queue 与 lock 共享同一 Redis client。
+    app.state.message_queue = create_message_queue(
+        {"kf": app.state.kf_adapter, "bot": app.state.bot_adapter},
+        app.state.message_processor,
+    )
+    if app.state.message_queue is not None:
+        await app.state.message_queue.start()
+
     yield
 
-    # 清理资源
+    # 清理资源: 先停队列 (in-flight 回灌 main), 再关服务连接
     logger.info("Shutting down WeChat AI Service (backend=%s)", backend)
+
+    if app.state.message_queue is not None:
+        try:
+            await app.state.message_queue.stop()
+        except Exception as e:
+            logger.error("Error stopping message queue: %s", e, exc_info=True)
 
     try:
         await app.state.wechat_service.close()
