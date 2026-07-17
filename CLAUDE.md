@@ -118,33 +118,33 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
   - 默认 `InMemoryConversationStore` (单 worker); `APP_CONVERSATION_STORE=redis` 切 `RedisConversationStore` (多 worker 抗重启)。
   - KF scope = `open_kfid`; bot scope = `"bot"`。
   - `DifyService.run_workflow(input_data, user_id, conversation_id=None, app="A")` 透传 `conversation_id` + 双 app 标识 `app` (A=KB问答 / B=bug追踪)。
-- `app/core/config.py:Settings` keeps `RedisSettings` and `CelerySettings` classes defined for config compatibility, but they are not wired into the runtime. `monitoring/health/detailed` reports `mode: "single_round_conversation"`.
-- `Celery`/`flower`/`prometheus_client`/`sentry-sdk` are pinned in `requirements.txt` but not currently wired in — leave them unless the task is to enable them.
+- `RedisSettings` 已接入 conversation/dedup/message queue/pending timer；`CelerySettings` 已接入 `bugtrack_timeout` broker/result backend。`monitoring/health/detailed` 仍报告运行模式与依赖配置态。
+- `flower`/`prometheus_client`/`sentry-sdk` 仍未接入运行时；除非任务明确要求，不要顺手启用。
 
 ### 二阶段 bug 反馈超时机制 (Phase 2 — Celery 已接入)
 
 二阶段架构 (见 `china_charge_kf/二阶段架构设计蓝图.md`) 引入了"客户反馈 → bug 表 → 多轮确认 → 30 分钟超时缓存"的状态机。Dify chatflow 管同步多轮 (cv_flow_state 跨轮续接), **本后端管异步超时** (Celery 真定时器)。这与 single-round mode **不冲突** —— 仍不持有会话历史。
 
 - **`PendingTimerStore` (非会话历史)**: 存 `(user_id, scope) → {task_id, state, record_id, armed_at, payload}` 待办定时器元数据, 性质同 `ConversationStore` (一个 id + 少量协调字段, 不存消息内容)。`app/services/pending_timer_store.py`, memory/redis 实现。生产多 worker (FastAPI + Celery 分进程) 必须用 redis 模式共享。
-- **Celery 已接入运行时**: `app/core/celery_app.py` + `app/tasks/bugtrack_tasks.py:bugtrack_timeout`。worker 由 systemd `wecom-celery-worker.service` 保活, 队列 `wecom_timers`, concurrency=1。broker/result 用 `192.168.0.40:6379` db1/db2 (`CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND`)。
+- **Celery 已接入运行时**: `app/core/celery_app.py` + `app/tasks/bugtrack_tasks.py:bugtrack_timeout`。worker 由 systemd/Compose 保活, 队列 `wecom_timers`, concurrency=1。broker/result 由 `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` 配置；pending timer 必须与 Web 进程共享 Redis store。
 - **Dify ↔ 后端握手通道**: Dify 在进入待确认态时, 由结束节点 code 在 answer 末尾追加 `<!--SYS:TIMER|action=arm|state=await_confirm_*|record_id=...|feedback_zh=...-->` 标记 (或 `action=cancel`)。`MessageProcessor` 经 `app/services/timer_coordinator.py` 解析+剥离标记 (用户不可见) → arm/cancel Celery 倒计时。入站时 (用户又说话) 主动 cancel 旧 timer (N17 同步路径)。
 - **arm/cancel 规则**: 进入 AWAIT_* 态 arm (countdown=1800s); 转 IDLE/确认完成 cancel。fire 时若 PendingTimerStore 已无 pending (用户已在窗口内回应) 则跳过。**fire 时不写表** (旧版写缓存表 N19 会污染主表, 2026-07 改为仅清 pending + 记日志, 半成品内容丢弃)。
-- **写表**: N16 新增/N14 修改走 webhook key (`app/services/smartsheet_writer.py`, 无需 access_token); N19 超时不再写表 (见上, 仅清 pending + 记日志)。N2 查表/N9 读旧行需 access_token, 走 `app/services/smartsheet_query_service.py` + `app/routes/bugtrack_internal.py` 内部接口 (Dify HTTP 节点调, Bearer `BUGTRACK_INTERNAL_TOKEN` 鉴权)。
+- **查写表**: N2/N9/N16/N14 均由 `app/routes/bugtrack_internal.py` 调飞书多维表格客户端；内部接口按 `BUGTRACK_ALLOWED_IPS` 来源 IP 白名单鉴权。N19 超时不写表，仅 CAS 清 pending + 记日志。
 
 ### 二阶段表格层: 企微智能表格 → 飞书多维表格 (2026-07-03 转变)
 
 企微智能表格查表是死路 (webhook 无 query / MCP 无 get_records / wedoc REST 48002, 见 memory wecom-smartsheet-deadend), 二阶段 bug 表改用**飞书多维表格**:
 - `app/services/feishu_bitable.py` — 飞书客户端 (tenant_access_token 缓存 + records/search contains 查表 + add/update 写表 + 建表/建字段初始化), httpx 同步实现
 - `app/services/smartsheet_query_service.py` — 改用 feishu_bitable 查表 (类名保留避免改调用方)
-- `app/tasks/bugtrack_tasks.py` — 写缓存表改飞书 (字段名中文标题作 key, 单选传选项名字符串)
+- `app/tasks/bugtrack_tasks.py` — 超时任务 CAS 清 pending，不再写缓存表
 - `app/routes/bugtrack_internal.py` — health 接口加飞书配置状态
-- 鉴权: `tenant_access_token` (FEISHU_APP_ID + FEISHU_APP_SECRET 换, 2h 有效)
+- 鉴权: `tenant_access_token` (`BUGTRACK_FEISHU_APP_ID` + `BUGTRACK_FEISHU_APP_SECRET` 换, 2h 有效)
 - 两层权限: 应用有 `bitable:app` scope + 是目标表协作者 (成员建表后加应用为协作者, 或应用自建)
-- ⚠️ 飞书同一表不支持并发写 (报 1254291), Celery worker concurrency=1 天然串行
+- 飞书同一表不支持并发写 (1254291)：add/update 使用本进程线程锁 + Redis 表级锁，并保留指数退避重试
 - 企微 smartsheet_mcp.py / smartsheet_writer.py 保留作历史, 不再使用
-- 配置: `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_APP_TOKEN` / `FEISHU_TABLE_ID` (BugtrackSettings.feishu_*)
+- 配置: `BUGTRACK_FEISHU_APP_ID` / `BUGTRACK_FEISHU_APP_SECRET` / `BUGTRACK_FEISHU_APP_TOKEN` / `BUGTRACK_FEISHU_TABLE_ID`
 - Dify 侧 N2 查表/N16 写表 HTTP 节点不变 (仍调后端 /internal/bugtrack/search, 底层已切飞书)
-- **配置**: `BugtrackSettings` (env_prefix `BUGTRACK_`): `BUGTRACK_ENABLED` / `BUGTRACK_MAIN_WEBHOOK_KEY` / `BUGTRACK_CACHE_WEBHOOK_KEY` / `BUGTRACK_MAIN_DOC_ID` / `BUGTRACK_MAIN_SHEET_ID` / `BUGTRACK_INTERNAL_TOKEN` / `BUGTRACK_TIMEOUT_SECONDS`。`CELERY_*` 现从 .env 读取 (CelerySettings 已加 env_file)。
+- **配置**: `BugtrackSettings` (env_prefix `BUGTRACK_`): `BUGTRACK_ENABLED` / `BUGTRACK_ALLOWED_IPS` / `BUGTRACK_FEISHU_*` / `BUGTRACK_TIMEOUT_SECONDS`；legacy webhook/doc 字段仅保留兼容。`CELERY_*` 从 `.env` 读取。
 
 **与 single-round 边界**: 仍不引入消息历史存储; `PendingTimerStore` 存的是定时器元数据 (非会话内容), 与 `ConversationStore` 同性质, 不违反无状态约束。
 
@@ -157,11 +157,11 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
 | `core/exceptions.py` | `WeChatAPIError`, `AIBackendError`, `SessionError` (kept for compat), `ValidationError`, `BusinessError`, and the matching `handle_*` → `HTTPException` converters. |
 | `crypto/wecom_crypto.py` | 纯函数 AES-256-CBC 加解密 + SHA1 签名 (无 flask, 无 print)。`compute_signature`/`verify_signature`/`decrypt_message`/`encrypt_message`。 |
 | `protocols/base.py` | `InboundMessage`/`OutboundReply` (frozen dataclass) + `ProtocolAdapter` ABC + `DedupStore` ABC + `InMemoryDedupStore`。 |
-| `protocols/kf_adapter.py` | `KfAdapter`: receive (XML 解密+sync_msg) / send (send_kf) / build_sync_ack("success") / verify_url / dedup_ttl=300s。 |
+| `protocols/kf_adapter.py` | `KfAdapter`: receive (XML 解密+sync_msg) / send (send_kf) / build_sync_ack("success") / verify_url / dedup_ttl=600s。 |
 | `protocols/bot_adapter.py` | `BotAdapter`: receive (JSON 解密+image/voice/mixed) / send (POST response_url + trace off/inline/separate) / build_sync_ack (加密 envelope) / verify_url (receive_id="") / dedup_ttl=600s。 |
 | `models/wechat.py` | Pydantic models: `WeChatMessage`, `MessageType` (text/image/voice/video/file/location/event)。(models/coze.py 已随 Coze 移除) |
 | `routes/wechat.py` | 薄分发器 (~170 行): `GET/POST /wechat/kf/callback`, `GET/POST /wechat/bot/callback`, `GET /wechat/test`。无业务逻辑。 |
-| `routes/monitoring.py` | `/monitoring/health`, `/health/detailed`, `/metrics`, `/stats`。 |
+| `routes/monitoring.py` | `/monitoring/health`, `/monitoring/health/ready`, `/monitoring/health/detailed`, `/monitoring/metrics`, `/monitoring/stats`。 |
 | `services/wechat.py` | `WeChatService` + `WeChatConfig`. Wraps `wechatpy.enterprise.WeChatClient`/`WeChatCrypto`. Owns access_token, signature verify (委托 wecom_crypto), AES decrypt, message sync, send_kf, download_media, is_event_processed。crypto 方法是 `wecom_crypto` 的薄委托。 |
 | `services/message_processor.py` | `MessageProcessor`: 协议无关编排器 (KF+bot 合并)。dedup→媒体→Chatwoot handoff 检查→conversation_id→AI→compose→send→chatwoot notify。bot 9 阶段 trace 门控发射。`_upload_to_dify_file_store` 在此 (bot 媒体上传)。 |
 | `services/conversation_store.py` | `ConversationStore` ABC + `InMemory`/`Redis` 实现。薄 conversation_id 映射 (非历史存储)。 |
@@ -196,10 +196,10 @@ WeChat KF / 智能机器人 ──POST /wechat/{kf|bot}/callback──▶ FastAP
 
 默认 `APP_MESSAGE_QUEUE=memory`: 路由层用 `BackgroundTasks` (KF) / `asyncio.create_task` (bot) 派发, 进程内, 无持久化无锁 (单进程 dev)。设 `APP_MESSAGE_QUEUE=redis` 启用持久队列 + 分布式锁:
 
-- **持久队列** (`app/services/message_queue.py:RedisMessageQueue`): 入站消息 `LPUSH wecom:msgq`, worker `BLMOVE` 弹到 `wecom:msgq:proc` 消费, FIFO。进程重启/崩溃不丢消息: orphan sweep 用单 EVAL 原子把 `proc` 回灌 `main` (防多进程误删在途) 并逐条 `release_processing` 清崩溃残留的 stale dedup proc key (否则重投递 acquire=False 跳过 -> LREM -> 丢); `MessageProcessor.process` 真异常重抛 -> 队列据此走 retry/dead-letter (不再被 process 内部吞掉当 success)。不可解析/未知 adapter/重试耗尽入 `wecom:msgq:dead`。worker 在 `lifespan` 启动 (`APP_QUEUE_WORKERS` 协程), 关闭时取消 worker + 回灌 in-flight。
+- **持久队列** (`app/services/message_queue.py:RedisMessageQueue`): 入站消息 `LPUSH wecom:msgq`, 每个进程用独立 `wecom:msgq:proc:{consumer_id}` processing list。consumer heartbeat 存活时其他实例不会触碰其在途消息；heartbeat 过期后健康实例周期性原子回灌并清 stale dedup proc key。优雅关闭仅回灌本实例，避免全局 orphan sweep 破坏活跃 delivery ownership。`MessageProcessor.process` 真异常重抛后由队列 retry/dead-letter；不可解析/未知 adapter/重试耗尽入 `wecom:msgq:dead`。
 - **分布式锁 (#17B, 与队列共享同一 Redis client)**: worker 调 `process()` 前 `SET wecom:lock:{user}:{scope} NX EX APP_QUEUE_LOCK_TTL(600)` 串行化同用户消息 (消除 read->Dify->save 竞态); Lua(token 比对)释放。**锁被占** -> 消息回队尾 (不计失败); **Redis 异常** -> fail-open; TTL > 最坏 4 轮 Dify (MAX_ROUTES=3 × chatflow_timeout 120 = 480)。
 - **去重 (非崩溃幂等)**: 配 `APP_DEDUP_STORE=redis` 用 `RedisDedupStore` (`app/services/dedup_store.py`)。崩溃重投递不是幂等跳过: orphan sweep 清 stale proc key 后重投递会重新处理 (at-least-once); `done` key 仅在完成后防重复发送。`KF/BOT_DEDUP_TTL=600` 须 > 最坏 4 轮 Dify (480s), 否则处理中 proc key 提前过期致重复。load_settings 告警: `message_queue=redis` + `dedup_store=memory` -> 崩溃重投递可能产生 Dify 重复轮次。
-- **路由层 + 启动连通性**: `create_message_queue` (async) 创建 client 后 `PING`, Redis 不可达返回 `None` 回退内存派发 (不启动连不上的队列)。`enqueue` 返回 `bool`: LPUSH/序列化失败返回 `False` -> 路由回退 BackgroundTasks/create_task (不再微信已 ACK 却丢消息)。bot 内存派发经 `_safe_process` 兜底 (process 现重抛异常)。
+- **路由层 + 启动连通性**: `create_message_queue` (async) 创建 client 后 `PING`, Redis 不可达返回 `None` 回退内存派发。`enqueue` 返回 `bool`: LPUSH/序列化失败返回 `False` -> 路由回退 BackgroundTasks/create_task。KF/Bot 内存派发均经 `_safe_process` 隔离异常并按 `APP_QUEUE_MAX_ATTEMPTS` 做有限进程内重试，避免一条 KF 异常中断同批后续消息。
 - ⚠️ **send 重试**: 不在 send 失败时重跑整个 process (会令 Dify chatflow 重复一轮污染上下文); 仅做崩溃恢复重投递。瞬态 send_kf/response_url 失败仍按 process 内既有逻辑 (release 去重 + 记日志)。
 - ⚠️ **bot response_url TTL**: 同用户连续消息被锁串行化, 靠后者回复延迟, 其 response_url 可能过期 (KF send_kf 无 TTL, 不受影响)。
 

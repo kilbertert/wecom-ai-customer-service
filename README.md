@@ -71,7 +71,8 @@ pytest                            # 单元 + 集成测试
 - Dify chatflow 多轮: 双 app 路由状态机 {active, conv_a, conv_b}, SWITCH 标记驱动改投
 - 二阶段 bug 反馈: TIMER 标记 + Celery 30 分钟超时 + 飞书多维表格
 - Chatwoot 人工接管 (handoff 跳过 AI) + 双向消息同步
-- 持久队列 + 分布式锁 (可选 redis 模式): 进程重启不丢消息, 同用户消息串行化防竞态
+- 持久队列 + 分布式锁 (可选 redis 模式): 每实例 processing ownership + heartbeat
+  崩溃恢复，同用户消息串行化防竞态
 - 监控: `/monitoring/health` (存活) / `/monitoring/health/ready` (就绪) / `/monitoring/metrics` / `/monitoring/stats`
 
 ## 部署 / 灰度

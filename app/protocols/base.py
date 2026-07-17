@@ -180,8 +180,12 @@ class DedupStore(ABC):
         ...
 
     @abstractmethod
-    async def release_processing(self, msgid: str) -> None:
-        """处理失败/取消时释放 ``_processing`` 标记, 允许微信重试。"""
+    async def release_processing(self, msgid: str) -> bool:
+        """释放 ``_processing`` 标记。
+
+        返回 True 表示标记已确认不存在；False 表示存储异常、无法确认。普通处理路径可
+        忽略返回值，队列 orphan 恢复必须确认成功后才能把 delivery 暴露回主队列。
+        """
         ...
 
 
@@ -244,11 +248,12 @@ class InMemoryDedupStore(DedupStore):
             self._sent.add(msgid)
             return True
 
-    async def release_processing(self, msgid: str) -> None:
+    async def release_processing(self, msgid: str) -> bool:
         if not msgid:
-            return
+            return True
         async with self._lock:
             self._processing.pop(msgid, None)
+        return True
 
 
 __all__ = [

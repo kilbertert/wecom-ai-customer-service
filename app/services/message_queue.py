@@ -6,14 +6,15 @@
 
 设计要点
 --------
-- **队列 (Redis list, FIFO)**: ``LPUSH`` 入队 (head), ``BRPOPLPUSH`` 出队 (tail -> proc)。
-  ``wecom:msgq`` (主) / ``wecom:msgq:proc`` (处理中) / ``wecom:msgq:dead`` (死信)。
-- **崩溃恢复 (无周期 sweeper)**: 启动 + 优雅关闭时把 ``proc`` 列表里的 in-flight
-  全部**原子**回灌 ``main`` (单 EVAL ``_REQUEUE_LUA``, 至少一次投递)。worker 硬崩
-  -> item 留 proc + dedup ``_processing`` key 残留 (finally 没机会跑) -> 下次启动
-  回灌时**逐条 ``release_processing`` 清 stale key**, 否则重投递 ``acquire=False``
-  -> 跳过 -> 丢 (审查 P1 #4)。清理后重投递可重新 acquire 重处理; ``DedupStore`` 的
-  ``done`` key 仍防重复**发送** (完成后的重投递 acquire 命中 done 返回 False, 跳过)。
+- **队列 (Redis list, FIFO)**: ``LPUSH`` 入队 (head), ``BLMOVE`` 出队
+  (tail -> 本实例 proc)。``wecom:msgq`` (主) / ``wecom:msgq:proc:{consumer_id}``
+  (处理中) / ``wecom:msgq:dead`` (死信)。
+- **崩溃恢复 (实例所有权)**: 每个进程使用独立 ``wecom:msgq:proc:{consumer_id}``
+  处理中列表，并持续刷新 consumer heartbeat。仅 heartbeat 过期的实例会被其他健康实例
+  原子回灌到 ``main``；优雅关闭只回灌本实例列表。这样一个实例启动/停止不会移动其他
+  健康实例的 in-flight 消息，也不会清除其 dedup ``_processing`` key。硬崩后恢复时逐条
+  ``release_processing`` 清 stale key，让重投递重新 acquire；``done`` key 仍防完成后的
+  重复发送。维护循环会周期扫描失联实例，因此多进程中单实例崩溃无需等待全栈重启。
 - **锁 (#17B, 与队列共享同一 Redis client)**: ``SET lock NX EX ttl`` 占有, Lua(token 比对)
   释放。**锁被占** -> 消息回 main 队尾 (不算失败, 不增 attempts) + 短暂 sleep 防忙轮询;
   **Redis 异常** -> fail-open 直处理 (不阻塞); TTL > 最坏 4 轮 Dify 耗时, worker 崩溃靠
@@ -50,22 +51,56 @@ class RedisMessageQueue:
     """Redis 持久消息队列 + 每 (user,scope) 分布式锁。"""
 
     Q_MAIN = "wecom:msgq"
+    # Q_PROC 保留为旧版全局 processing key，仅用于启动迁移恢复。新实例一律使用
+    # ``Q_PROC_PREFIX + consumer_id``，防一个实例的 orphan sweep 误动其他健康实例。
     Q_PROC = "wecom:msgq:proc"
+    Q_PROC_PREFIX = "wecom:msgq:proc:"
+    CONSUMER_HEARTBEAT_PREFIX = "wecom:msgq:consumer:"
     Q_DEAD = "wecom:msgq:dead"
+
+    _HEARTBEAT_TTL = 60
+    _MAINTENANCE_INTERVAL = 15
 
     # 锁释放: 仅当持有 token 一致才 del (防误删他人锁)。
     _RELEASE_LUA = """
 if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end
 """
 
-    # 原子 orphan sweep: 把 proc 全量移到 main (LRANGE -> 逐条 LPUSH -> DEL proc)。
-    # 单 EVAL 原子, 避免多进程/多 worker 下 LRANGE 与 DEL 之间他人 blmove 入 proc 被误删
-    # (审查 P1 #4)。返回被移动的 items, 供 Python 逐条 release stale dedup key。
+    # 原子 orphan move: 只移动 Python 已确认清除 dedup processing key 的精确 raw。
+    # 不再 DEL 整个 proc，避免 heartbeat 误判后原 owner 恢复并新写入的 delivery 被带走。
     _REQUEUE_LUA = """
+local moved = 0
+for i=1,#ARGV do
+  local removed = redis.call('LREM', KEYS[1], 1, ARGV[i])
+  if removed == 1 then
+    redis.call('LPUSH', KEYS[2], ARGV[i])
+    moved = moved + 1
+  end
+end
+return moved
+"""
+
+    # 原子 move: 从 processing 按 source_raw 删除，再把 dest_raw 推到目标队列。
+    # retry 会更新 attempts，source_raw 与 dest_raw 不同；旧实现拿 new_raw 做 LREM，
+    # 导致旧 delivery 永久残留 proc，后续 orphan sweep 又以 attempts=0 回灌。
+    _MOVE_LUA = """
+local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+if removed == 0 then return 0 end
+redis.call('LPUSH', KEYS[2], ARGV[2])
+return 1
+"""
+
+    # BLMOVE 后把该 delivery 在本实例 proc 中的 raw 替换为带 processing_started_at
+    # 的 envelope，供观察脚本直接判断在途年龄（观察进程晚启动也不丢起始时间）。
+    _CLAIM_LUA = """
 local items = redis.call('LRANGE', KEYS[1], 0, -1)
-for i=1,#items do redis.call('LPUSH', KEYS[2], items[i]) end
-redis.call('DEL', KEYS[1])
-return items
+for i=1,#items do
+  if items[i] == ARGV[1] then
+    redis.call('LSET', KEYS[1], i-1, ARGV[2])
+    return 1
+  end
+end
+return 0
 """
 
     def __init__(
@@ -73,6 +108,7 @@ return items
         redis_client: Any,
         adapters: Dict[str, Any],
         processor: Any,
+        consumer_id: Optional[str] = None,
     ) -> None:
         from app.core.config import settings
 
@@ -82,8 +118,21 @@ return items
         self._n_workers = max(1, int(getattr(settings.app, "queue_workers", 2) or 2))
         self._lock_ttl = int(getattr(settings.app, "queue_lock_ttl", 300) or 300)
         self._max_attempts = int(getattr(settings.app, "queue_max_attempts", 3) or 3)
+        self._consumer_id = consumer_id or uuid4().hex
+        self._proc_key = f"{self.Q_PROC_PREFIX}{self._consumer_id}"
+        # 滚动升级时旧版本进程仍可能在全局 Q_PROC 中处理消息且没有 heartbeat。
+        # 新版本不能启动即回灌；至少等待一个完整 lock TTL + heartbeat 宽限，届时旧 delivery
+        # 要么完成移除，要么其处理锁也已失效，可安全按 legacy orphan 恢复。
+        self._legacy_recovery_after = (
+            time.monotonic() + self._lock_ttl + self._HEARTBEAT_TTL
+        )
+        # 向后兼容既有测试/观测代码里的 ``q.Q_PROC``，实例值指向自己的 processing list；
+        # 类属性 ``RedisMessageQueue.Q_PROC`` 仍表示旧版迁移 key。
+        self.Q_PROC = self._proc_key
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        self._maintenance_task: Optional[asyncio.Task] = None
+        self._pending_acks: set[str] = set()
 
     # ------------------------------------------------------------------
     # 入队 (路由层调用)
@@ -159,15 +208,22 @@ return items
     # 生命周期
     # ------------------------------------------------------------------
     async def start(self) -> None:
-        await self._requeue_orphans()
         self._stop.clear()
+        # 先声明本实例存活，再扫描失联 consumer。否则并发启动时会把刚创建实例的
+        # processing list 当 orphan。旧版全局 proc key 无 owner，启动时迁移一次。
+        await self._touch_heartbeat()
+        await self._recover_stale_consumers()
         for i in range(self._n_workers):
             self._tasks.append(
                 asyncio.create_task(self._loop(i), name=f"msgq-w{i}")
             )
+        self._maintenance_task = asyncio.create_task(
+            self._maintenance_loop(), name=f"msgq-maint-{self._consumer_id[:8]}"
+        )
         logger.info(
-            "[QUEUE] 启动 %d worker (lock_ttl=%ss max_attempts=%s)",
-            self._n_workers, self._lock_ttl, self._max_attempts,
+            "[QUEUE] 启动 %d worker consumer=%s (lock_ttl=%ss max_attempts=%s)",
+            self._n_workers, self._consumer_id[:8], self._lock_ttl,
+            self._max_attempts,
         )
 
     async def stop(self) -> None:
@@ -181,8 +237,19 @@ return items
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
-        # 被 cancel 的 in-flight 已留 proc (见 _handle), 这里统一回灌 main 供下次启动重处理。
+        if self._maintenance_task is not None:
+            self._maintenance_task.cancel()
+            try:
+                await self._maintenance_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._maintenance_task = None
+        # 被 cancel 的 in-flight 已留在本实例 proc；只回灌本实例，不能触碰其他健康进程。
         await self._requeue_orphans()
+        try:
+            await self._r.delete(self._heartbeat_key())
+        except Exception as e:
+            logger.warning("[QUEUE] 删除 consumer heartbeat 失败 (靠 TTL): %s", e)
         # 关闭队列独占的 Redis 连接 (conv/timer/dedup store 各自的连接由各自管理)
         try:
             aclose = getattr(self._r, "aclose", None)
@@ -192,49 +259,126 @@ return items
             logger.warning("[QUEUE] 关闭 Redis 连接失败: %s", e)
         logger.info("[QUEUE] 已停止")
 
-    async def _requeue_orphans(self) -> None:
-        """把 proc 列表里的 in-flight 全部原子回灌 main (启动/关闭时调用)。
+    def _heartbeat_key(self, consumer_id: Optional[str] = None) -> str:
+        cid = consumer_id or self._consumer_id
+        return f"{self.CONSUMER_HEARTBEAT_PREFIX}{cid}"
 
-        启动: 上次硬崩溃留下的 proc -> 重投递。关闭: 被 cancel 的 in-flight ->
-        下次启动重处理。不增 attempts (崩溃/取消不算失败)。
+    async def _touch_heartbeat(self) -> None:
+        await self._r.set(
+            self._heartbeat_key(), "1", ex=self._HEARTBEAT_TTL
+        )
 
-        原子性 (审查 P1 #4): 用单 EVAL (``_REQUEUE_LUA``) 把 proc 全量移到 main,
-        避免 LRANGE 与 DEL 之间他人 blmove 入 proc 被误删。
-
-        崩溃/dedup 冲突 (审查 P1 #4): 硬崩会同时留 proc 消息 + dedup ``_processing``
-        key (process.finally 没机会跑)。若不清理, 重投递时 ``acquire`` 命中残留 key
-        返回 False -> process 跳过 -> 队列 LREM -> **消息丢失**。故移动后逐条解析
-        msgid+adapter, ``release_processing`` 清 stale key, 让重投递能重新 acquire
-        (崩溃=未完成=应重处理)。cancel 路径下 process.finally 已 release, 此处为
-        no-op, 安全。
-        """
-        try:
-            items = await self._r.eval(
-                self._REQUEUE_LUA, 2, self.Q_PROC, self.Q_MAIN
-            )
-        except Exception as e:
-            logger.warning("[QUEUE] orphan sweep 失败 (proc 残留待下次): %s", e)
-            return
-        if not items:
-            return
-        cleared = 0
-        for it in items:
-            if isinstance(it, bytes):
-                it = it.decode("utf-8", errors="ignore")
+    async def _maintenance_loop(self) -> None:
+        """刷新本实例 heartbeat，并周期恢复已失联实例的 processing list。"""
+        while not self._stop.is_set():
             try:
-                env = json.loads(it)
+                await self._touch_heartbeat()
+                await self._recover_stale_consumers()
+                await self._flush_pending_acks()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("[QUEUE] consumer 维护循环异常: %s", e)
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self._MAINTENANCE_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _recover_stale_consumers(self) -> None:
+        """恢复旧版全局 proc 及 heartbeat 已过期的 consumer processing list。
+
+        新实例拥有随机 consumer_id，启动前先写 heartbeat；因此只要 heartbeat 存在，
+        其他实例绝不会回灌其 in-flight。硬崩实例 heartbeat 最迟 TTL 后消失，由健康实例
+        的维护循环恢复，无需等待整个服务重启。
+        """
+        # 兼容升级前遗留的全局 processing list。延迟恢复以兼容旧实例仍存活的滚动升级；
+        # 否则新实例无法区分“旧版活跃 delivery”和“旧版崩溃 orphan”。
+        if time.monotonic() >= self._legacy_recovery_after:
+            await self._recover_proc_key(type(self).Q_PROC, owner="legacy")
+
+        keys = self._r.scan_iter(match=f"{self.Q_PROC_PREFIX}*")
+        async for key in keys:
+            if isinstance(key, bytes):
+                key = key.decode("utf-8", errors="ignore")
+            owner = key.removeprefix(self.Q_PROC_PREFIX)
+            if not owner or owner == self._consumer_id:
+                continue
+            try:
+                alive = await self._r.exists(self._heartbeat_key(owner))
+            except Exception as e:
+                logger.warning("[QUEUE] 检查 consumer=%s heartbeat 失败: %s", owner[:8], e)
+                continue
+            if alive:
+                continue
+            await self._recover_proc_key(key, owner=owner)
+
+    async def _requeue_orphans(self) -> None:
+        """优雅关闭时仅回灌本实例的 in-flight，不影响其他健康实例。"""
+        await self._recover_proc_key(self._proc_key, owner=self._consumer_id)
+
+    async def _flush_pending_acks(self) -> None:
+        """重试成功处理后因瞬态 Redis 故障未完成的 LREM。"""
+        for raw in list(self._pending_acks):
+            try:
+                await self._r.lrem(self._proc_key, 1, raw)
+                self._pending_acks.discard(raw)
+            except Exception as e:
+                logger.warning("[QUEUE] success ACK 重试仍失败: %s", e)
+
+    async def _recover_proc_key(self, proc_key: str, owner: str) -> int:
+        """先确认清除 stale dedup，再原子暴露 delivery 回主队列。"""
+        try:
+            items = await self._r.lrange(proc_key, 0, -1)
+        except Exception as e:
+            logger.warning(
+                "[QUEUE] orphan 读取失败 owner=%s (proc 残留待下次): %s",
+                owner[:8], e,
+            )
+            return 0
+        if not items:
+            return 0
+
+        cleared = 0
+        dedup_ready = True
+        for it in items:
+            parse_raw = it.decode("utf-8", errors="ignore") if isinstance(it, bytes) else it
+            try:
+                env = json.loads(parse_raw)
                 msgid = (env.get("payload") or {}).get("msgid", "")
                 adapter = self._adapters.get(env.get("adapter"))
                 if msgid and adapter is not None:
-                    await adapter.dedup.release_processing(msgid)
-                    cleared += 1
+                    released = await adapter.dedup.release_processing(msgid)
+                    if released:
+                        cleared += 1
+                    else:
+                        dedup_ready = False
             except Exception as e:
-                # 解析失败的 item 已在 main, worker 会按反序列化失败入死信; 不阻塞回灌。
+                # 解析失败项不持有可定位的 dedup key，可安全移动后由 worker 入死信。
                 logger.warning("[QUEUE] orphan release dedup 跳过 (解析失败): %s", e)
+        if not dedup_ready:
+            logger.warning(
+                "[QUEUE] orphan owner=%s 的 dedup 清理未确认, 保留 %d 条 proc 待重试",
+                owner[:8], len(items),
+            )
+            return 0
+
+        try:
+            moved = await self._r.eval(
+                self._REQUEUE_LUA, 2, proc_key, self.Q_MAIN, *items
+            )
+        except Exception as e:
+            logger.warning(
+                "[QUEUE] orphan move 失败 owner=%s (proc 残留待下次): %s",
+                owner[:8], e,
+            )
+            return 0
         logger.info(
-            "[QUEUE] 原子回灌 %d 条 in-flight -> main (orphan sweep), "
-            "清 %d 个 stale dedup key", len(items), cleared,
+            "[QUEUE] 原子回灌 owner=%s 的 %d 条 in-flight -> main, "
+            "清 %d 个 stale dedup key", owner[:8], moved, cleared,
         )
+        return int(moved or 0)
 
     # ------------------------------------------------------------------
     # worker 循环
@@ -258,12 +402,33 @@ return items
                 continue  # 5s 超时, 回头检查 _stop
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
+            raw = await self._mark_processing_started(raw, wid)
             await self._handle(raw, wid)
+
+    async def _mark_processing_started(self, raw: str, wid: int) -> str:
+        """给刚 claim 的 envelope 写 processing_started_at；失败时保留原 raw 继续处理。"""
+        try:
+            env = json.loads(raw)
+            env["processing_started_at"] = time.time()
+            claimed_raw = json.dumps(env, ensure_ascii=False)
+            replaced = await self._r.eval(
+                self._CLAIM_LUA, 1, self._proc_key, raw, claimed_raw
+            )
+            if replaced:
+                return claimed_raw
+            logger.warning(
+                "[QUEUE w%s] claim 标记未找到 delivery, 继续处理原 envelope", wid
+            )
+        except Exception as e:
+            logger.warning("[QUEUE w%s] 写 processing_started_at 失败: %s", wid, e)
+        return raw
 
     async def _handle(self, raw: str, wid: int) -> None:
         # 1) 反序列化
         try:
             env = json.loads(raw)
+            if not isinstance(env, dict):
+                raise ValueError("queue envelope must be a JSON object")
         except Exception as e:
             logger.error("[QUEUE w%s] 反序列化失败, 入死信: %s", wid, e)
             await self._move_to(self.Q_DEAD, raw)
@@ -307,35 +472,47 @@ return items
                     "[QUEUE w%s] 重试 %s/%s msgid=%s: %s",
                     wid, env["attempts"], self._max_attempts, inbound.msgid, err,
                 )
-                await self._move_to(self.Q_MAIN, new_raw)
+                await self._move_to(self.Q_MAIN, raw, new_raw)
             else:
                 logger.error(
                     "[QUEUE w%s] 死信 (重试耗尽) msgid=%s: %s",
                     wid, inbound.msgid, err,
                 )
-                await self._move_to(self.Q_DEAD, new_raw)
+                await self._move_to(self.Q_DEAD, raw, new_raw)
             return
 
         # success: 移出 proc (仅 LREM; 失败则留 proc -> sweep 重投递, dedup 幂等)
         try:
             await self._r.lrem(self.Q_PROC, 1, raw)
+            self._pending_acks.discard(raw)
         except Exception as e:
+            self._pending_acks.add(raw)
             logger.warning(
-                "[QUEUE w%s] success LREM 失败, 留 proc 待 sweep (dedup 幂等): %s",
+                "[QUEUE w%s] success LREM 失败, 交维护循环重试 (dedup 幂等): %s",
                 wid, e,
             )
 
-    async def _move_to(self, dest: str, raw: str) -> None:
-        """把当前 proc 里的 raw 原子地移到 dest (先 LPUSH dest 再 LREM proc)。
-
-        先入 dest 再删 proc: 若 LPUSH 失败, raw 仍在 proc -> 下次 sweep 回灌 (不丢)。
-        若 LREM 失败, raw 同时在 proc+dest -> 重复投递, 由 dedup 幂等兜底。
-        """
+    async def _move_to(
+        self, dest: str, source_raw: str, dest_raw: Optional[str] = None
+    ) -> None:
+        """把 processing 中的 source_raw 原子移到 dest，可同时替换 envelope 内容。"""
+        dest_raw = source_raw if dest_raw is None else dest_raw
         try:
-            await self._r.lpush(dest, raw)
-            await self._r.lrem(self.Q_PROC, 1, raw)
+            moved = await self._r.eval(
+                self._MOVE_LUA,
+                2,
+                self._proc_key,
+                dest,
+                source_raw,
+                dest_raw,
+            )
+            if not moved:
+                logger.warning(
+                    "[QUEUE] _move_to(%s) 未找到 source delivery, 可能已被恢复: %s",
+                    dest, source_raw[:80],
+                )
         except Exception as e:
-            logger.warning("[QUEUE] _move_to(%s) 失败, 留 proc 待 sweep: %s", dest, e)
+            logger.warning("[QUEUE] _move_to(%s) 失败, 留 proc 待恢复: %s", dest, e)
 
     # ------------------------------------------------------------------
     # 分布式锁 + process
@@ -396,6 +573,7 @@ async def create_message_queue(
     mode = (getattr(settings.app, "message_queue", "memory") or "memory").lower()
     if mode != "redis":
         return None
+    client = None
     try:
         import redis.asyncio as aioredis
 
@@ -411,6 +589,11 @@ async def create_message_queue(
         )
         await client.ping()  # 连通性检查: 失败则回退内存派发
     except Exception as e:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
         logger.warning(
             "Redis MessageQueue PING 失败, 回退 memory (BackgroundTasks): %s", e
         )

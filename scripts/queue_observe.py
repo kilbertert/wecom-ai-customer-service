@@ -3,12 +3,13 @@
 
 部署 (#15 持久队列) 后用于灰度观察:
   - wecom:msgq      主队列深度 (积压)
-  - wecom:msgq:proc 处理中深度 (> workers 持续 = 超容量积压/锁卡死; 正常在途不告警)
+  - wecom:msgq:proc:* 各实例处理中深度 + 单条 delivery 在途年龄
   - wecom:msgq:dead 死信 (> 0 = 有消息反复失败, 需排查)
   - /monitoring/health       存活
   - /monitoring/health/ready 就绪 (配置占位 / Dify 不可达 -> 503)
 
-任一告警 (dead>0 / proc 超 workers 持续 / 非 200) -> 退出码非零, 可作 canary gate:
+任一告警 (dead>0 / proc 超容量 / 单条 delivery 超时 / 非 200) -> 退出码非零,
+可作 canary gate:
   python3 scripts/queue_observe.py --duration 300   # 观察 5 分钟, 有告警则 exit 1
 
 默认读 app settings (prod .env) 取 redis 与端口; 也可 --redis-url / --health-url 覆盖。
@@ -17,6 +18,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import sys
 import time
@@ -34,6 +37,73 @@ def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _processing_items(redis_client) -> list:
+    """读取旧版全局 proc + 所有实例 ``proc:{consumer_id}`` 的 in-flight。"""
+    keys = [RedisMessageQueue.Q_PROC]
+    keys.extend(redis_client.scan_iter(match=f"{RedisMessageQueue.Q_PROC_PREFIX}*"))
+    seen = set()
+    items = []
+    for key in keys:
+        if isinstance(key, bytes):
+            key = key.decode("utf-8", errors="ignore")
+        if key in seen:
+            continue
+        seen.add(key)
+        items.extend(redis_client.lrange(key, 0, -1))
+    return items
+
+
+def _delivery_id(raw) -> str:
+    """从队列 envelope 取稳定 delivery id；坏数据用内容摘要兜底。"""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        env = json.loads(raw)
+        delivery_id = env.get("id") or (env.get("payload") or {}).get("msgid")
+        if delivery_id:
+            return str(delivery_id)
+    except Exception:
+        pass
+    return "raw-" + hashlib.sha1(str(raw).encode("utf-8")).hexdigest()[:12]
+
+
+def _processing_started_at(raw) -> float | None:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        value = json.loads(raw).get("processing_started_at")
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _stuck_deliveries(
+    items: list, first_seen: dict[str, float], now: float, max_age: float
+) -> list[tuple[str, int]]:
+    """跟踪同一 delivery 连续停留在任一 proc list 的时长。"""
+    current = set()
+    for raw in items:
+        delivery_id = _delivery_id(raw)
+        current.add(delivery_id)
+        started_at = _processing_started_at(raw)
+        initial = min(now, started_at) if started_at is not None else now
+        if delivery_id not in first_seen:
+            first_seen[delivery_id] = initial
+        else:
+            first_seen[delivery_id] = min(first_seen[delivery_id], initial)
+    for delivery_id in set(first_seen) - current:
+        first_seen.pop(delivery_id, None)
+    return sorted(
+        (
+            (delivery_id, int(now - first_seen[delivery_id]))
+            for delivery_id in current
+            if now - first_seen[delivery_id] >= max_age
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="灰度观察 redis 队列 + 健康")
     ap.add_argument("--duration", type=int, default=0,
@@ -48,8 +118,14 @@ def main() -> int:
                     help="proc 连续超容量多少轮判为卡死 (默认 6 ≈ 30s)")
     ap.add_argument("--workers", type=int,
                     default=int(getattr(settings.app, "queue_workers", 2) or 2),
-                    help="worker 协程数; proc>workers 持续才判卡死 (默认读 "
-                         "APP_QUEUE_WORKERS, 正常在途 proc<=workers 不告警)")
+                    help="所有服务实例的 worker 总数; proc>workers 持续判超容量 "
+                         "(单实例默认读 APP_QUEUE_WORKERS, 多实例请显式传总数)")
+    ap.add_argument(
+        "--proc-stuck-seconds", type=int,
+        default=int(getattr(settings.app, "queue_lock_ttl", 600) or 600) + 60,
+        help="同一 delivery 连续停留在 proc 的告警秒数 "
+             "(默认 APP_QUEUE_LOCK_TTL+60, 避免正常长 Dify 误报)",
+    )
     args = ap.parse_args()
 
     # ---- redis 客户端 ----
@@ -89,9 +165,10 @@ def main() -> int:
             return 0
 
     proc_over = 0             # proc 连续超容量 (>workers) 轮数
+    proc_first_seen: dict[str, float] = {}
     ever_alert = False
     start = time.time()
-    QM, QP, QD = RedisMessageQueue.Q_MAIN, RedisMessageQueue.Q_PROC, RedisMessageQueue.Q_DEAD
+    QM, QD = RedisMessageQueue.Q_MAIN, RedisMessageQueue.Q_DEAD
 
     try:
         while True:
@@ -100,10 +177,12 @@ def main() -> int:
                 break
 
             main_len = proc_len = dead_len = -1
+            proc_items = []
             if r is not None:
                 try:
                     main_len = r.llen(QM)
-                    proc_len = r.llen(QP)
+                    proc_items = _processing_items(r)
+                    proc_len = len(proc_items)
                     dead_len = r.llen(QD)
                 except Exception as e:
                     print(f"[{_ts()}] [WARN] redis 查询失败: {e}")
@@ -124,6 +203,14 @@ def main() -> int:
                     )
             else:
                 proc_over = 0
+            # 数量无法识别“全部 worker 都卡死且 proc==workers”。按 delivery id 连续在途
+            # 年龄补齐这一盲区；消息正常完成/回队后会从 first_seen 移除。
+            stuck = _stuck_deliveries(
+                proc_items, proc_first_seen, now, args.proc_stuck_seconds
+            )
+            if stuck:
+                sample = ",".join(f"{did[:8]}:{age}s" for did, age in stuck[:3])
+                alerts.append(f"PROC_STUCK={len(stuck)}[{sample}]")
             if health != 200:
                 alerts.append(f"health={health}")
             if ready != 200:

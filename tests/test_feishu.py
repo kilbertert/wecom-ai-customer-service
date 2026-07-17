@@ -74,3 +74,56 @@ def test_write_with_retry_success_first_try(monkeypatch):
     data = _write_with_retry("新增记录", _do)
     assert data["code"] == 0
     assert calls == [1]
+
+
+def test_table_write_guard_uses_token_checked_redis_lock(monkeypatch):
+    import redis
+    from app.core.config import settings
+
+    class _Client:
+        def __init__(self):
+            self.set_args = None
+            self.eval_args = None
+            self.closed = False
+
+        def set(self, *args, **kwargs):
+            self.set_args = (args, kwargs)
+            return True
+
+        def eval(self, *args):
+            self.eval_args = args
+            return 1
+
+        def close(self):
+            self.closed = True
+
+    client = _Client()
+    monkeypatch.setattr(settings.app, "message_queue", "redis")
+    monkeypatch.setattr(redis, "Redis", lambda **_kwargs: client)
+
+    with fb._table_write_guard():
+        assert client.set_args is not None
+
+    assert client.eval_args[2] == fb._DISTRIBUTED_WRITE_LOCK_KEY
+    assert client.eval_args[3] == client.set_args[0][1]
+    assert client.closed is True
+
+
+def test_table_write_guard_degrades_to_local_lock_when_redis_fails(monkeypatch):
+    import redis
+    from app.core.config import settings
+
+    class _Client:
+        def set(self, *args, **kwargs):
+            raise ConnectionError("redis down")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(settings.app, "message_queue", "redis")
+    monkeypatch.setattr(redis, "Redis", lambda **_kwargs: _Client())
+
+    with fb._table_write_guard():
+        reached = True
+
+    assert reached is True

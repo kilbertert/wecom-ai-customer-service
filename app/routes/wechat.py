@@ -20,21 +20,44 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/wechat", tags=["wechat"])
 
 
-async def _safe_process(processor, inbound, adapter) -> None:
-    """内存派发兜底: 捕获 ``process`` 重抛的异常, 避免 asyncio un-retrieved-exception
-    警告 (审查 P1 #3: process 真异常现重抛供队列重试/死信; 内存路径在此兜底日志)。
+async def _safe_process(
+    processor, inbound, adapter, max_attempts: int | None = None
+) -> None:
+    """内存派发兜底: 隔离异常并做有限重试。
 
-    ``CancelledError`` (shutdown) 重抛以正确标记任务取消; 业务 ``Exception`` 记 ERROR。
+    ``MessageProcessor.process`` 会重抛真异常供 Redis 队列 retry/dead-letter。Redis
+    不可用或显式 memory 模式下没有持久队列，因此这里按 ``APP_QUEUE_MAX_ATTEMPTS``
+    做进程内有限重试；最终失败只记录，不让 Starlette ``BackgroundTasks`` 的首条异常
+    中断同一批后续 KF 消息。``CancelledError`` 仍重抛以正确标记 shutdown。
     """
-    try:
-        await processor.process(inbound, adapter)
-    except asyncio.CancelledError:
-        logger.info("[BOT] 后台处理被取消 (shutdown): msgid=%s", inbound.msgid)
-        raise
-    except Exception as e:
-        logger.error(
-            "[BOT] 后台处理异常: msgid=%s, %s", inbound.msgid, e, exc_info=True
-        )
+    if max_attempts is None:
+        from app.core.config import settings
+
+        max_attempts = int(getattr(settings.app, "queue_max_attempts", 3) or 3)
+    max_attempts = max(1, max_attempts)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await processor.process(inbound, adapter)
+            return
+        except asyncio.CancelledError:
+            logger.info(
+                "[MEMORY] 后台处理被取消 (shutdown): msgid=%s", inbound.msgid
+            )
+            raise
+        except Exception as e:
+            if attempt >= max_attempts:
+                logger.error(
+                    "[MEMORY] 后台处理失败且重试耗尽: msgid=%s attempts=%s, %s",
+                    inbound.msgid, max_attempts, e, exc_info=True,
+                )
+                return
+            delay = min(2 ** (attempt - 1), 5)
+            logger.warning(
+                "[MEMORY] 后台处理失败, %.1fs 后重试 %s/%s: msgid=%s, %s",
+                delay, attempt, max_attempts, inbound.msgid, e,
+            )
+            await asyncio.sleep(delay)
 
 
 # ============================================================================
@@ -95,7 +118,7 @@ async def wechat_callback_handler(
                 # queue is None (memory 模式) 或入队失败 (Redis 宕机) -> 内存派发兜底,
                 # 避免微信已 ACK 却丢消息 (审查 P1 #2)。
                 logger.info(f"[KF] 入后台处理: msgid={inbound.msgid}")
-                background_tasks.add_task(processor.process, inbound, adapter)
+                background_tasks.add_task(_safe_process, processor, inbound, adapter)
     except Exception as e:
         logger.error(f"[KF] 回调处理异常: {e}", exc_info=True)
 

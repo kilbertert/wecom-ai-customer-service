@@ -8,6 +8,7 @@ orphan sweep 回灌、RedisDedupStore 状态机。
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 from dataclasses import asdict
 
@@ -102,6 +103,13 @@ class FakeRedis:
         async with self._cond:
             return 1 if key in self._kv else 0
 
+    async def scan_iter(self, match=None):
+        async with self._cond:
+            keys = list(set(self._lists) | set(self._kv))
+        for key in keys:
+            if match is None or fnmatch.fnmatch(key, match):
+                yield key
+
     async def get(self, key):
         async with self._cond:
             return self._kv.get(key)
@@ -121,6 +129,18 @@ class FakeRedis:
             keys = list(args[:numkeys])
             argv = list(args[numkeys:])
             if numkeys == 1:
+                if "LSET" in s:
+                    # CLAIM_LUA: KEYS[1]=proc, ARGV=[source_raw,claimed_raw]
+                    proc = keys[0]
+                    source_raw, claimed_raw = argv[0], argv[1]
+                    lst = self._lists.get(proc, [])
+                    try:
+                        idx = lst.index(source_raw)
+                    except ValueError:
+                        return 0
+                    lst[idx] = claimed_raw
+                    self._cond.notify_all()
+                    return 1
                 # RELEASE_LUA: KEYS[1]=lock, ARGV[1]=token
                 key, token = keys[0], argv[0]
                 if self._kv.get(key) == token:
@@ -128,15 +148,36 @@ class FakeRedis:
                     self._cond.notify_all()
                     return 1
                 return 0
-            if numkeys == 2 and "LRANGE" in s:
-                # REQUEUE_LUA: KEYS=[proc, main] -> 把 proc 全量原子移到 main, 返回 items
+            if numkeys == 2 and "for i=1,#ARGV" in s:
+                # REQUEUE_LUA: 只移动调用方传入的精确 raw items
                 proc, main = keys[0], keys[1]
-                items = list(self._lists.get(proc, []))
-                for it in items:
-                    self._lists.setdefault(main, []).insert(0, it)  # LPUSH head
-                self._lists.pop(proc, None)
+                moved = 0
+                for it in argv:
+                    lst = self._lists.get(proc, [])
+                    try:
+                        idx = lst.index(it)
+                    except ValueError:
+                        continue
+                    lst.pop(idx)
+                    self._lists[proc] = lst
+                    self._lists.setdefault(main, []).insert(0, it)
+                    moved += 1
                 self._cond.notify_all()
-                return items
+                return moved
+            if numkeys == 2 and "LREM" in s:
+                # MOVE_LUA: KEYS=[proc,dest], ARGV=[source_raw,dest_raw]
+                proc, dest = keys[0], keys[1]
+                source_raw, dest_raw = argv[0], argv[1]
+                lst = self._lists.get(proc, [])
+                try:
+                    idx = lst.index(source_raw)
+                except ValueError:
+                    return 0
+                lst.pop(idx)
+                self._lists[proc] = lst
+                self._lists.setdefault(dest, []).insert(0, dest_raw)
+                self._cond.notify_all()
+                return 1
             if numkeys == 2 and "exists" in s:
                 # ACQUIRE_LUA: KEYS=[done, proc]
                 done, proc = keys[0], keys[1]
@@ -239,6 +280,44 @@ async def test_lock_released_after_success():
     assert await fake.get("wecom:lock:u1:k1") is None
 
 
+async def test_claim_records_processing_started_at_in_proc_envelope():
+    fake = FakeRedis()
+    q = RedisMessageQueue(fake, {"kf": FakeAdapter()}, FakeProcessor())
+    raw = _env(_inbound("m1", "hi"))
+    await fake.lpush(q.Q_PROC, raw)
+
+    claimed = await q._mark_processing_started(raw, 0)
+
+    assert json.loads(claimed)["processing_started_at"] > 0
+    assert await fake.lrange(q.Q_PROC, 0, -1) == [claimed]
+
+
+async def test_success_ack_is_retried_by_maintenance_after_transient_lrem_failure():
+    class _FlakyLremRedis(FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.fail_once = True
+
+        async def lrem(self, key, count, value):
+            if self.fail_once:
+                self.fail_once = False
+                raise ConnectionError("transient")
+            return await super().lrem(key, count, value)
+
+    fake = _FlakyLremRedis()
+    q = RedisMessageQueue(fake, {"kf": FakeAdapter()}, FakeProcessor())
+    raw = _env(_inbound("m1", "hi"))
+    await fake.lpush(q.Q_PROC, raw)
+
+    await q._handle(raw, 0)
+    assert raw in q._pending_acks
+    assert await fake.lrange(q.Q_PROC, 0, -1) == [raw]
+
+    await q._flush_pending_acks()
+    assert q._pending_acks == set()
+    assert await fake.lrange(q.Q_PROC, 0, -1) == []
+
+
 async def test_cancel_leaves_in_proc():
     fake = FakeRedis()
     proc = FakeProcessor(raise_exc=asyncio.CancelledError())
@@ -268,6 +347,7 @@ async def test_true_exception_retries_then_dead():
     main = await fake.lrange(q.Q_MAIN, 0, -1)
     assert len(main) == 1
     assert json.loads(main[0])["attempts"] == 1
+    assert await fake.lrange(q.Q_PROC, 0, -1) == []
 
     # attempts=1 (== max-1) -> 再失败 -> attempts=2 == max -> 死信
     await fake.delete(q.Q_MAIN)
@@ -276,6 +356,7 @@ async def test_true_exception_retries_then_dead():
     await q._handle(raw1, 0)
     assert len(await fake.lrange(q.Q_DEAD, 0, -1)) == 1
     assert len(await fake.lrange(q.Q_MAIN, 0, -1)) == 0
+    assert await fake.lrange(q.Q_PROC, 0, -1) == []
 
 
 async def test_unparseable_goes_to_dead():
@@ -285,6 +366,18 @@ async def test_unparseable_goes_to_dead():
     await q._handle("not-json{", 0)
     assert len(await fake.lrange(q.Q_DEAD, 0, -1)) == 1
     assert len(await fake.lrange(q.Q_PROC, 0, -1)) == 0
+
+
+async def test_non_object_json_envelope_goes_to_dead():
+    fake = FakeRedis()
+    q = RedisMessageQueue(fake, {"kf": FakeAdapter()}, FakeProcessor())
+    raw = '["valid-json", "wrong-shape"]'
+    await fake.lpush(q.Q_PROC, raw)
+
+    await q._handle(raw, 0)
+
+    assert len(await fake.lrange(q.Q_DEAD, 0, -1)) == 1
+    assert await fake.lrange(q.Q_PROC, 0, -1) == []
 
 
 async def test_unknown_adapter_goes_to_dead():
@@ -436,6 +529,73 @@ async def test_orphan_sweep_clears_stale_dedup_key():
     assert len(await fake.lrange(q.Q_PROC, 0, -1)) == 0
     # stale dedup proc key 已清 -> 重投递可重新 acquire (P1 #4 修复点)
     assert await ds.acquire("m1", 300) is True
+
+
+async def test_recovery_does_not_touch_live_consumer_processing():
+    """活跃实例有 heartbeat 时，另一实例启动/维护不得回灌其消息或清 processing key。"""
+    fake = FakeRedis()
+    ds = RedisDedupStore(fake)
+    adapter = FakeAdapter(dedup=ds)
+    q1 = RedisMessageQueue(
+        fake, {"kf": adapter}, FakeProcessor(), consumer_id="consumer-live"
+    )
+    q2 = RedisMessageQueue(
+        fake, {"kf": adapter}, FakeProcessor(), consumer_id="consumer-other"
+    )
+
+    await q1._touch_heartbeat()
+    assert await ds.acquire("live-msg", 600) is True
+    await fake.lpush(q1.Q_PROC, _env(_inbound("live-msg", "hi")))
+
+    await q2._recover_stale_consumers()
+
+    assert len(await fake.lrange(q1.Q_PROC, 0, -1)) == 1
+    assert await fake.lrange(q1.Q_MAIN, 0, -1) == []
+    assert await ds.acquire("live-msg", 600) is False
+
+
+async def test_recovery_requeues_consumer_after_heartbeat_disappears():
+    """硬崩实例无 heartbeat 时，健康实例恢复其列表并释放 stale dedup key。"""
+    fake = FakeRedis()
+    ds = RedisDedupStore(fake)
+    adapter = FakeAdapter(dedup=ds)
+    dead = RedisMessageQueue(
+        fake, {"kf": adapter}, FakeProcessor(), consumer_id="consumer-dead"
+    )
+    rescuer = RedisMessageQueue(
+        fake, {"kf": adapter}, FakeProcessor(), consumer_id="consumer-rescuer"
+    )
+
+    assert await ds.acquire("dead-msg", 600) is True
+    await fake.lpush(dead.Q_PROC, _env(_inbound("dead-msg", "hi")))
+
+    await rescuer._recover_stale_consumers()
+
+    assert await fake.lrange(dead.Q_PROC, 0, -1) == []
+    assert len(await fake.lrange(dead.Q_MAIN, 0, -1)) == 1
+    assert await ds.acquire("dead-msg", 600) is True
+
+
+async def test_recovery_keeps_orphan_hidden_when_dedup_release_fails():
+    class _FailingDedup:
+        async def release_processing(self, msgid):
+            return False
+
+    fake = FakeRedis()
+    adapter = FakeAdapter(dedup=_FailingDedup())
+    dead = RedisMessageQueue(
+        fake, {"kf": adapter}, FakeProcessor(), consumer_id="consumer-dead"
+    )
+    rescuer = RedisMessageQueue(
+        fake, {"kf": adapter}, FakeProcessor(), consumer_id="consumer-rescuer"
+    )
+    raw = _env(_inbound("dead-msg", "hi"))
+    await fake.lpush(dead.Q_PROC, raw)
+
+    await rescuer._recover_stale_consumers()
+
+    assert await fake.lrange(dead.Q_PROC, 0, -1) == [raw]
+    assert await fake.lrange(dead.Q_MAIN, 0, -1) == []
 
 
 async def test_create_message_queue_ping_failure_returns_none(monkeypatch):

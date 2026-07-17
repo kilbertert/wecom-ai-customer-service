@@ -7,10 +7,9 @@ memory wecom-smartsheet-deadend)。飞书 ``records/search`` 支持 ``contains``
 鉴权: ``tenant_access_token`` (app_id+app_secret 换, 2h 有效, 双 token 并存)。
 两层权限: 应用需有 ``bitable:app`` scope + 是目标表的协作者/所有者。
 
-⚠️ 并发写: 同一数据表不支持并发写 (报 1254291 Write conflict)。Celery worker
-concurrency=1 天然串行; ``add_record``/``update_record`` 内置 1254291 指数退避
-重试 (3 次: 0.3/0.6/1.2s) 自愈瞬态冲突; 真正串行仍靠 celery concurrency=1 +
-避免并发 web 写 (审查 P1 #7)。
+⚠️ 并发写: 同一数据表不支持并发写 (报 1254291 Write conflict)。
+``add_record``/``update_record`` 先经进程内线程锁；Redis 队列模式再获取跨进程表级锁，
+并保留 1254291 指数退避重试 (3 次: 0.3/0.6/1.2s) 处理锁 TTL/外部并发等瞬态冲突。
 
 本模块为**同步实现** (httpx.Client), 供 Celery task 直接调; async 上下文用
 ``asyncio.to_thread`` 包装 (见 smartsheet_query_service)。
@@ -18,9 +17,12 @@ concurrency=1 天然串行; ``add_record``/``update_record`` 内置 1254291 指�
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 import httpx
 
@@ -108,9 +110,94 @@ def _check(data: Dict[str, Any], action: str) -> None:
         )
 
 
-# 1254291 = Write conflict (同表并发写)。add_record/update_record 退避重试 (审查 P1 #7)。
+# 1254291 = Write conflict (同表并发写)。表级锁之外再用退避重试兜底。
 _WRITE_CONFLICT_CODE = 1254291
 _WRITE_RETRY_DELAYS = (0.3, 0.6, 1.2)  # 指数退避 (秒), 3 次重试
+_LOCAL_WRITE_LOCK = threading.Lock()
+_DISTRIBUTED_WRITE_LOCK_KEY = "wecom:feishu:table-write"
+_DISTRIBUTED_WRITE_LOCK_TTL = 180  # 覆盖最坏 4×30s HTTP timeout + backoff
+_DISTRIBUTED_WRITE_LOCK_WAIT = 60
+_RELEASE_WRITE_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+def _acquire_distributed_write_lock():
+    """Redis 队列模式下获取跨进程飞书表级锁。
+
+    Redis 故障时保留本进程 ``threading.Lock`` + 1254291 重试的降级能力；Redis 可用但
+    锁持续繁忙超过等待上限时 fail-closed，避免绕过锁制造新一轮写冲突。
+    """
+    mode = (getattr(settings.app, "message_queue", "memory") or "memory").lower()
+    if mode != "redis":
+        return None, None
+    client = None
+    try:
+        import redis
+
+        client = redis.Redis(
+            host=settings.redis.host,
+            port=settings.redis.port,
+            db=settings.redis.db,
+            password=(
+                settings.redis.password.get_secret_value()
+                if settings.redis.password
+                else None
+            ),
+            socket_timeout=1,
+            socket_connect_timeout=1,
+        )
+        token = uuid4().hex
+        deadline = time.monotonic() + _DISTRIBUTED_WRITE_LOCK_WAIT
+        while time.monotonic() < deadline:
+            if client.set(
+                _DISTRIBUTED_WRITE_LOCK_KEY,
+                token,
+                nx=True,
+                ex=_DISTRIBUTED_WRITE_LOCK_TTL,
+            ):
+                return client, token
+            time.sleep(0.1)
+    except Exception as e:
+        logger.warning(
+            "[feishu] Redis 表级写锁不可用, 降级本进程串行 + 冲突重试: %s", e
+        )
+        if client is not None:
+            client.close()
+        return None, None
+
+    if client is not None:
+        client.close()
+    raise FeishuBitableError(
+        f"飞书表级写锁等待超过 {_DISTRIBUTED_WRITE_LOCK_WAIT}s"
+    )
+
+
+@contextmanager
+def _table_write_guard():
+    """同进程线程锁 + Redis 跨进程锁，串行化同一飞书表的 add/update。"""
+    with _LOCAL_WRITE_LOCK:
+        client, token = _acquire_distributed_write_lock()
+        try:
+            yield
+        finally:
+            if client is not None and token is not None:
+                try:
+                    client.eval(
+                        _RELEASE_WRITE_LOCK_LUA,
+                        1,
+                        _DISTRIBUTED_WRITE_LOCK_KEY,
+                        token,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[feishu] 释放 Redis 表级写锁失败 (靠 TTL): %s", e
+                    )
+                finally:
+                    client.close()
 
 
 def _write_with_retry(action: str, do_request):
@@ -231,7 +318,8 @@ def add_record(fields: Dict[str, Any]) -> str:
             )
             r.raise_for_status()
             return r.json()
-    data = _write_with_retry("新增记录", _do)
+    with _table_write_guard():
+        data = _write_with_retry("新增记录", _do)
     record = (data.get("data") or {}).get("record") or {}
     rid = record.get("record_id") or record.get("id") or ""
     if not rid:
@@ -258,7 +346,8 @@ def update_record(record_id: str, fields: Dict[str, Any]) -> None:
             )
             r.raise_for_status()
             return r.json()
-    _write_with_retry("修改记录", _do)
+    with _table_write_guard():
+        _write_with_retry("修改记录", _do)
     logger.info("[feishu] 修改记录成功 record_id=%s", record_id)
 
 

@@ -94,11 +94,14 @@ curl http://localhost:8501/monitoring/metrics
 
 ## 灰度观察
 
-`scripts/queue_observe.py` 轮询 redis 队列深度 + 健康端点, 死信 > 0 / 处理中堆积增长 / 未就绪时告警并非零退出 (可作 canary gate):
+`scripts/queue_observe.py` 轮询 redis 队列深度、各实例 processing list、单条 delivery
+在途年龄和健康端点；死信、处理超时、超容量或未就绪时告警并非零退出 (可作 canary gate):
 
 ```bash
 python3 scripts/queue_observe.py                  # 持续观察 (Ctrl-C 停)
 python3 scripts/queue_observe.py --duration 300   # 观察 5 分钟后退出 (非零=告警)
+# 多实例部署: workers 传所有实例 APP_QUEUE_WORKERS 总和；长任务卡死门槛可按需调整
+python3 scripts/queue_observe.py --workers 4 --proc-stuck-seconds 660 --duration 900
 ```
 
 ## 安全清单 (部署前)

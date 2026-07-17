@@ -103,13 +103,15 @@ return 1
             logger.warning("[DedupRedis] mark_sent 异常, fail-open: msgid=%s %s", msgid, e)
             return True
 
-    async def release_processing(self, msgid: str) -> None:
+    async def release_processing(self, msgid: str) -> bool:
         if not msgid:
-            return
+            return True
         try:
             await self._r.delete(f"{self._PROC}{msgid}")
+            return True
         except Exception as e:
             logger.warning("[DedupRedis] release_processing 异常: msgid=%s %s", msgid, e)
+            return False
 
 
 def create_dedup_store() -> DedupStore:
