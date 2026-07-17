@@ -2,7 +2,7 @@
 
 覆盖:
     - _coerce_url_list (None / str / list[str] / list[dict] 各种形态)
-    - extract_multimodal_payload (text / reply_content / content / data 各种字段)
+    - extract_multimodal_payload (text / content / data 各种字段)
     - compose_multimodal_markdown (文本+图片+视频+文件拼接)
     - has_multimodal_payload
 """
@@ -90,19 +90,6 @@ class TestExtractMultimodalPayload:
         p = extract_multimodal_payload({"text": "hello"})
         assert p["text"] == "hello"
 
-    def test_reply_content_text_object(self):
-        wf = {
-            "reply_content": {
-                "msgtype": "text",
-                "text": {"content": "hello from reply_content"},
-            }
-        }
-        assert extract_multimodal_payload(wf)["text"] == "hello from reply_content"
-
-    def test_reply_content_fallback_content(self):
-        wf = {"reply_content": {"content": "fallback content"}}
-        assert extract_multimodal_payload(wf)["text"] == "fallback content"
-
     def test_top_level_content_field(self):
         assert extract_multimodal_payload({"content": "hi"})["text"] == "hi"
 
@@ -114,16 +101,8 @@ class TestExtractMultimodalPayload:
             "text": "primary",
             "content": "secondary",
             "data": "tertiary",
-            "reply_content": {"text": {"content": "quaternary"}},
         }
         assert extract_multimodal_payload(wf)["text"] == "primary"
-
-    def test_reply_content_priority_over_content(self):
-        wf = {
-            "reply_content": {"text": {"content": "primary rc"}},
-            "content": "secondary content",
-        }
-        assert extract_multimodal_payload(wf)["text"] == "primary rc"
 
     def test_images_field(self):
         p = extract_multimodal_payload({"text": "x", "images": ["a.jpg", "b.jpg"]})
@@ -211,16 +190,6 @@ class TestComposeMultimodalMarkdown:
         assert "![图片](https://x.com/b.jpg)" in md
         assert "[视频](https://x.com/v.mp4)" in md
         assert "[文件](https://x.com/d.pdf)" in md
-
-    def test_coze_reply_content_format(self):
-        """Coze stream_run 返回的 reply_content 结构应正确拼接"""
-        wf = {
-            "reply_content": {"msgtype": "text", "text": {"content": "hi from coze"}},
-            "images": ["https://x.com/a.jpg"],
-        }
-        md = compose_multimodal_markdown(wf)
-        assert "hi from coze" in md
-        assert "![图片](https://x.com/a.jpg)" in md
 
     def test_empty_returns_empty_string(self):
         assert compose_multimodal_markdown({}) == ""

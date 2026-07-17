@@ -41,6 +41,8 @@ class InboundMessage:
     # 媒体定位符 (协议无关): KF 用 media_id 走 /media/get; bot image 用 CDN url
     media_ref: str = ""
     media_kind: str = ""  # "url" | "media_id" | ""
+    media_type: str = ""  # "image" | "voice" | "" (实际媒体类型; mixed 时由首个媒体决定)
+    aeskey: str = ""  # 企微AI机器人图片AES解密密钥
     user_id: str = ""  # KF: external_userid; bot: from.userid
     open_kfid: str = ""  # KF 专用; bot 为空
     response_url: str = ""  # bot 专用 (异步推送回复); KF 为空

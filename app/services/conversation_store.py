@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple
 
@@ -30,59 +31,120 @@ class ConversationStore(ABC):
     """conversation_id 映射存储接口。"""
 
     @abstractmethod
-    async def get(self, user_id: str, scope: str) -> Optional[str]:
-        """取已保存的 conversation_id, 首次为 None (Dify 会新建会话)。"""
+    async def get_state(self, user_id: str, scope: str) -> Dict[str, str]:
+        """取状态 {active, conv_a, conv_b}; 首次 {'active':'A','conv_a':'','conv_b':''}。
+
+        双 app 模式: active ∈ {'A','B'} 决定下条消息走哪个 Dify app;
+        conv_a/conv_b 各自独立续接 Dify 会话。单 app 模式只用 A+conv_a。
+        """
         ...
 
     @abstractmethod
-    async def save(self, user_id: str, scope: str, conversation_id: str) -> None:
-        """保存 Dify 返回的新 conversation_id, 供下一轮续接。"""
+    async def save_state(self, user_id: str, scope: str, state: Dict[str, str]) -> None:
+        """保存状态。"""
         ...
 
-
-class InMemoryConversationStore(ConversationStore):
-    """进程内映射 (默认, 单 worker)。"""
-
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._map: Dict[Tuple[str, str], str] = {}
-
+    # —— 向后兼容: 旧 get/save 只读写 active app 的 conv_id ——
     async def get(self, user_id: str, scope: str) -> Optional[str]:
-        async with self._lock:
-            return self._map.get(_key(user_id, scope))
+        st = await self.get_state(user_id, scope)
+        val = st.get("conv_a") if st.get("active", "A") == "A" else st.get("conv_b")
+        return val or None
 
     async def save(self, user_id: str, scope: str, conversation_id: str) -> None:
         if not conversation_id:
             return
+        st = await self.get_state(user_id, scope)
+        if st.get("active", "A") == "A":
+            st["conv_a"] = conversation_id
+        else:
+            st["conv_b"] = conversation_id
+        await self.save_state(user_id, scope, st)
+
+
+class InMemoryConversationStore(ConversationStore):
+    """进程内映射 (默认, 单 worker)。
+
+    与 RedisConversationStore 行为对齐: 带 ``conversation_ttl`` 滑动 TTL
+    (默认 1800s, 与 bugtrack 定时器对齐)。save_state 每条消息刷新过期时间;
+    30min 不活动 -> get_state 返回 default (新会话), 防 conv 永不过期致跨话题
+    串话/A↔B 弹跳 (修根因5 的 memory 模式补丁)。
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._states: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._expires: Dict[Tuple[str, str], float] = {}  # key -> 过期时间戳
+
+    @staticmethod
+    def _default() -> Dict[str, str]:
+        return {"active": "A", "conv_a": "", "conv_b": ""}
+
+    @staticmethod
+    def _ttl() -> float:
+        from app.core.config import settings
+
+        return float(getattr(settings.app, "conversation_ttl", 1800) or 1800)
+
+    async def get_state(self, user_id: str, scope: str) -> Dict[str, str]:
+        k = _key(user_id, scope)
         async with self._lock:
-            self._map[_key(user_id, scope)] = conversation_id
+            # 过期清理 (滑动 TTL): 30min 不活动 -> 视为新会话
+            if k in self._expires and self._expires[k] < time.time():
+                self._states.pop(k, None)
+                self._expires.pop(k, None)
+            st = self._states.get(k)
+            return dict(st) if st else self._default()
+
+    async def save_state(self, user_id: str, scope: str, state: Dict[str, str]) -> None:
+        k = _key(user_id, scope)
+        async with self._lock:
+            self._states[k] = dict(state)
+            self._expires[k] = time.time() + self._ttl()
 
 
 class RedisConversationStore(ConversationStore):
     """Redis 映射 (多 worker 抗重启)。
 
-    key: wecom:conv:{user_id}:{scope}, 不设 TTL (会话长期续接)。
-    需 ``settings.redis`` 已配置且 Redis 可达。
+    key: wecom:convstate:{user_id}:{scope}, 存 JSON {active,conv_a,conv_b}。
+    TTL=conversation_ttl(默认1800s, 与 bugtrack 定时器对齐; save_state 每条消息调一次
+    -> 滑动刷新, 活跃会话不过期, 30min 不活动才过期)。修根因5: 防 conv 永不过期致
+    跨话题串话/状态残留(A↔B 弹跳)。需 ``settings.redis`` 已配置且 Redis 可达。
     """
 
-    _KEY_PREFIX = "wecom:conv:"
+    _KEY_PREFIX = "wecom:convstate:"
 
     def __init__(self, redis_client) -> None:  # type: ignore[no-untyped-def]
         self._redis = redis_client
 
-    async def get(self, user_id: str, scope: str) -> Optional[str]:
-        import redis.asyncio as aioredis  # noqa: F401
+    @staticmethod
+    def _default() -> Dict[str, str]:
+        return {"active": "A", "conv_a": "", "conv_b": ""}
+
+    async def get_state(self, user_id: str, scope: str) -> Dict[str, str]:
+        import json
 
         val = await self._redis.get(f"{self._KEY_PREFIX}{user_id}:{scope}")
         if isinstance(val, bytes):
-            return val.decode("utf-8")
-        return val
+            val = val.decode("utf-8")
+        if not val:
+            return self._default()
+        try:
+            st = json.loads(val)
+            return {"active": st.get("active", "A"), "conv_a": st.get("conv_a", ""),
+                    "conv_b": st.get("conv_b", "")}
+        except Exception:
+            return self._default()
 
-    async def save(self, user_id: str, scope: str, conversation_id: str) -> None:
-        if not conversation_id:
-            return
+    async def save_state(self, user_id: str, scope: str, state: Dict[str, str]) -> None:
+        import json
+
+        from app.core.config import settings
+
+        ttl = int(getattr(settings.app, "conversation_ttl", 1800) or 1800)
         await self._redis.set(
-            f"{self._KEY_PREFIX}{user_id}:{scope}", conversation_id
+            f"{self._KEY_PREFIX}{user_id}:{scope}",
+            json.dumps(state, ensure_ascii=False),
+            ex=ttl,
         )
 
 

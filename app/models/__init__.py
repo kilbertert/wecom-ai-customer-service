@@ -1,9 +1,8 @@
 """数据模型包"""
 
 from .wechat import *
-from .coze import *
 
-# Session models removed in single-round mode
+# Coze models 已随 Coze 后端移除 (2026-07)
 
 __all__ = [
     # WeChat models
@@ -11,7 +10,4 @@ __all__ = [
     "WeChatCallback",
     "WeChatUser",
     "WeChatKF",
-    # Coze models
-    "CozeWorkflowInput",
-    "CozeWorkflowOutput",
 ]

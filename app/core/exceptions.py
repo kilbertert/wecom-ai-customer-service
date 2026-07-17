@@ -14,17 +14,13 @@ class WeChatAPIError(Exception):
 
 
 class AIBackendError(Exception):
-    """AI 后端 (Coze / Dify / ...) 通用异常。"""
+    """AI 后端 (Dify) 异常。"""
 
     def __init__(self, message: str, code: Optional[int] = None, details: Optional[Dict[str, Any]] = None):
         self.message = message
         self.code = code
         self.details = details or {}
         super().__init__(self.message)
-
-
-# 向后兼容:旧名称仍然可用,新代码请用 AIBackendError
-CozeAPIError = AIBackendError
 
 
 class SessionError(Exception):
@@ -58,19 +54,6 @@ def handle_wechat_error(error: WeChatAPIError) -> HTTPException:
         status_code=502,
         detail={
             "error": "wechat_api_error",
-            "message": error.message,
-            "code": error.code,
-            "details": error.details
-        }
-    )
-
-
-def handle_coze_error(error: CozeAPIError) -> HTTPException:
-    """处理Coze API异常"""
-    return HTTPException(
-        status_code=502,
-        detail={
-            "error": "coze_api_error",
             "message": error.message,
             "code": error.code,
             "details": error.details

@@ -4,7 +4,7 @@ from app.core.config import settings
 
 # 创建Celery应用
 celery_app = Celery(
-    "weixin_coze_service",
+    "wecom_service",
     broker=settings.celery.broker_url,
     backend=settings.celery.result_backend,
     include=["app.tasks"]

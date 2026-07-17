@@ -1,7 +1,7 @@
 """完整流程测试 (Phase 3 重写: 在 adapter/processor 边界 mock)。
 
 旧的 test_flow.py 引用了已删除的 ``DataStandardizationService`` 与不存在的
-``process_single_message(message, wechat, coze, std, media)`` 4 参签名。
+``process_single_message(message, wechat, ai, std, media)`` 4 参签名。
 Phase 3 把编排逻辑搬到 ``MessageProcessor``, 路由瘦身为分发器, 这里改为在
 adapter/processor 边界打桩。
 
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skip(
 from app.main import app  # noqa: E402
 from app.models.wechat import WeChatMessage, MessageType  # noqa: E402
 from app.services.wechat import WeChatService  # noqa: E402
-from app.services.coze import CozeService  # noqa: E402
+from app.services.dify import DifyService  # noqa: E402
 from app.services.media import MediaService  # noqa: E402
 
 
@@ -51,9 +51,9 @@ def test_service_initialization():
     assert hasattr(wechat_service, "sync_messages")
     assert hasattr(wechat_service, "send_message")
 
-    # Coze 服务
-    coze_service = CozeService()
-    assert hasattr(coze_service, "run_workflow")
+    # AI 服务 (Dify)
+    ai_service = DifyService()
+    assert hasattr(ai_service, "run_workflow")
 
     # 媒体服务
     media_service = MediaService(wechat_service)
@@ -66,11 +66,6 @@ def test_models_import():
 
     assert WeChatMessage
     assert MessageType.TEXT == "text"
-
-    from app.models.coze import StandardizedMessage, ActionType
-
-    assert StandardizedMessage
-    assert ActionType.REPLY == "reply"
 
 
 def test_routes_registration(client):

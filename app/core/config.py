@@ -44,28 +44,6 @@ class WeChatSettings(BaseSettings):
         extra = "ignore"
 
 
-class CozeSettings(BaseSettings):
-    """Coze相关配置"""
-
-    api_token: SecretStr = Field(
-        SecretStr("PLACEHOLDER_COZE_API_TOKEN"), description="Coze API Token"
-    )
-    bot_id: str = Field("7599886499640147968", description="Coze Bot ID")
-
-    # API 根地址 — 国内站 api.coze.cn / 海外站 api.coze.com
-    api_base_url: str = Field("https://api.coze.cn", description="Coze API base URL")
-
-    # 工作流配置
-    workflow_timeout: int = Field(30, description="工作流超时时间(秒)")
-    max_retries: int = Field(3, description="工作流重试次数")
-
-    class Config:
-        env_prefix = "COZE_"
-        env_file = ".env"  # 指定.env文件
-        env_file_encoding = "utf-8"
-        extra = "ignore"
-
-
 class RedisSettings(BaseSettings):
     """Redis配置"""
 
@@ -94,7 +72,7 @@ class RedisSettings(BaseSettings):
 class DatabaseSettings(BaseSettings):
     """数据库配置"""
 
-    url: str = Field("sqlite:///./weixin_coze.db", description="数据库URL")
+    url: str = Field("sqlite:///./wecom.db", description="数据库URL")
     pool_size: int = Field(10, description="连接池大小")
     max_overflow: int = Field(20, description="最大溢出连接数")
 
@@ -109,9 +87,9 @@ class CelerySettings(BaseSettings):
     result_backend: str = Field("redis://localhost:6379/2", description="结果后端URL")
 
     # 任务配置
-    task_default_queue: str = Field("weixin_coze", description="默认队列")
-    task_default_exchange: str = Field("weixin_coze", description="默认交换机")
-    task_default_routing_key: str = Field("weixin_coze", description="默认路由键")
+    task_default_queue: str = Field("wecom", description="默认队列")
+    task_default_exchange: str = Field("wecom", description="默认交换机")
+    task_default_routing_key: str = Field("wecom", description="默认路由键")
 
     # 任务执行配置
     worker_prefetch_multiplier: int = Field(1, description="工作进程预取倍数")
@@ -142,8 +120,12 @@ class BugtrackSettings(BaseSettings):
     main_doc_id: str = Field("", description="主表 doc_id (查询记录用)")
     main_sheet_id: str = Field("", description="主表 sheet_id (查询记录用)")
 
-    # 内部接口鉴权 token (Dify HTTP 节点调 /internal/bugtrack/* 时携带)
-    internal_token: str = Field("", description="内部接口 Bearer token")
+    # 内部接口鉴权 (来源 IP 白名单, 替代 Bearer token; token 已从 Dify 侧移除)
+    internal_token: str = Field("", description="内部接口 Bearer token (已弃用, 保留兼容)")
+    allowed_ips: str = Field(
+        "127.0.0.1,::1",
+        description="允许调用 /internal/bugtrack/* 的来源IP(逗号分隔);生产配 127.0.0.1,::1,<dify_server_ip>",
+    )
 
     # MCP 通道 (智能机器人文档能力, 查表/写表走此通道, 绕开 wedoc REST 48002)
     mcp_apikey: str = Field("", description="企微 MCP robot-doc apikey")
@@ -195,6 +177,14 @@ class DifySettings(BaseSettings):
     api_key: SecretStr = Field(
         SecretStr("PLACEHOLDER_DIFY_API_KEY"), description="Dify API Key (app-xxx)"
     )
+    # 双 app 拆分 (KB问答 + bug追踪): api_key_b 非空 → 双 app 路由模式;
+    # 为空 → 单 app 兼容 (只走 api_key/api_key_a, 忽略 SWITCH 标记)。
+    api_key_a: SecretStr = Field(
+        SecretStr(""), description="App A (KB问答) token; 空则回退 api_key"
+    )
+    api_key_b: SecretStr = Field(
+        SecretStr(""), description="App B (bug追踪) token; 空则单 app 模式"
+    )
 
     # Workflow 输入变量名 — 与 Dify 工作流"开始"节点保持一致
     input_text: str = Field("input_text", description="Workflow 文本输入变量名")
@@ -208,7 +198,7 @@ class DifySettings(BaseSettings):
 
     # 工作流配置
     workflow_timeout: int = Field(
-        120, description="工作流超时时间(秒) — Dify 较 Coze 慢,默认 120s"
+        120, description="工作流超时时间(秒) — Dify chatflow 较慢,默认 120s"
     )
     upload_timeout: int = Field(60, description="文件上传超时(秒)")
 
@@ -255,8 +245,8 @@ class AppSettings(BaseSettings):
     version: str = Field("1.1.0", description="应用版本")
     debug: bool = Field(False, description="调试模式")
 
-    # AI 后端选择: "coze" | "dify"
-    ai_backend: str = Field("coze", description="AI 后端: coze | dify")
+    # AI 后端 (Coze 已于 2026-07 移除; 仅保留 "dify", 字段留作向后兼容)
+    ai_backend: str = Field("dify", description="AI 后端: dify (coze 已移除)")
 
     # 服务器配置
     host: str = Field("0.0.0.0", description="服务器主机")
@@ -300,10 +290,71 @@ class AppSettings(BaseSettings):
         "memory",
         description='conversation_id 映射存储: "memory" | "redis"',
     )
+    # 会话状态 TTL(秒): 与 bugtrack 定时器(1800)对齐, 超时未活动 -> conv 过期 -> 下条消息起新会话。
+    # 修根因5: conv_id 永不过期致跨话题串话/状态残留(实测 YeBiWei 消息 A↔B 弹跳)。
+    # save_state 每条消息调一次, TTL 滑动刷新(活跃会话不过期, 30min 不活动才过期)。
+    conversation_ttl: int = Field(
+        1800,
+        description="会话状态TTL秒(滑动,每条消息刷新);与bugtrack定时器1800对齐",
+    )
+
+    # 持久消息队列 + 分布式锁 (Phase: #15+#17B 耦合对)。
+    # "memory" (默认): 路由层 BackgroundTasks/asyncio.create_task, 无持久化无锁 (单进程 dev)。
+    # "redis"  : 入站消息入 Redis list 持久队列, worker 循环消费, 每 (user,scope) 分布式锁
+    #            串行化 process() 防同用户并发竞态 (read->Dify->save)。进程重启不丢消息
+    #            (proc 列表 orphan sweep 重入队, 至少一次投递)。生产多进程部署用此模式。
+    message_queue: str = Field(
+        "memory",
+        description='消息队列+锁: "memory"(默认) | "redis"(持久队列+分布式锁)',
+    )
+    # 去重存储 (与 message_queue 解耦, 但 redis 队列模式下建议 redis 去重, 否则进程崩溃
+    # 重投递会因 InMemory 状态丢失导致 Dify 重复轮次)。
+    dedup_store: str = Field(
+        "memory",
+        description='去重存储: "memory"(默认) | "redis"(多进程/崩溃安全幂等)',
+    )
+    queue_workers: int = Field(
+        2,
+        description="Redis 队列 worker 协程数 (锁按 user 隔离, 多 worker 服务不同用户)",
+    )
+    queue_lock_ttl: int = Field(
+        600,
+        description="分布式锁 TTL 秒; 须 > 最坏 4 轮 Dify (MAX_ROUTES=3, ×chatflow_timeout120=480); "
+                    "太短->锁过期中段被他人抢占致状态竞态; 太长->崩溃后该用户消息恢复延迟",
+    )
+    queue_max_attempts: int = Field(
+        3,
+        description="process 真异常最大重试次数; 超出入死信 (CancelledError 不计数)",
+    )
 
     class Config:
         env_prefix = "APP_"
         env_file = ".env"  # 必需: 否则 APP_* 字段不会从 .env 读取
+        env_file_encoding = "utf-8"
+        extra = "ignore"
+
+
+class ASRSettings(BaseSettings):
+    """语音识别 (ASR) 配置 - wecom 侧 paraformer 转写语音为文本入 query。
+
+    Dify chatflow 无 ASR 节点且 speech_to_text feature 只管前端 UI,
+    语音必须在 wecom 侧转文本后作为 query 发送 (见 multimodal-vision-findings 记忆)。
+    """
+
+    enabled: bool = Field(True, description="是否启用 wecom 侧 ASR (语音转文本)")
+    dashscope_api_key: SecretStr = Field(
+        SecretStr(""), description="通义 DashScope API key (paraformer ASR)"
+    )
+    model: str = Field(
+        "paraformer-realtime-v2",
+        description="ASR 模型 (paraformer-realtime-v2 支持本地 wav 流式识别)",
+    )
+    sample_rate: int = Field(16000, description="音频采样率 (wecom AMR->WAV 转 16kHz)")
+    timeout: int = Field(30, description="ASR 单次转写超时秒")
+
+    class Config:
+        env_prefix = "ASR_"
+        env_file = ".env"
         env_file_encoding = "utf-8"
         extra = "ignore"
 
@@ -313,7 +364,6 @@ class Settings(BaseSettings):
 
     # 子配置
     wechat: WeChatSettings = WeChatSettings()
-    coze: CozeSettings = CozeSettings()
     dify: DifySettings = DifySettings()
     chatwoot: ChatwootSettings = ChatwootSettings()
     bugtrack: BugtrackSettings = BugtrackSettings()
@@ -321,6 +371,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = DatabaseSettings()
     celery: CelerySettings = CelerySettings()
     app: AppSettings = AppSettings()
+    asr: ASRSettings = ASRSettings()
 
     class Config:
         env_file = ".env"
@@ -343,9 +394,35 @@ def load_settings():
         if (
             settings.wechat.corp_id.startswith("PLACEHOLDER")
             or str(settings.wechat.corp_secret).startswith("PLACEHOLDER")
-            or str(settings.coze.api_token).startswith("PLACEHOLDER")
         ):
             logger.warning("检测到占位符配置值，请确保已正确配置生产环境变量")
+
+        # 配置对齐约束 (Path C 防护): APP_CONVERSATION_TTL 必须与
+        # BUGTRACK_TIMEOUT_SECONDS 一等。conv TTL > bug timeout -> 超时后 conv 仍在,
+        # 用户晚归命中 stale conv_b (await_confirm_* 残留); conv TTL < bug timeout ->
+        # 超时前 conv 提前过期。两者都破坏"超时后新会话 cv=IDLE"不变量。不等则告警
+        # (若需更强保证, 可在此处 settings.app.conversation_ttl = min(...) 强制取小)。
+        conv_ttl = getattr(settings.app, "conversation_ttl", 1800)
+        bug_timeout = getattr(settings.bugtrack, "timeout_seconds", 1800)
+        if conv_ttl != bug_timeout:
+            logger.warning(
+                "[CONFIG] APP_CONVERSATION_TTL(%s) != BUGTRACK_TIMEOUT_SECONDS(%s) "
+                "-> 超时路径 cv_flow_state 一致性可能破裂 (Path C 复现风险), 请对齐",
+                conv_ttl, bug_timeout,
+            )
+
+        # 队列/去重对齐约束 (#15+#17B): redis 持久队列下, 进程崩溃重投递靠 DedupStore
+        # 幂等去重。若 dedup 仍为 memory, 崩溃后 InMemory 状态丢失 -> 重投递的 msgid
+        # 重新 acquire 成功 -> Dify chatflow 重复一轮 (污染上下文)。仅告警, 不强制。
+        mq = (getattr(settings.app, "message_queue", "memory") or "memory").lower()
+        dd = (getattr(settings.app, "dedup_store", "memory") or "memory").lower()
+        if mq == "redis" and dd != "redis":
+            logger.warning(
+                "[CONFIG] APP_MESSAGE_QUEUE=redis 但 APP_DEDUP_STORE=%s -> 崩溃重投递"
+                " 可能产生 Dify 重复轮次 (InMemory 去重不跨进程/不抗重启), 建议设 "
+                "APP_DEDUP_STORE=redis",
+                dd,
+            )
 
         return
     except Exception as e:

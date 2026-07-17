@@ -261,17 +261,20 @@ class KfAdapter(ProtocolAdapter):
         text = ""
         media_ref = ""
         media_kind = ""
+        media_type = ""  # "image" | "voice" | ""
 
         if mt_val == "text":
             td = getattr(message, "text", None)
             if isinstance(td, dict):
                 text = td.get("content", "") or ""
         elif mt_val == "image":
+            media_type = "image"
             img = getattr(message, "image", None) or {}
             if isinstance(img, dict):
                 media_ref = img.get("media_id", "") or ""
                 media_kind = "media_id" if media_ref else ""
         elif mt_val == "voice":
+            media_type = "voice"
             v = getattr(message, "voice", None) or {}
             if isinstance(v, dict):
                 media_ref = v.get("media_id", "") or ""
@@ -284,6 +287,7 @@ class KfAdapter(ProtocolAdapter):
             text=text,
             media_ref=media_ref,
             media_kind=media_kind,
+            media_type=media_type,
             user_id=getattr(message, "external_userid", "") or "wechat_user",
             open_kfid=getattr(message, "open_kfid", "") or "",
             response_url="",

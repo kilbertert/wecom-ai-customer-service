@@ -16,10 +16,8 @@ from app.routes import (
 )
 from app.core.exceptions import (
     WeChatAPIError,
-    CozeAPIError,
     SessionError,
     handle_wechat_error,
-    handle_coze_error,
     handle_session_error
 )
 from app.protocols.base import InMemoryDedupStore
@@ -42,16 +40,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """应用生命周期管理"""
-    backend = (settings.app.ai_backend or "coze").lower()
+    backend = (settings.app.ai_backend or "dify").lower()
     logger.info("Starting WeChat AI Service (Single-round mode, backend=%s)", backend)
 
     # 初始化全局服务 (单轮对话模式，无会话管理)
     app.state.wechat_service = WeChatService()
-    app.state.ai_service = get_ai_service()  # CozeService or DifyService
+    app.state.ai_service = get_ai_service()  # DifyService
     app.state.media_service = MediaService(app.state.wechat_service)
 
     # 协议适配器 + 编排器 (Phase 3)
-    # 共享去重存储 + 薄 conversation_id 映射 (默认 InMemory, 单 worker)
+    # 共享去重存储 (默认 InMemory 单进程; APP_DEDUP_STORE=redis 多进程/崩溃安全)
+    # + 薄 conversation_id 映射 (默认 InMemory, 单 worker)
     app.state.dedup_store = InMemoryDedupStore()
     app.state.conversation_store = create_conversation_store()
     # 二阶段: 待办定时器元数据存储 (非会话历史, 类比 ConversationStore)
@@ -79,14 +78,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await app.state.wechat_service.close()
         await app.state.ai_service.close()
     except Exception as e:
-        logger.error("Error during shutdown", error=str(e))
+        logger.error("Error during shutdown: %s", e, exc_info=True)
 
 
 # 创建FastAPI应用
 app = FastAPI(
     title=settings.app.app_name,
     version=settings.app.version,
-    description="微信客服接入AI智能体 (Coze / Dify 可切换)",
+    description="微信客服接入 AI 智能体 (Dify)",
     lifespan=lifespan,
     debug=settings.app.debug,
 )
@@ -110,11 +109,6 @@ app.add_middleware(
 @app.exception_handler(WeChatAPIError)
 async def wechat_api_exception_handler(request: Request, exc: WeChatAPIError):
     return handle_wechat_error(exc)
-
-
-@app.exception_handler(CozeAPIError)
-async def coze_api_exception_handler(request: Request, exc: CozeAPIError):
-    return handle_coze_error(exc)
 
 
 @app.exception_handler(SessionError)
@@ -147,13 +141,13 @@ async def service_info():
     return {
         "service": settings.app.app_name,
         "version": settings.app.version,
-        "description": "微信客服/智能机器人接入 AI 智能体 (Coze / Dify 可切换)",
-        "ai_backend": (settings.app.ai_backend or "coze").lower(),
+        "description": "微信客服/智能机器人接入 AI 智能体 (Dify)",
+        "ai_backend": (settings.app.ai_backend or "dify").lower(),
         "features": [
             "微信回调处理 (客服 KF + 智能机器人)",
             "媒体文件处理 (图片/语音)",
             "多模态回复 (markdown)",
-            "Coze / Dify 双后端可切换",
+            "Dify chatflow 多轮 (双 app 路由)",
             "Chatwoot 双向集成",
             "监控和健康检查"
         ],

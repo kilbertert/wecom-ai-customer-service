@@ -41,6 +41,26 @@ _TIMER_MARKER_RE = re.compile(
     r"<!--SYS:TIMER\|([^>]*?)-->", re.DOTALL
 )
 
+# 匹配双 app 路由握手标记 (A↔B 切换)。SWITCH_TO_BUG / SWITCH_TO_KB_REENTRY / SWITCH_TO_KB_DONE
+_SWITCH_MARKER_RE = re.compile(r"<!--SYS:(SWITCH_TO_[A-Z_]+)-->")
+
+# 双 app 路由标记名
+SWITCH_TO_BUG = "SWITCH_TO_BUG"                # A→B: A 检测 bug 意图, wecom 改投 B (同条消息)
+SWITCH_TO_KB_REENTRY = "SWITCH_TO_KB_REENTRY"  # B→A: B IRRELEVANT/修改窗NEW, wecom 改投 A (同条消息)
+SWITCH_TO_KB_DONE = "SWITCH_TO_KB_DONE"        # B→A: B 结束(放弃/无差异), 发 B 话术, 下条→A
+
+
+def parse_switch_markers(text: str) -> Tuple[str, set]:
+    """剥离并返回 SWITCH 路由标记。返回 (剥离后文本, {标记名集合})。
+
+    标记名 ∈ {SWITCH_TO_BUG, SWITCH_TO_KB_REENTRY, SWITCH_TO_KB_DONE}。
+    """
+    if not text:
+        return text or "", set()
+    found = set(m.group(1) for m in _SWITCH_MARKER_RE.finditer(text))
+    stripped = _SWITCH_MARKER_RE.sub("", text)
+    return stripped, found
+
 
 def parse_timer_markers(text: str) -> Tuple[str, list]:
     """从文本中提取所有 TIMER 标记, 返回 (剥离后的文本, [marker_dict, ...])。
@@ -187,6 +207,10 @@ async def _arm_timer(
 
 __all__ = [
     "parse_timer_markers",
+    "parse_switch_markers",
+    "SWITCH_TO_BUG",
+    "SWITCH_TO_KB_REENTRY",
+    "SWITCH_TO_KB_DONE",
     "cancel_pending_timer",
     "apply_markers",
 ]

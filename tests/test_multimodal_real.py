@@ -20,7 +20,7 @@ from app.services.multimodal import (
 
 
 def _real_workflow_payload():
-    """复刻用户提供的真实工作流输出结构 (Coze stream_run SSE message content 解析后形态)。"""
+    """复刻用户提供的真实工作流输出结构 (Dify outputs 解析后形态)。"""
     inner_output_str = json.dumps({
         "text": "您好，充电桩PC管理后端的角色管理操作步骤如下：\n1. ...",
         "media": [

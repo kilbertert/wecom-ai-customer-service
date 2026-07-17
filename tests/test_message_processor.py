@@ -141,7 +141,8 @@ async def test_empty_text_skips_workflow():
 # ---------------------------------------------------------------------------
 
 
-async def test_image_flow_downloads_and_uploads():
+async def test_image_flow_downloads_and_defers_upload():
+    """KF 图片: download_media -> file_image_bytes (上传延后到 _run_chatflow 按目标 app, 不在此 upload_file)"""
     proc, ai, wechat, media, conv = _make_processor()
     dedup = InMemoryDedupStore()
     adapter = _FakeAdapter(dedup)
@@ -150,12 +151,11 @@ async def test_image_flow_downloads_and_uploads():
     await proc.process(inbound, adapter)
 
     wechat.download_media.assert_awaited_once_with("img_mid")
-    ai.upload_file.assert_awaited_once()
-    args = ai.upload_file.await_args.args
-    assert args[0] == b"\x89PNG bytes"
-    assert "wechat_image_img_mid.jpg" == args[1]
+    # 不在此 upload_file (延后到 _run_chatflow 按目标 app 上传, Dify 文件库按 app 隔离)
+    ai.upload_file.assert_not_awaited()
     sent_input = ai.run_workflow.await_args.args[0]
-    assert sent_input["file_image_id"] == "dify_file_id_x"
+    assert sent_input["file_image_bytes"] == b"\x89PNG bytes"
+    assert sent_input["file_image_name"] == "wechat_image_img_mid.jpg"
 
 
 async def test_image_download_failure_skips_send():
@@ -177,43 +177,33 @@ async def test_image_download_failure_skips_send():
 # ---------------------------------------------------------------------------
 
 
-async def test_voice_flow_converted_wav():
+async def test_voice_flow_uses_asr_transcript():
+    """KF 语音: 下载+AMR->WAV 转码 -> ASR -> text=transcript (Dify 无 ASR 节点, wecom 侧转文本)"""
     proc, ai, wechat, media, conv = _make_processor()
     media.download_and_process_media = AsyncMock(
         return_value={"error": None, "converted": True, "wav_path": "/tmp/v.wav"}
     )
-    # patch aiofiles.open 读取 wav
     dedup = InMemoryDedupStore()
     adapter = _FakeAdapter(dedup)
 
+    # mock asr 模块 (避免依赖 dashscope 安装); message_processor 函数内 from app.services.asr import transcribe
     import sys
-    fake_aiofiles = MagicMock()
-
-    class _FC:
-        async def __aenter__(self):
-            self.f = MagicMock()
-            self.f.read = AsyncMock(return_value=b"WAVBYTES")
-            return self.f
-
-        async def __aexit__(self, *a):
-            return False
-
-    fake_aiofiles.open = lambda *a, **k: _FC()
-    with patch.dict(sys.modules, {"aiofiles": fake_aiofiles}):
+    asr_mod = MagicMock()
+    asr_mod.transcribe = AsyncMock(return_value="你好呀")
+    with patch.dict(sys.modules, {"app.services.asr": asr_mod}):
         await proc.process(
             _inbound(msg_type="voice", text="", media_ref="v_mid", media_kind="media_id"),
             adapter,
         )
 
+    # 语音走 ASR, 不上传音频文件
+    ai.upload_file.assert_not_awaited()
     sent_input = ai.run_workflow.await_args.args[0]
-    assert sent_input["file_voice_id"] == "dify_file_id_x"
-    # 上传的是 wav 字节 + wav 文件名
-    args = ai.upload_file.await_args.args
-    assert args[0] == b"WAVBYTES"
-    assert args[1].endswith(".wav")
+    assert sent_input["text"] == "你好呀"
 
 
-async def test_voice_transcode_failure_falls_back_to_amr():
+async def test_voice_transcode_failure_uses_failure_text():
+    """KF 语音转码失败 -> text=[用户发了一段语音,识别失败] (不上传, 不 ASR)"""
     proc, ai, wechat, media, conv = _make_processor()
     media.download_and_process_media = AsyncMock(return_value={"error": "no ffmpeg"})
     dedup = InMemoryDedupStore()
@@ -223,9 +213,9 @@ async def test_voice_transcode_failure_falls_back_to_amr():
         _inbound(msg_type="voice", text="", media_ref="v_mid", media_kind="media_id"),
         adapter,
     )
-    args = ai.upload_file.await_args.args
-    assert args[0] == b"\x89PNG bytes"  # voice_content (原始)
-    assert args[1].endswith(".amr")
+    ai.upload_file.assert_not_awaited()
+    sent_input = ai.run_workflow.await_args.args[0]
+    assert sent_input["text"] == "[用户发了一段语音,识别失败]"
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +247,17 @@ async def test_chatwoot_notify_called_after_send_for_kf():
     ):
         await proc.process(_inbound(text="hi"), adapter)
 
-    sync_mock.notify_incoming.assert_awaited_once()
-    payload = sync_mock.notify_incoming.await_args.kwargs
-    assert payload["open_kfid"] == "kf_1"
-    assert payload["external_userid"] == "ext_u"
-    assert payload["message_data"]["origin"] == 2
+    # #16: 入站(origin=1)在 handoff 前同步, 出站(origin=2)在 send 后同步
+    assert sync_mock.notify_incoming.await_count == 2
+    calls = sync_mock.notify_incoming.await_args_list
+    origins = {c.kwargs["message_data"]["origin"] for c in calls}
+    assert origins == {1, 2}
+    outbound = next(
+        c.kwargs for c in calls
+        if c.kwargs["message_data"]["origin"] == 2
+    )
+    assert outbound["open_kfid"] == "kf_1"
+    assert outbound["external_userid"] == "ext_u"
 
 
 async def test_send_failure_skips_chatwoot():
@@ -279,8 +275,10 @@ async def test_send_failure_skips_chatwoot():
         cw_cls.return_value = sync_mock
         await proc.process(_inbound(text="hi"), adapter)
 
-    # send 失败 → 不应通知 chatwoot
-    sync_mock.notify_incoming.assert_not_awaited()
+    # #16: send 失败 -> 出站(origin=2)不同步; 但入站(origin=1)已在 send 前同步
+    assert sync_mock.notify_incoming.await_count == 1
+    inbound = sync_mock.notify_incoming.await_args.kwargs
+    assert inbound["message_data"]["origin"] == 1
 
 
 async def test_empty_workflow_result_uses_kf_fallback():
@@ -355,26 +353,34 @@ async def test_bot_empty_text_mixed_sends_canned_reply():
     assert "空消息" in adapter.sent[0][1].text
 
 
-async def test_bot_image_url_uses_remote_url_no_download():
+async def test_bot_image_url_downloads_and_defers_upload():
+    """bot image url: httpx 下载(+AES解密+PIL) -> file_image_bytes (不喂 remote_url: Dify 取不到企微 COS)"""
     proc, ai, wechat, media, conv = _make_processor()
     dedup = InMemoryDedupStore()
     adapter = _FakeAdapter(dedup)
     inbound = _bot_inbound(
         msg_type="image", text="",
-        media_ref="https://cdn/x.jpg", media_kind="url",
+        media_ref="https://cdn/x.jpg", media_kind="url", media_type="image",
     )
-    await proc.process(inbound, adapter)
-    wechat.download_media.assert_not_awaited()  # url 模式不下载
+    # mock httpx 下载 (AES/PIL 对 fake 字节失败则保留原始下载字节, 不影响 file_image_bytes 落地)
+    fake_resp = MagicMock()
+    fake_resp.content = b"\x89PNG fake_bytes"
+    fake_resp.raise_for_status = MagicMock()
+    fake_ac = MagicMock()
+    fake_ac.__aenter__ = AsyncMock(return_value=fake_ac)
+    fake_ac.__aexit__ = AsyncMock(return_value=False)
+    fake_ac.get = AsyncMock(return_value=fake_resp)
+    with patch("httpx.AsyncClient", return_value=fake_ac):
+        await proc.process(inbound, adapter)
+    wechat.download_media.assert_not_awaited()  # url 走 httpx, 不走 download_media
     sent_input = ai.run_workflow.await_args.args[0]
-    assert sent_input["file_image_url"] == "https://cdn/x.jpg"
-    assert "file_image_id" not in sent_input
-    # bot image 无文本时给 hint
-    assert sent_input["text"] == "[用户发了一张图片]"
+    assert "file_image_bytes" in sent_input  # 下载后转 bytes
+    assert sent_input["text"] == "[image]"
 
 
-async def test_bot_image_media_id_downloads_and_uploads_via_client():
+async def test_bot_image_media_id_downloads_and_defers_upload():
+    """bot image media_id: download_media -> file_image_bytes (上传延后到 _run_chatflow)"""
     proc, ai, wechat, media, conv = _make_processor()
-    # bot 用 ai.client.upload_file (不是 ai.upload_file)
     client = MagicMock()
     client.upload_file = AsyncMock(return_value="dify-img-uuid")
     ai.client = client
@@ -382,16 +388,15 @@ async def test_bot_image_media_id_downloads_and_uploads_via_client():
     adapter = _FakeAdapter(dedup)
     inbound = _bot_inbound(
         msg_type="image", text="",
-        media_ref="img_mid_1", media_kind="media_id",
+        media_ref="img_mid_1", media_kind="media_id", media_type="image",
     )
     await proc.process(inbound, adapter)
     wechat.download_media.assert_awaited_once_with("img_mid_1")
-    client.upload_file.assert_awaited_once()
+    client.upload_file.assert_not_awaited()  # 延后到 _run_chatflow 按目标 app 上传
     sent_input = ai.run_workflow.await_args.args[0]
-    assert sent_input["file_image_id"] == "dify-img-uuid"
-    # 文件名带 wechat_image_ 前缀
-    fname = client.upload_file.await_args.kwargs["filename"]
-    assert fname.startswith("wechat_image_") and fname.endswith(".jpg")
+    assert sent_input["file_image_bytes"] == b"\x89PNG bytes"
+    assert sent_input["file_image_name"].startswith("wechat_image_")
+    assert sent_input["file_image_name"].endswith(".png")
 
 
 async def test_bot_empty_ai_reply_uses_fallback():
@@ -563,7 +568,7 @@ async def test_crash_during_processing_keeps_retryable():
     异常模拟 _prepare_input 之外的崩溃, 验证 except → release_processing 路径。
     """
     proc, ai, wechat, media, conv = _make_processor()
-    conv.get = AsyncMock(side_effect=RuntimeError("conv store down"))
+    conv.get_state = AsyncMock(side_effect=RuntimeError("conv store down"))
     dedup = InMemoryDedupStore()
     adapter = _FakeAdapter(dedup)
 

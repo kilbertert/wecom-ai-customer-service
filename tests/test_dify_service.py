@@ -116,49 +116,6 @@ async def test_run_workflow_text_only(service):
     assert "raw" in result
 
 
-async def test_run_workflow_text_plus_image(service):
-    svc, client = service
-    await svc.upload_file(b"img-bytes", "x.jpg")
-    await svc.run_workflow(
-        {"text": "看图", "file_image_id": "dify-file-uuid-xxx"},
-        user_id="wx-user-1",
-    )
-    sent_inputs = client.run_workflow.await_args.kwargs["inputs"]
-    assert sent_inputs["input_text"] == "看图"
-    assert sent_inputs["input_img_id"] == [
-        {
-            "type": "image",
-            "transfer_method": "local_file",
-            "upload_file_id": "dify-file-uuid-xxx",
-        }
-    ]
-
-
-async def test_run_workflow_text_plus_voice(service):
-    svc, client = service
-    await svc.run_workflow(
-        {"text": "听声音", "file_voice_id": "voice-uuid"},
-        user_id="wx-user-1",
-    )
-    sent_inputs = client.run_workflow.await_args.kwargs["inputs"]
-    assert sent_inputs["input_text"] == "听声音"
-    assert sent_inputs["input_audio_id"] == [
-        {
-            "type": "audio",
-            "transfer_method": "local_file",
-            "upload_file_id": "voice-uuid",
-        }
-    ]
-
-
-async def test_run_workflow_image_only_no_text(service):
-    svc, client = service
-    await svc.run_workflow({"file_image_id": "img-uuid"}, user_id="u")
-    sent_inputs = client.run_workflow.await_args.kwargs["inputs"]
-    assert "input_text" not in sent_inputs
-    assert sent_inputs["input_img_id"][0]["upload_file_id"] == "img-uuid"
-
-
 async def test_run_workflow_empty_input_uses_default_text(service):
     svc, client = service
     await svc.run_workflow({}, user_id="u")
@@ -328,53 +285,6 @@ async def test_chatflow_mode_passes_query_field(chatflow_service):
     assert call_kwargs["query"] == "充电桩有问题"
     # 不应再用 input_text 之类的 workflow 变量名
     assert "inputs" not in call_kwargs or not call_kwargs["inputs"]
-
-
-async def test_chatflow_mode_files_array_image_url(chatflow_service):
-    """file_image_url 走 files 数组, transfer_method=remote_url。"""
-    svc, client = chatflow_service
-    await svc.run_workflow(
-        {"text": "看图", "file_image_url": "https://x.com/a.jpg"},
-        user_id="wx-user-1",
-    )
-    call_kwargs = client.run_chatflow.await_args.kwargs
-    assert call_kwargs["files"] == [
-        {"type": "image", "transfer_method": "remote_url", "url": "https://x.com/a.jpg"}
-    ]
-
-
-async def test_chatflow_mode_files_array_image_id(chatflow_service):
-    """file_image_id 走 files 数组, transfer_method=local_file。"""
-    svc, client = chatflow_service
-    await svc.run_workflow(
-        {"text": "看图", "file_image_id": "dify-uuid-yyy"},
-        user_id="wx-user-1",
-    )
-    call_kwargs = client.run_chatflow.await_args.kwargs
-    assert call_kwargs["files"] == [
-        {
-            "type": "image",
-            "transfer_method": "local_file",
-            "upload_file_id": "dify-uuid-yyy",
-        }
-    ]
-
-
-async def test_chatflow_mode_files_array_voice_id(chatflow_service):
-    """file_voice_id 走 files 数组, type=audio。"""
-    svc, client = chatflow_service
-    await svc.run_workflow(
-        {"text": "听声音", "file_voice_id": "voice-uuid"},
-        user_id="wx-user-1",
-    )
-    call_kwargs = client.run_chatflow.await_args.kwargs
-    assert call_kwargs["files"] == [
-        {
-            "type": "audio",
-            "transfer_method": "local_file",
-            "upload_file_id": "voice-uuid",
-        }
-    ]
 
 
 async def test_chatflow_mode_extracts_answer_as_content(chatflow_service):
@@ -566,15 +476,33 @@ def test_factory_returns_dify_when_backend_is_dify(mock_dify_client_cls):
         settings.app.ai_backend = original
 
 
-def test_factory_rejects_unknown_backend():
+def test_factory_unknown_backend_falls_back_to_dify():
     from app.core.config import settings
+    from app.services import get_ai_service, DifyService
 
     original = settings.app.ai_backend
     settings.app.ai_backend = "bogus"
     try:
-        from app.services import get_ai_service
-
-        with pytest.raises(ValueError):
-            get_ai_service()
+        svc = get_ai_service()
+        assert isinstance(svc, DifyService)
     finally:
         settings.app.ai_backend = original
+
+
+async def test_chatflow_mode_files_array_image_bytes(chatflow_service):
+    """file_image_bytes -> client.upload_file -> files 数组 (local_file)。
+
+    重构后图片统一走 bytes (上传延后到发送点按目标 app, Dify 文件库按 app 隔离,
+    改投 A->B 时文件归属自动正确)。替代旧 file_image_id/file_image_url 契约测试。
+    """
+    svc, client = chatflow_service
+    await svc.run_workflow(
+        {"text": "看图", "file_image_bytes": b"\x89PNG fake", "file_image_name": "x.png"},
+        user_id="wx-user-1",
+    )
+    client.upload_file.assert_awaited_once()
+    call_kwargs = client.run_chatflow.await_args.kwargs
+    assert call_kwargs["files"] == [
+        {"type": "image", "transfer_method": "local_file",
+         "upload_file_id": "dify-file-uuid-xxx"}
+    ]

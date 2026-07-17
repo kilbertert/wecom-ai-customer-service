@@ -231,8 +231,103 @@ def update_record(record_id: str, fields: Dict[str, Any]) -> None:
 
 
 # ======================================================================
+# 附件上传 (附件字段 type=17 用)
+# ======================================================================
+
+def upload_attachment(
+    content: bytes,
+    filename: str,
+    content_type: str = "image/jpeg",
+) -> str:
+    """上传附件到飞书 (多维表格图片), 返回 ``file_token``。
+
+    附件字段 (type=17) 的值格式为 ``[{"file_token": "..."}]``, 需先调用本接口
+    拿到 file_token 再写记录。
+
+    端点: ``POST /drive/v1/medias/upload_all`` (multipart/form-data)
+    - ``parent_type`` = ``bitable_image``
+    - ``parent_node`` = 多维表格 ``app_token``
+    - ``size`` = 文件字节数 (字符串)
+
+    Args:
+        content:      文件二进制内容
+        filename:     文件名 (含扩展名, 推断类型)
+        content_type: MIME (默认 image/jpeg)
+
+    Returns:
+        file_token (写入附件字段用)
+
+    Raises:
+        FeishuBitableError: 上传失败或未返回 file_token
+
+    Note:
+        需应用开通 ``drive:drive:write`` (或旧版 ``drive:file:upload``) 权限。
+        multipart 上传不能带 ``Content-Type: application/json`` (httpx 自动设
+        boundary), 故此处仅带 Authorization。
+    """
+    app_token = _app_token()
+    url = f"{_BASE}/drive/v1/medias/upload_all"
+    files = {
+        "file_name": (None, filename),
+        "parent_type": (None, "bitable_image"),
+        "parent_node": (None, app_token),
+        "size": (None, str(len(content))),
+        "file": (filename, content, content_type or "image/jpeg"),
+    }
+    with httpx.Client(timeout=_TIMEOUT) as c:
+        r = c.post(
+            url,
+            headers={"Authorization": f"Bearer {_get_token()}"},
+            files=files,
+        )
+        r.raise_for_status()
+        data = r.json()
+    _check(data, "上传附件")
+    file_token = (data.get("data") or {}).get("file_token") or ""
+    if not file_token:
+        raise FeishuBitableError(f"上传附件未返回 file_token: {str(data)[:200]}")
+    logger.info(
+        "[feishu] 上传附件成功 file_token=%s size=%dB", file_token, len(content)
+    )
+    return file_token
+
+
+# ======================================================================
 # 建表 / 建字段 (初始化用, 一次性)
 # ======================================================================
+
+def create_field(
+    field_name: str,
+    field_type: int,
+    property: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """在当前配置的数据表新增字段, 返回新建字段信息。
+
+    一次性初始化用 (如新增 "Bug截图" 附件字段 type=17)。
+
+    Args:
+        field_name: 字段名 (中文标题)
+        field_type: 飞书字段类型 (1=文本, 3=单选, 5=日期, 17=附件, ...)
+        property:   字段属性 (单选传 {"options":[{"name":...}]})
+
+    Returns:
+        新建字段 dict (含 field_id)
+    """
+    body: Dict[str, Any] = {"field_name": field_name, "type": field_type}
+    if property:
+        body["property"] = property
+    with httpx.Client(timeout=_TIMEOUT) as c:
+        r = c.post(
+            f"{_BASE}/bitable/v1/apps/{_app_token()}/tables/{_table_id()}/fields",
+            headers=_headers(),
+            json=body,
+        )
+        r.raise_for_status()
+        data = r.json()
+    _check(data, "建字段")
+    field = (data.get("data") or {}).get("field") or {}
+    logger.info("[feishu] 建字段 %s type=%d field_id=%s", field_name, field_type, field.get("field_id"))
+    return field
 
 def create_app(name: str = "二阶段bug反馈表") -> Dict[str, Any]:
     """创建多维表格 (应用成所有者, 免协作者授权)。返回 {app_token, url}。
@@ -318,13 +413,20 @@ def cell_to_str(value: Any) -> str:
 
 
 def record_to_summary(record: Dict[str, Any]) -> Dict[str, str]:
-    """记录归一成 {record_id, module, op_desc, summary} 便于 Dify 消费。"""
+    """记录归一成 {record_id, module, op_desc, summary, dev_status, reply, result} 便于 Dify 消费。
+
+    dev_status(问题状态)/reply(产品回复)/result(完成结果) 是"进度"字段,
+    供 Dify D4 命中汇报告知客户当前处理进度(根因3: 不再只塞 raw op_desc)。
+    """
     fields = record.get("fields") or {}
     return {
         "record_id": record.get("record_id") or record.get("id") or "",
         "module": cell_to_str(fields.get("模块/功能点")),
         "op_desc": cell_to_str(fields.get("操作描述")),
         "summary": cell_to_str(fields.get("产品备注")),
+        "dev_status": cell_to_str(fields.get("问题状态")),
+        "reply": cell_to_str(fields.get("产品回复")),
+        "result": cell_to_str(fields.get("完成结果")),
     }
 
 
@@ -334,8 +436,10 @@ __all__ = [
     "get_record",
     "add_record",
     "update_record",
+    "upload_attachment",
     "create_app",
     "create_table",
+    "create_field",
     "list_fields",
     "cell_to_str",
     "record_to_summary",

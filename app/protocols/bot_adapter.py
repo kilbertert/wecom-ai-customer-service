@@ -278,17 +278,24 @@ class BotAdapter(ProtocolAdapter):
 
         media_ref = ""
         media_kind = ""  # "url" | "media_id"
+        media_type = ""  # "image" | "voice" | "" (实际媒体类型, mixed 时由首个媒体决定)
+        img_aeskey = ""  # 企微AI机器人图片AES解密密钥
         # effective_media_type: image/voice/"" (mixed 时由子项决定)
         if msg_type == "image":
+            media_type = "image"
             image_obj = msg.get("image") or {}
             if isinstance(image_obj, dict):
                 url_val = (image_obj.get("url") or "").strip()
-                mid_val = (image_obj.get("media_id") or "").strip()
                 if url_val:
                     media_ref, media_kind = url_val, "url"
-                elif mid_val:
-                    media_ref, media_kind = mid_val, "media_id"
+                    img_aeskey = (image_obj.get("aeskey") or "").strip()
+                else:
+                    # media_id 回退 (无 url 的图片, 走 /media/get 下载)
+                    mid_val = (image_obj.get("media_id") or "").strip()
+                    if mid_val:
+                        media_ref, media_kind = mid_val, "media_id"
         elif msg_type == "voice":
+            media_type = "voice"
             voice_obj = msg.get("voice") or {}
             if isinstance(voice_obj, dict):
                 mid_val = (voice_obj.get("media_id") or "").strip()
@@ -310,15 +317,15 @@ class BotAdapter(ProtocolAdapter):
                             content = (t.get("content") or "").strip()
                     elif itype in ("image", "voice") and not media_ref:
                         if itype == "image":
+                            media_type = "image"
                             img = item.get("image") or {}
                             if isinstance(img, dict):
                                 url_val = (img.get("url") or "").strip()
-                                mid_val = (img.get("media_id") or "").strip()
                                 if url_val:
                                     media_ref, media_kind = url_val, "url"
-                                elif mid_val:
-                                    media_ref, media_kind = mid_val, "media_id"
+                                    img_aeskey = (img.get("aeskey") or "").strip()
                         else:  # voice
+                            media_type = "voice"
                             v = item.get("voice") or {}
                             if isinstance(v, dict):
                                 mid_val = (v.get("media_id") or "").strip()
@@ -333,6 +340,8 @@ class BotAdapter(ProtocolAdapter):
             text=content,
             media_ref=media_ref,
             media_kind=media_kind,
+            media_type=media_type,
+            aeskey=img_aeskey,
             user_id=from_user,
             open_kfid="",
             response_url=response_url,

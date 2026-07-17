@@ -3,6 +3,7 @@
 快速测试回调URL是否可访问
 """
 
+import os
 import requests
 import sys
 
@@ -60,8 +61,8 @@ def test_with_signature(url):
     import hashlib
     import time
     
-    # 使用env.example中的Token
-    token = "OCmjYUSjJhpsKUDpneDdWhoI"
+    # 从环境变量读 Token (不再硬编码; .env 提供 WECHAT_KF_TOKEN)
+    token = os.environ.get("WECHAT_KF_TOKEN", "PLACEHOLDER_KF_TOKEN")
     timestamp = str(int(time.time()))
     nonce = "test_nonce_" + timestamp
     echostr = "test_echo_string"

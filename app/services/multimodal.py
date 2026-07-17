@@ -1,6 +1,6 @@
 """多模态回复工具模块。
 
-把 AI 后端 (Coze / Dify) 返回的复杂工作流结构
+把 Dify 返回的复杂工作流结构
 归一化成 markdown 文本，供客服 / 智能机器人两套链路复用。
 
 一期 (markdown 内嵌图片) 路径:
@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Coze 工作流 LLM 节点会输出 <think>...</think> 思考块 (类似 doubao-seed-2-0-lite)
+# Dify 工作流 LLM 节点可能输出 <think>...</think> 思考块 (thinking-enabled 模型)
 # 必须过滤掉，否则会污染最终回复文本
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
@@ -39,7 +39,7 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 def _strip_thinking(text: str) -> str:
     """过滤 <think>...</think> 思考块。
 
-    Coze 工作流如果用了 thinking-enabled 模型, 会在 output 里泄露思考过程。
+    工作流如果用了 thinking-enabled 模型, 会在 output 里泄露思考过程。
     必须 strip 掉再交给用户。
     """
     if not isinstance(text, str) or not text:
@@ -114,11 +114,9 @@ def _extract_text_from_workflow_result(wf: Dict[str, Any]) -> str:
     优先级 (与真实工作流结构对齐):
         1. wf["assistant_text"]            ← 顶层纯文本回答 (用户工作流实际形态)
         2. wf["text"]
-        3. wf["reply_content"]["text"]["content"]   (Coze 标准 reply_content)
-        4. wf["reply_content"]["content"]           (Coze 兜底)
-        5. wf["content"]                            (Dify 归一化字段)
-        6. wf["output"]                             ← LLM 节点输出, 可能是嵌套 JSON 字符串
-        7. wf["data"] (字符串)
+        3. wf["content"]                   (Dify 归一化字段)
+        4. wf["output"]                    ← LLM 节点输出, 可能是嵌套 JSON 字符串
+        5. wf["data"] (字符串)
     """
     if not isinstance(wf, dict):
         return ""
@@ -133,18 +131,7 @@ def _extract_text_from_workflow_result(wf: Dict[str, Any]) -> str:
     if isinstance(v, str) and v.strip():
         return _strip_thinking(v)
 
-    # 3-4. reply_content 结构
-    rc = wf.get("reply_content")
-    if isinstance(rc, dict):
-        tf = rc.get("text")
-        if isinstance(tf, dict):
-            content = tf.get("content")
-            if isinstance(content, str) and content.strip():
-                return _strip_thinking(content)
-        if isinstance(rc.get("content"), str) and rc["content"].strip():
-            return _strip_thinking(rc["content"])
-
-    # 5. content (Dify 归一化字段)
+    # 3. content (Dify 归一化字段)
     v = wf.get("content")
     if isinstance(v, str) and v.strip():
         return _strip_thinking(v)
@@ -219,8 +206,8 @@ def _collect_candidate_outputs(wf: Dict[str, Any]) -> List[Any]:
     """递归收集 wf 里所有可能的 output/outputs 字段值, 供后续解析。
 
     用户真实工作流结构里 output 可能位于:
-        wf["output"]                          ← Coze 旧结构
-        wf["outputs"]                         ← Coze 变体
+        wf["output"]                          ← 旧结构 (遗留)
+        wf["outputs"]                         ← Dify / 变体
         wf["raw"]["output"]                   ← 嵌套层
         wf["raw"]["outputs"]                  ← 嵌套层 (可能是 dict)
         wf["raw"]["data"]["output"]           ← run API 形态
@@ -442,7 +429,7 @@ def has_multimodal_payload(wf: Dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 兼容旧 API: _coerce_url_list (coze.py 还在用, 保留)
+# 兼容旧 API: _coerce_url_list (dify.py 多模态字段提取在用, 保留)
 # ---------------------------------------------------------------------------
 
 

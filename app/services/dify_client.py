@@ -71,6 +71,40 @@ class DifyClient:
             raise DifyError(f"Dify upload returned no id: {body}")
         return str(file_id)
 
+    async def download_file(self, *, file_id: str) -> bytes:
+        """下载已上传文件的内容 (按 file_id 取字节)。
+
+        端点: ``GET {api_base}/files/{file_id}/preview`` (Dify 1.14.2 是
+        ``/preview`` 不是 ``/content``; ``/content`` 返回 404)。
+        鉴权: 应用 API key (Bearer) + ``user=<end_user>`` query 参数 (Dify
+        ``validate_app_token(fetch_from=QUERY)`` 要求)。文件须属于本 app 内某条
+        消息 (生产中 turn1 chat-messages 已发送该图, 满足; 独立上传未发送的文件
+        会被 _validate_file_ownership 拒绝)。
+
+        用途: bug 截图入飞书附件时, 后端按 Dify upload_file_id 回取图片字节
+        (上传时进程内缓存 miss 的兜底路径)。
+
+        Returns:
+            文件二进制内容
+
+        Raises:
+            DifyError: HTTP 4xx/5xx (如 file_id 不属于本 app -> 404, 用于
+                       多 app 场景下逐个 key 尝试)
+        """
+        url = f"{self.api_base.rstrip('/')}/files/{file_id}/preview"
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.upload_timeout)
+        ) as client:
+            resp = await client.get(
+                url, headers=self._headers(), params={"user": self.end_user}
+            )
+
+        if resp.status_code >= 400:
+            raise DifyError(
+                f"Dify download failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        return resp.content
+
     # ------------------------------------------------------------------
     # 2. Workflow execution
     # ------------------------------------------------------------------
