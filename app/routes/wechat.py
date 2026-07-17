@@ -20,6 +20,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/wechat", tags=["wechat"])
 
 
+async def _safe_process(processor, inbound, adapter) -> None:
+    """内存派发兜底: 捕获 ``process`` 重抛的异常, 避免 asyncio un-retrieved-exception
+    警告 (审查 P1 #3: process 真异常现重抛供队列重试/死信; 内存路径在此兜底日志)。
+
+    ``CancelledError`` (shutdown) 重抛以正确标记任务取消; 业务 ``Exception`` 记 ERROR。
+    """
+    try:
+        await processor.process(inbound, adapter)
+    except asyncio.CancelledError:
+        logger.info("[BOT] 后台处理被取消 (shutdown): msgid=%s", inbound.msgid)
+        raise
+    except Exception as e:
+        logger.error(
+            "[BOT] 后台处理异常: msgid=%s, %s", inbound.msgid, e, exc_info=True
+        )
+
+
 # ============================================================================
 # 微信客服 (KF) 回调
 # ============================================================================
@@ -72,10 +89,11 @@ async def wechat_callback_handler(
     try:
         inbound_list = await adapter.receive(request)
         for inbound in inbound_list:
-            if queue is not None:
-                await queue.enqueue(inbound, "kf")
+            if queue is not None and await queue.enqueue(inbound, "kf"):
                 logger.info(f"[KF] 入持久队列: msgid={inbound.msgid}")
             else:
+                # queue is None (memory 模式) 或入队失败 (Redis 宕机) -> 内存派发兜底,
+                # 避免微信已 ACK 却丢消息 (审查 P1 #2)。
                 logger.info(f"[KF] 入后台处理: msgid={inbound.msgid}")
                 background_tasks.add_task(processor.process, inbound, adapter)
     except Exception as e:
@@ -143,14 +161,15 @@ async def bot_callback_handler(
         # 去重由 MessageProcessor.process 统一负责 (与 KF 路径一致); route 层不再
         # 重复 acquire —— 否则 process() 的 acquire 必然返回 False, 整条消息被跳过。
 
-        if queue is not None:
+        if queue is not None and await queue.enqueue(inbound, "bot"):
             # 持久队列模式 (#15): 入队后立即返回占位 envelope, worker 异步消费。
-            await queue.enqueue(inbound, "bot")
             logger.info(f"[BOT] msgid={inbound.msgid} 入持久队列, 返回占位 envelope")
         else:
-            # 内存派发: Dify 跑 30-50s, 不能同步等
+            # queue is None (memory 模式) 或入队失败 (Redis 宕机) -> 内存派发兜底
+            # (审查 P1 #2)。_safe_process 兜底日志: process 现重抛异常 (审查 P1 #3),
+            # 需捕获避免 asyncio un-retrieved-exception 警告。
             asyncio.create_task(
-                processor.process(inbound, adapter),
+                _safe_process(processor, inbound, adapter),
                 name=f"bot-{inbound.msgid[:8] if inbound.msgid else 'noid'}",
             )
             logger.info(f"[BOT] msgid={inbound.msgid} 已创建后台任务, 返回占位 envelope")

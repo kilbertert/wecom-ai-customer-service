@@ -24,12 +24,15 @@ from app.protocols.base import (
     InboundMessage,
     OutboundReply,
     ProtocolAdapter,
+    to_serializable,
 )
 
 logger = logging.getLogger(__name__)
 
-# KF 消息去重窗口 (与历史 WeChatService._processed_messages 的 5 分钟一致)
-KF_DEDUP_TTL = 300
+# KF 消息去重窗口。须 >= 最坏处理耗时 (队列模式下 4 轮 Dify ≈ 4×120=480s,
+# 见 APP_QUEUE_LOCK_TTL=600), 否则处理中 _processing key 提前过期 -> 微信重试
+# 可能重复处理 (污染 Dify 上下文)。600s 覆盖绝大多数场景 (审查 P1 #4)。
+KF_DEDUP_TTL = 600
 
 
 class KfAdapter(ProtocolAdapter):
@@ -292,7 +295,7 @@ class KfAdapter(ProtocolAdapter):
             open_kfid=getattr(message, "open_kfid", "") or "",
             response_url="",
             chat_type="single",
-            raw={"message": message},
+            raw={"message": to_serializable(message)},
         )
 
 

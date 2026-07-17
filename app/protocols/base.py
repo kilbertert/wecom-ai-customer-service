@@ -26,6 +26,22 @@ from typing import Any, Dict, List, Optional, Protocol
 logger = logging.getLogger(__name__)
 
 
+def to_serializable(obj: Any) -> Any:
+    """把对象转为 JSON 可序列化结构 (供持久队列 ``asdict`` + ``json.dumps``)。
+
+    Pydantic 模型 (如 KF 的 ``WeChatMessage``) 经 ``dataclasses.asdict`` 后仍原样
+    保留为对象实例, 会让 ``json.dumps`` 抛 ``TypeError`` -> 路由吞异常返回 success
+    -> 消息丢失 (审查 P1 #1)。这里把 Pydantic 模型 ``model_dump()`` 成 dict;
+    dict / 原始值不变 (bot 的 ``msg`` 已是 dict, 幂等)。
+    """
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump()
+        except Exception:  # pragma: no cover - 防御性
+            return str(obj)
+    return obj
+
+
 @dataclass(frozen=True)
 class InboundMessage:
     """协议无关的入站消息。

@@ -572,8 +572,10 @@ async def test_crash_during_processing_keeps_retryable():
     dedup = InMemoryDedupStore()
     adapter = _FakeAdapter(dedup)
 
-    await proc.process(_inbound(msgid="crash1", text="你好"), adapter)
-    # 异常后未 mark_done → 重试可重新 acquire
+    # 异常被重抛 (审查 P1 #3): 队列模式 _run_with_lock 据此走 retry/dead-letter
+    with pytest.raises(RuntimeError):
+        await proc.process(_inbound(msgid="crash1", text="你好"), adapter)
+    # finally 已 release_processing -> 未 mark_done -> 重试可重新 acquire
     assert await dedup.acquire("crash1", 300) is True
 
 

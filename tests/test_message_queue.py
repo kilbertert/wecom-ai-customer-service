@@ -126,6 +126,15 @@ class FakeRedis:
                     self._cond.notify_all()
                     return 1
                 return 0
+            if numkeys == 2 and "LRANGE" in s:
+                # REQUEUE_LUA: KEYS=[proc, main] -> 把 proc 全量原子移到 main, 返回 items
+                proc, main = keys[0], keys[1]
+                items = list(self._lists.get(proc, []))
+                for it in items:
+                    self._lists.setdefault(main, []).insert(0, it)  # LPUSH head
+                self._lists.pop(proc, None)
+                self._cond.notify_all()
+                return items
             if numkeys == 2 and "exists" in s:
                 # ACQUIRE_LUA: KEYS=[done, proc]
                 done, proc = keys[0], keys[1]

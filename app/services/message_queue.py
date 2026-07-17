@@ -8,9 +8,12 @@
 --------
 - **队列 (Redis list, FIFO)**: ``LPUSH`` 入队 (head), ``BRPOPLPUSH`` 出队 (tail -> proc)。
   ``wecom:msgq`` (主) / ``wecom:msgq:proc`` (处理中) / ``wecom:msgq:dead`` (死信)。
-- **崩溃恢复 (无周期 sweeper)**: 启动 + 优雅关闭时把 ``proc`` 列表里的 in-flight 全部
-  回灌 ``main`` (至少一次投递)。worker 崩溃 -> item 留 proc -> 下次启动重入队重投递。
-  幂等由 ``DedupStore`` 保证 (redis 模式用 ``RedisDedupStore`` 跨进程抗重启)。
+- **崩溃恢复 (无周期 sweeper)**: 启动 + 优雅关闭时把 ``proc`` 列表里的 in-flight
+  全部**原子**回灌 ``main`` (单 EVAL ``_REQUEUE_LUA``, 至少一次投递)。worker 硬崩
+  -> item 留 proc + dedup ``_processing`` key 残留 (finally 没机会跑) -> 下次启动
+  回灌时**逐条 ``release_processing`` 清 stale key**, 否则重投递 ``acquire=False``
+  -> 跳过 -> 丢 (审查 P1 #4)。清理后重投递可重新 acquire 重处理; ``DedupStore`` 的
+  ``done`` key 仍防重复**发送** (完成后的重投递 acquire 命中 done 返回 False, 跳过)。
 - **锁 (#17B, 与队列共享同一 Redis client)**: ``SET lock NX EX ttl`` 占有, Lua(token 比对)
   释放。**锁被占** -> 消息回 main 队尾 (不算失败, 不增 attempts) + 短暂 sleep 防忙轮询;
   **Redis 异常** -> fail-open 直处理 (不阻塞); TTL > 最坏 4 轮 Dify 耗时, worker 崩溃靠
@@ -55,6 +58,16 @@ class RedisMessageQueue:
 if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end
 """
 
+    # 原子 orphan sweep: 把 proc 全量移到 main (LRANGE -> 逐条 LPUSH -> DEL proc)。
+    # 单 EVAL 原子, 避免多进程/多 worker 下 LRANGE 与 DEL 之间他人 blmove 入 proc 被误删
+    # (审查 P1 #4)。返回被移动的 items, 供 Python 逐条 release stale dedup key。
+    _REQUEUE_LUA = """
+local items = redis.call('LRANGE', KEYS[1], 0, -1)
+for i=1,#items do redis.call('LPUSH', KEYS[2], items[i]) end
+redis.call('DEL', KEYS[1])
+return items
+"""
+
     def __init__(
         self,
         redis_client: Any,
@@ -75,8 +88,13 @@ if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) 
     # ------------------------------------------------------------------
     # 入队 (路由层调用)
     # ------------------------------------------------------------------
-    async def enqueue(self, inbound: InboundMessage, adapter_id: str) -> None:
-        """序列化 InboundMessage 入主队列 (head)。路由层 ACK 后立即返回。"""
+    async def enqueue(self, inbound: InboundMessage, adapter_id: str) -> bool:
+        """序列化 InboundMessage 入主队列 (head)。返回 True=已入队, False=未入队。
+
+        路由层据返回值决定: True -> 已持久化, 可安全 ACK; False -> Redis 不可达或
+        序列化失败, 路由应回退内存派发 (BackgroundTasks/create_task), 避免微信已
+        ACK 却丢消息 (审查 P1 #2)。
+        """
         env = {
             "id": uuid4().hex,
             "adapter": adapter_id,
@@ -84,19 +102,57 @@ if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) 
             "attempts": 0,
             "enqueued_at": time.time(),
         }
-        raw = json.dumps(env, ensure_ascii=False)
+        try:
+            raw = json.dumps(env, ensure_ascii=False)
+        except Exception as e:
+            # 序列化失败 (审查 P1 #1, 适配器已 model_dump 规避, 此为兜底):
+            # 入死信 (可观测, 不静默丢) + 返回 False 让路由回退内存派发。
+            logger.error(
+                "[QUEUE] 序列化失败, 入死信 + 回退内存派发: "
+                "adapter=%s msgid=%s %s", adapter_id, inbound.msgid, e,
+            )
+            await self._push_dead_unparseable(inbound, adapter_id, f"serialize: {e}")
+            return False
         try:
             await self._r.lpush(self.Q_MAIN, raw)
             logger.info(
                 "[QUEUE] 入队 adapter=%s msgid=%s (qlen 将由 worker 消费)",
                 adapter_id, inbound.msgid,
             )
+            return True
         except Exception as e:
-            # 入队失败: 消息无法持久化。路由层已 ACK 给微信 -> 此消息将丢失。记 ERROR。
-            # (比静默丢好: 可观测。生产应配告警。)
+            # Redis 不可达: 返回 False, 路由回退内存派发 (审查 P1 #2)。
             logger.error(
-                "[QUEUE] 入队失败, 消息将丢失 (微信已 ACK 不会重发): "
+                "[QUEUE] 入队失败 (Redis 不可达?), 路由将回退内存派发: "
                 "adapter=%s msgid=%s %s", adapter_id, inbound.msgid, e,
+            )
+            return False
+
+    async def _push_dead_unparseable(
+        self, inbound: InboundMessage, adapter_id: str, reason: str
+    ) -> None:
+        """把不可序列化的消息以最小可序列化占位写入死信 (供排查, 不重试)。"""
+        dead_env = {
+            "id": uuid4().hex,
+            "adapter": adapter_id,
+            "payload": {
+                "msgid": inbound.msgid,
+                "protocol": inbound.protocol,
+                "user_id": inbound.user_id,
+                "msg_type": inbound.msg_type,
+            },
+            "attempts": self._max_attempts,
+            "enqueued_at": time.time(),
+            "_dead_reason": reason,
+        }
+        try:
+            await self._r.lpush(
+                self.Q_DEAD, json.dumps(dead_env, ensure_ascii=False)
+            )
+        except Exception as de:
+            logger.error(
+                "[QUEUE] 死信写入也失败 (Redis 不可达, 彻底丢): msgid=%s %s",
+                inbound.msgid, de,
             )
 
     # ------------------------------------------------------------------
@@ -137,22 +193,48 @@ if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) 
         logger.info("[QUEUE] 已停止")
 
     async def _requeue_orphans(self) -> None:
-        """把 proc 列表里的 in-flight 全部回灌 main (启动/关闭时调用)。
+        """把 proc 列表里的 in-flight 全部原子回灌 main (启动/关闭时调用)。
 
-        启动: 上次崩溃留下的 proc -> 重投递。关闭: 被 cancel 的 in-flight -> 下次启动重处理。
-        不增 attempts (崩溃/取消不算失败)。
+        启动: 上次硬崩溃留下的 proc -> 重投递。关闭: 被 cancel 的 in-flight ->
+        下次启动重处理。不增 attempts (崩溃/取消不算失败)。
+
+        原子性 (审查 P1 #4): 用单 EVAL (``_REQUEUE_LUA``) 把 proc 全量移到 main,
+        避免 LRANGE 与 DEL 之间他人 blmove 入 proc 被误删。
+
+        崩溃/dedup 冲突 (审查 P1 #4): 硬崩会同时留 proc 消息 + dedup ``_processing``
+        key (process.finally 没机会跑)。若不清理, 重投递时 ``acquire`` 命中残留 key
+        返回 False -> process 跳过 -> 队列 LREM -> **消息丢失**。故移动后逐条解析
+        msgid+adapter, ``release_processing`` 清 stale key, 让重投递能重新 acquire
+        (崩溃=未完成=应重处理)。cancel 路径下 process.finally 已 release, 此处为
+        no-op, 安全。
         """
         try:
-            items = await self._r.lrange(self.Q_PROC, 0, -1)
-            if not items:
-                return
-            # 逐条 LPUSH 回 main (保持顺序不必严格, FIFO 近似即可)
-            for it in items:
-                await self._r.lpush(self.Q_MAIN, it)
-            await self._r.delete(self.Q_PROC)
-            logger.info("[QUEUE] 回灌 %d 条 in-flight -> main (orphan sweep)", len(items))
+            items = await self._r.eval(
+                self._REQUEUE_LUA, 2, self.Q_PROC, self.Q_MAIN
+            )
         except Exception as e:
             logger.warning("[QUEUE] orphan sweep 失败 (proc 残留待下次): %s", e)
+            return
+        if not items:
+            return
+        cleared = 0
+        for it in items:
+            if isinstance(it, bytes):
+                it = it.decode("utf-8", errors="ignore")
+            try:
+                env = json.loads(it)
+                msgid = (env.get("payload") or {}).get("msgid", "")
+                adapter = self._adapters.get(env.get("adapter"))
+                if msgid and adapter is not None:
+                    await adapter.dedup.release_processing(msgid)
+                    cleared += 1
+            except Exception as e:
+                # 解析失败的 item 已在 main, worker 会按反序列化失败入死信; 不阻塞回灌。
+                logger.warning("[QUEUE] orphan release dedup 跳过 (解析失败): %s", e)
+        logger.info(
+            "[QUEUE] 原子回灌 %d 条 in-flight -> main (orphan sweep), "
+            "清 %d 个 stale dedup key", len(items), cleared,
+        )
 
     # ------------------------------------------------------------------
     # worker 循环
@@ -299,13 +381,15 @@ if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) 
                     )
 
 
-def create_message_queue(
+async def create_message_queue(
     adapters: Dict[str, Any], processor: Any
 ) -> Optional[RedisMessageQueue]:
     """根据 ``settings.app.message_queue`` 选择队列。
 
-    "memory" (默认) / Redis 不可达 -> 返回 None (路由层回退 BackgroundTasks/create_task)。
-    "redis" -> RedisMessageQueue。
+    "memory" (默认) -> 返回 None (路由层回退 BackgroundTasks/create_task)。
+    "redis" -> 连通性 PING 通过则返回 RedisMessageQueue; Redis 不可达 -> 回退 None
+    (审查 P1 #2: 启动期发现 Redis 连不上即回退内存派发, 而非启动一个连不上的队列
+    导致后续每条消息入队失败被静默 ACK 丢)。
     """
     from app.core.config import settings
 
@@ -325,16 +409,17 @@ def create_message_queue(
                 else None
             ),
         )
-        logger.info(
-            "MessageQueue: Redis 持久队列模式 (workers=%s)",
-            getattr(settings.app, "queue_workers", 2),
-        )
-        return RedisMessageQueue(client, adapters, processor)
+        await client.ping()  # 连通性检查: 失败则回退内存派发
     except Exception as e:
         logger.warning(
-            "Redis MessageQueue 初始化失败, 回退 memory (BackgroundTasks): %s", e
+            "Redis MessageQueue PING 失败, 回退 memory (BackgroundTasks): %s", e
         )
         return None
+    logger.info(
+        "MessageQueue: Redis 持久队列模式 (workers=%s)",
+        getattr(settings.app, "queue_workers", 2),
+    )
+    return RedisMessageQueue(client, adapters, processor)
 
 
 __all__ = ["RedisMessageQueue", "create_message_queue"]

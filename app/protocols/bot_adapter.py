@@ -29,6 +29,7 @@ from app.protocols.base import (
     InboundMessage,
     OutboundReply,
     ProtocolAdapter,
+    to_serializable,
 )
 from app.services.wechat import WeChatService
 
@@ -346,7 +347,7 @@ class BotAdapter(ProtocolAdapter):
             open_kfid="",
             response_url=response_url,
             chat_type=chat_type,
-            raw={"message": msg},
+            raw={"message": to_serializable(msg)},
         )
 
 

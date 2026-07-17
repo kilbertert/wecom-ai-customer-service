@@ -315,9 +315,15 @@ class MessageProcessor:
             logger.info("[PROC] 完成: msgid=%s", msgid)
 
         except Exception as e:
+            # 重抛 (审查 P1 #3): 队列模式下 _run_with_lock 据此走 retry/dead-letter;
+            # 若吞掉正常返回, 队列当 success -> LREM -> 重试/死信永不触发, 消息静默丢。
+            # 内存派发路径 (BackgroundTasks/create_task) 自有外层兜底日志。finally 仍
+            # release_processing, 允许重试重新 acquire。
             logger.error(
-                "[PROC] 编排异常: msgid=%s, %s", msgid, e, exc_info=True
+                "[PROC] 编排异常 (将重抛供上层重试/死信): msgid=%s, %s",
+                msgid, e, exc_info=True,
             )
+            raise
         except BaseException as e:
             # A3: CancelledError 等 BaseException 也要 release, 否则 msgid 卡
             # _processing (且 _processing 旧版无 TTL 清理 → 永久泄漏)。记日志后重抛。

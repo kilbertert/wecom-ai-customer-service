@@ -72,7 +72,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 持久消息队列 + 分布式锁 (#15+#17B): APP_MESSAGE_QUEUE=redis 时启用, 否则 None
     # (路由层回退 BackgroundTasks/create_task)。queue 与 lock 共享同一 Redis client。
-    app.state.message_queue = create_message_queue(
+    # create_message_queue 内部 PING Redis, 不可达则返回 None 回退内存派发 (审查 P1 #2)。
+    app.state.message_queue = await create_message_queue(
         {"kf": app.state.kf_adapter, "bot": app.state.bot_adapter},
         app.state.message_processor,
     )
