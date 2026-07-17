@@ -15,8 +15,10 @@
 services:
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    # 不发布主机端口 (审查 P1 #6): wecom-ai-service / celery-worker 走 docker 网络
+    # 服务名 `redis` 访问, 无需暴露 6379 到主机接口。需主机调试时改
+    # "127.0.0.1:6379:6379"; 生产额外设 REDIS_PASSWORD + redis-server --requirepass
+    # (RedisSettings.password 已支持, wecom/celery 经 .env 读取)。
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -62,6 +64,9 @@ services:
       - .env
     environment:
       - REDIS_HOST=redis
+      # 与 wecom-ai-service 一致: pending timer store 走 redis, 否则 celery 看不到
+      # web 进程 arm 的 timer -> bugtrack_timeout 永远 no_pending 跳过 (审查 P1 #5)。
+      - APP_CONVERSATION_STORE=redis
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
     command: >

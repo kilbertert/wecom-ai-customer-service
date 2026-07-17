@@ -85,6 +85,18 @@ class PendingTimerStore(ABC):
         """清除并返回被清除的定时器 (cancel 成功 / 状态终结)。"""
         ...
 
+    @abstractmethod
+    async def clear_if_match(
+        self, user_id: str, scope: str, expected_task_id: str
+    ) -> bool:
+        """CAS 清除: 仅当当前 pending 的 ``task_id == expected_task_id`` 才清除。
+
+        原子 compare-and-delete, 避免旧 (被 revoke 的) 任务延迟 fire 时读到匹配的
+        旧 task_id、却在 clear 前被新 arm 覆盖 -> 误删新 timer (审查 P1 #5)。
+        返回 True=已清除, False=无 pending 或 task_id 不匹配 (调用方应跳过 fire)。
+        """
+        ...
+
 
 class InMemoryPendingTimerStore(PendingTimerStore):
     """进程内映射 (默认, 单 worker)。"""
@@ -116,6 +128,16 @@ class InMemoryPendingTimerStore(PendingTimerStore):
         async with self._lock:
             return self._map.pop(_key(user_id, scope), None)
 
+    async def clear_if_match(
+        self, user_id: str, scope: str, expected_task_id: str
+    ) -> bool:
+        async with self._lock:
+            t = self._map.get(_key(user_id, scope))
+            if t is not None and t.task_id == expected_task_id:
+                self._map.pop(_key(user_id, scope), None)
+                return True
+            return False
+
 
 class RedisPendingTimerStore(PendingTimerStore):
     """Redis 映射 (多 worker 抗重启, 与 Celery worker 共享)。
@@ -128,6 +150,17 @@ class RedisPendingTimerStore(PendingTimerStore):
     """
 
     _KEY_PREFIX = "wecom:timer:"
+
+    # CAS 清除 (审查 P1 #5): GET -> cjson 解码比对 task_id -> 匹配才 DEL, 单 EVAL 原子。
+    # 避免旧 (被 revoke) 任务延迟 fire 误删新 arm 的 timer (get-then-clear 非原子的竞态)。
+    _CLEAR_IF_MATCH_LUA = """
+local val = redis.call('GET', KEYS[1])
+if val == false then return 0 end
+local ok, obj = pcall(cjson.decode, val)
+if not ok or obj.task_id ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1])
+return 1
+"""
 
     def __init__(self, redis_client) -> None:  # type: ignore[no-untyped-def]
         self._redis = redis_client
@@ -171,6 +204,21 @@ class RedisPendingTimerStore(PendingTimerStore):
         except Exception as e:
             logger.warning("[TimerStore] clear 反序列化失败: %s", e)
             return None
+
+    async def clear_if_match(
+        self, user_id: str, scope: str, expected_task_id: str
+    ) -> bool:
+        k = self._k(user_id, scope)
+        try:
+            res = await self._redis.eval(self._CLEAR_IF_MATCH_LUA, 1, k, expected_task_id)
+            return bool(res)
+        except Exception as e:
+            # Redis 异常: fail-open 不清 (保守, 宁可漏清靠 TTL, 不误清新 timer)。
+            logger.warning(
+                "[TimerStore] clear_if_match 异常 (未清, 靠 TTL): user=%s %s",
+                user_id, e,
+            )
+            return False
 
 
 def create_pending_timer_store() -> PendingTimerStore:

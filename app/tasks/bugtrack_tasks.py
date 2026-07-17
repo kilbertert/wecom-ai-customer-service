@@ -55,7 +55,10 @@ def bugtrack_timeout(
         user_id, scope, state, record_id or "(none)",
     )
 
-    # 1) 防重复 fire: 确认 PendingTimerStore 里该 user 仍 pending。
+    # 1) 防重复 fire + 原子 CAS 清 (审查 P1 #5): 仅当 stored task_id == 本任务 id 才清,
+    #    否则跳过 (被 revoke 的旧任务延迟 fire, store 里已是新 timer, 不误删)。
+    #    memory 模式下 celery 与 web 分进程 -> store 为空 -> no_pending (compose 已设
+    #    APP_CONVERSATION_STORE=redis 使两者共享同一份 pending 元数据)。
     try:
         from app.services.pending_timer_store import (
             create_pending_timer_store,
@@ -66,38 +69,26 @@ def bugtrack_timeout(
         except RuntimeError:
             loop = None
 
-        async def _check_pending():
+        async def _resolve():
             store = create_pending_timer_store()
-            return await store.get(user_id, scope)
+            # 原子 CAS 清 (Lua): 匹配才清。返回 True 才继续 fire。
+            if await store.clear_if_match(user_id, scope, self.request.id):
+                return "cleared"
+            # 未清: 判原因 (仅日志用, 决策已定=不 fire)
+            pending = await store.get(user_id, scope)
+            return "no_pending" if pending is None else "task_id_mismatch"
 
         if loop and loop.is_running():
-            pending = None
+            reason = "loop_running_skip"
         else:
-            pending = asyncio.run(_check_pending())
+            reason = asyncio.run(_resolve())
 
-        if pending is None:
+        if reason != "cleared":
             logger.info(
-                "[bugtrack_timeout] user=%s 已无 pending timer "
-                "(用户已在窗口内回应), 跳过", user_id,
+                "[bugtrack_timeout] user=%s 跳过 fire (reason=%s, self=%s)",
+                user_id, reason, (self.request.id or "")[:8],
             )
-            return {"status": "skipped", "reason": "no_pending"}
-
-        # compare-and-delete: 只清自己 arm 的 timer。若 pending.task_id != 本任务 id,
-        # 说明这是被 revoke 的旧任务延迟 fire, 而 store 里已是新 timer -> 不清, 跳过,
-        # 防旧任务删新任务 (审查 P1)。注: 完全原子需 RedisPendingTimerStore CAS clear。
-        if pending.task_id != self.request.id:
-            logger.warning(
-                "[bugtrack_timeout] task_id 不匹配 (stored=%s self=%s) "
-                "-> 旧任务误 fire, 不清新 timer, 跳过",
-                (pending.task_id or "")[:8], (self.request.id or "")[:8],
-            )
-            return {"status": "skipped", "reason": "task_id_mismatch"}
-
-        async def _clear_pending():
-            store = create_pending_timer_store()
-            return await store.clear(user_id, scope)
-        if not (loop and loop.is_running()):
-            asyncio.run(_clear_pending())
+            return {"status": "skipped", "reason": reason}
     except Exception as e:
         logger.warning(
             "[bugtrack_timeout] pending 检查异常 (继续): %s", e

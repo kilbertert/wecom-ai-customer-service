@@ -8,7 +8,9 @@ memory wecom-smartsheet-deadend)。飞书 ``records/search`` 支持 ``contains``
 两层权限: 应用需有 ``bitable:app`` scope + 是目标表的协作者/所有者。
 
 ⚠️ 并发写: 同一数据表不支持并发写 (报 1254291 Write conflict)。Celery worker
-concurrency=1 天然串行; FastAPI 侧写表需注意 (本模块不内置锁, 调用方串行调)。
+concurrency=1 天然串行; ``add_record``/``update_record`` 内置 1254291 指数退避
+重试 (3 次: 0.3/0.6/1.2s) 自愈瞬态冲突; 真正串行仍靠 celery concurrency=1 +
+避免并发 web 写 (审查 P1 #7)。
 
 本模块为**同步实现** (httpx.Client), 供 Celery task 直接调; async 上下文用
 ``asyncio.to_thread`` 包装 (见 smartsheet_query_service)。
@@ -106,6 +108,34 @@ def _check(data: Dict[str, Any], action: str) -> None:
         )
 
 
+# 1254291 = Write conflict (同表并发写)。add_record/update_record 退避重试 (审查 P1 #7)。
+_WRITE_CONFLICT_CODE = 1254291
+_WRITE_RETRY_DELAYS = (0.3, 0.6, 1.2)  # 指数退避 (秒), 3 次重试
+
+
+def _write_with_retry(action: str, do_request):
+    """执行飞书写表请求, 遇 1254291 Write conflict 指数退避重试。
+
+    ``do_request``: ``() -> dict``, 执行 httpx 请求并返回 ``r.json()``。
+    HTTP 层错误 (raise_for_status) 直接传播不重试; 仅对 1254291 重试, 其余业务
+    code 由 ``_check`` 抛出。真正串行仍靠 celery concurrency=1 + 避免并发 web 写。
+    """
+    for attempt in range(len(_WRITE_RETRY_DELAYS) + 1):
+        data = do_request()
+        code = data.get("code", -1) if isinstance(data, dict) else -1
+        if code == _WRITE_CONFLICT_CODE and attempt < len(_WRITE_RETRY_DELAYS):
+            logger.warning(
+                "[feishu] %s 遇 Write conflict (1254291), %.1fs 后重试 (%s/%s)",
+                action, _WRITE_RETRY_DELAYS[attempt],
+                attempt + 1, len(_WRITE_RETRY_DELAYS),
+            )
+            time.sleep(_WRITE_RETRY_DELAYS[attempt])
+            continue
+        _check(data, action)  # 0=成功; 非重试码抛
+        return data
+    return data  # pragma: no cover - 循环末次必 return
+
+
 # ======================================================================
 # 查表 (N2/N9)
 # ======================================================================
@@ -192,15 +222,16 @@ def add_record(fields: Dict[str, Any]) -> str:
     Returns:
         新记录的 record_id
     """
-    with httpx.Client(timeout=_TIMEOUT) as c:
-        r = c.post(
-            f"{_BASE}/bitable/v1/apps/{_app_token()}/tables/{_table_id()}/records",
-            headers=_headers(),
-            json={"fields": fields},
-        )
-        r.raise_for_status()
-        data = r.json()
-    _check(data, "新增记录")
+    def _do() -> Dict[str, Any]:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.post(
+                f"{_BASE}/bitable/v1/apps/{_app_token()}/tables/{_table_id()}/records",
+                headers=_headers(),
+                json={"fields": fields},
+            )
+            r.raise_for_status()
+            return r.json()
+    data = _write_with_retry("新增记录", _do)
     record = (data.get("data") or {}).get("record") or {}
     rid = record.get("record_id") or record.get("id") or ""
     if not rid:
@@ -218,15 +249,16 @@ def update_record(record_id: str, fields: Dict[str, Any]) -> None:
     """
     if not record_id:
         raise FeishuBitableError("update_record 需要 record_id")
-    with httpx.Client(timeout=_TIMEOUT) as c:
-        r = c.put(
-            f"{_BASE}/bitable/v1/apps/{_app_token()}/tables/{_table_id()}/records/{record_id}",
-            headers=_headers(),
-            json={"fields": fields},
-        )
-        r.raise_for_status()
-        data = r.json()
-    _check(data, "修改记录")
+    def _do() -> Dict[str, Any]:
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            r = c.put(
+                f"{_BASE}/bitable/v1/apps/{_app_token()}/tables/{_table_id()}/records/{record_id}",
+                headers=_headers(),
+                json={"fields": fields},
+            )
+            r.raise_for_status()
+            return r.json()
+    _write_with_retry("修改记录", _do)
     logger.info("[feishu] 修改记录成功 record_id=%s", record_id)
 
 
