@@ -1,12 +1,47 @@
-version: '3.8'
+# docker-compose.yml — 完整开发/灰度栈 (wecom 服务 + redis + celery worker)
+#
+# 用法:
+#   cp env.example .env && vim .env     # 填真实凭据 (chmod 600 .env)
+#   docker-compose up -d                # 起 redis + wecom + celery
+#   docker-compose logs -f wecom-ai-service
+#
+# 端口: 主机 8501 -> 容器 8000 (与 prod 8501 对齐)。
+# 队列: 默认启用 redis 持久队列 + 分布式锁 (#15+#17B) + redis 去重/会话
+#       (注释掉 wecom-ai-service.environment 里三行 APP_* 即回退 memory 模式)。
+#
+# Redis db 划分: db0 = 队列/锁/去重/会话/定时器元数据 (wecom 服务 + celery 共享);
+#                db1 = celery broker; db2 = celery result。
 
 services:
-  weixin-coze-service:
-    build: .
+  redis:
+    image: redis:7-alpine
     ports:
-      - "8000:8000"
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  wecom-ai-service:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
     env_file:
       - .env
+    environment:
+      # redis 指向 compose 的 redis 服务 (覆盖 .env 的 REDIS_HOST)
+      - REDIS_HOST=redis
+      # 启用 #15+#17B 持久队列 + 分布式锁 + redis 去重/会话 (注释即回退 memory)
+      - APP_MESSAGE_QUEUE=redis
+      - APP_DEDUP_STORE=redis
+      - APP_CONVERSATION_STORE=redis
+    ports:
+      - "8501:8000"
     volumes:
       - ./temp_media:/app/temp_media
     restart: unless-stopped
@@ -16,3 +51,23 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  celery-worker:
+    # 二阶段 bug 反馈超时 (bugtrack_timeout, 队列 wecom_timers, concurrency=1 串行写飞书表)
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    command: >
+      celery -A app.core.celery_app worker
+      -Q wecom_timers --concurrency=1 --loglevel=info
+    restart: unless-stopped
+
+volumes:
+  redis_data:

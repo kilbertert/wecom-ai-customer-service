@@ -1,0 +1,60 @@
+# --- 凭据/环境 (绝不进镜像) ---
+.env
+.env.*
+!.env.example
+.env.bak*
+.env.local
+.env.production
+.env.staging
+
+# --- Git / CI ---
+.git
+.gitignore
+.gitattributes
+
+# --- Python 缓存与虚拟环境 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+ENV/
+.venv/
+*.egg-info/
+
+# --- 测试 / 覆盖率 / lint 产物 ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- 编辑器 / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- 日志 / 临时媒体 ---
+logs/
+*.log
+temp_media/
+*.tmp
+*.temp
+
+# --- 本地脚本/备份/文档 (非运行时) ---
+*.bak
+*.backup
+*.enc
+start_uvicorn.sh
+run_test.py
+test_*.py
+add_bug_screenshot_field.py
+charge_charging_v16.yml
+docs/
+.claude/
