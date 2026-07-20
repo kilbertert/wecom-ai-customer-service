@@ -9,22 +9,26 @@
 端点:
     POST /internal/bugtrack/search    — N2 关键词查表, 返回命中行
     GET  /internal/bugtrack/record/{record_id} — N9 读旧行
+    POST /internal/bugtrack/cache-image — H5 首轮截图跨轮缓存
     POST /internal/bugtrack/add       — N16 新增记录 (写飞书主表), 返回 record_id
     POST /internal/bugtrack/update    — N14 修改记录 (增量更新飞书主表)
     GET  /internal/bugtrack/health    — 健康检查
 """
 import asyncio
+import hashlib
 import logging
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Request, HTTPException, Header
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.services.dify import (
+    _cache_put,
     _conv_image_clear,
     _conv_image_get,
+    _conv_image_put,
     fetch_upload_bytes,
 )
 from app.services.feishu_bitable import (
@@ -165,6 +169,68 @@ class AddRecordRequest(BaseModel):
 class UpdateRecordRequest(BaseModel):
     record_id: str = Field(..., description="要修改的记录 id (来自 add 返回或 search)")
     fields: Dict[str, Any] = Field(..., description="要增量更新的字段(未传保持不变)")
+
+
+_MAX_CACHED_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _image_mime(content: bytes) -> str:
+    if content[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if content[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if content[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+@router.post("/cache-image")
+async def cache_bug_image(
+    request: Request,
+    conversation_id: str = Form(...),
+    image: UploadFile = File(...),
+):
+    """缓存 H5 首轮原图，确认写表时按 Dify B conversation_id 回取。"""
+    _verify_access(request)
+    conv_id = (conversation_id or "").strip()
+    if not conv_id:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "conversation_id required"},
+        )
+    content = await image.read(_MAX_CACHED_IMAGE_BYTES + 1)
+    if not content:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "empty image"},
+        )
+    if len(content) > _MAX_CACHED_IMAGE_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"success": False, "error": "image exceeds 10MB"},
+        )
+    content_type = _image_mime(content)
+    if not content_type:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "unsupported image format"},
+        )
+
+    cache_id = "h5-" + hashlib.sha256(content).hexdigest()
+    _cache_put(
+        cache_id,
+        content,
+        image.filename or "bug-screenshot.jpg",
+        content_type,
+    )
+    _conv_image_put(conv_id, cache_id)
+    logger.info(
+        "[bugtrack/internal/cache-image] 已缓存 conv=%s image=%s size=%dB",
+        conv_id[:8], cache_id[:12], len(content),
+    )
+    return JSONResponse(content={"success": True})
 
 
 @router.post("/add")
