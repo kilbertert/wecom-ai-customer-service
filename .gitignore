@@ -58,3 +58,9 @@ build/
 *.tmp
 *.temp
 .claude/settings.local.json
+
+# 本地关系型数据库与 Bug 附件（生产使用独立 PostgreSQL/持久目录）
+*.db
+*.sqlite
+*.sqlite3
+data/bugtrack/

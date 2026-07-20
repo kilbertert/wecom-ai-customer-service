@@ -30,10 +30,8 @@ logger = logging.getLogger(__name__)
 # ======================================================================
 # 上传文件字节缓存 (bug 截图入飞书附件用)
 # ======================================================================
-# WeCom 后端 workers=1, 进程内缓存可靠。上传 Dify 时顺手缓存原始字节,
-# 后续 /add 写飞书附件时按 upload_file_id 回取, 避免再向 Dify 下载
-# (Dify 文件下载有 app token 归属 A/B + end_user 所有权不确定性)。
-# 缓存 miss (超时/跨进程) 时 fetch_upload_bytes 兜底走 Dify download。
+# 仅保留给旧 ``image_file_ids`` 调用方的短期兼容缓存。新链路在目标草稿确定后
+# 直接写持久附件存储；该缓存不再承担附件归属或跨轮状态职责。
 _UPLOAD_CACHE: Dict[str, Tuple[bytes, str, str, float]] = {}
 _UPLOAD_CACHE_TTL = 1800.0  # 30 分钟 (bug 多轮确认流程通常数分钟内完成)
 _UPLOAD_CACHE_CAP = 100
@@ -103,46 +101,6 @@ async def fetch_upload_bytes(upload_file_id: str) -> Optional[Tuple[bytes, str, 
             continue
     logger.warning("[dify] 回取文件 %s 全部失败 (缓存 miss + 下载失败)", uid)
     return None
-
-
-# ======================================================================
-# 会话 -> 图片 缓存 (bug 截图跨轮: turn1 发图, turn2 写表时按 conv_id 回取)
-# ======================================================================
-# bug 多轮流程: turn1 用户发截图+描述 -> 分类 bug -> 引导确认; turn2 确认 ->
-# 6260a 写飞书。图片 file_id 在 turn1, 写表在 turn2, 需跨轮保留。Dify 6260a
-# 在 /add body 里传 conversation_id, 后端按 conv_id 取本缓存得 file_id 列表,
-# 再 fetch_upload_bytes 取字节 -> 上传飞书附件。workers=1 进程内可靠。
-_CONV_IMAGE_CACHE: Dict[str, Tuple[List[str], float]] = {}
-_CONV_IMAGE_TTL = 3600.0  # 1h (bug 多轮流程通常数分钟内完成)
-_CONV_IMAGE_CAP = 200
-
-
-def _conv_image_put(conv_id: str, file_id: str) -> None:
-    """追加一个图片 file_id 到会话的图片列表 (带 TTL, 去重, 不可变)。"""
-    now = time.time()
-    if len(_CONV_IMAGE_CACHE) >= _CONV_IMAGE_CAP:
-        for k in [k for k, v in _CONV_IMAGE_CACHE.items() if v[1] < now]:
-            _CONV_IMAGE_CACHE.pop(k, None)
-    ids, _ = _CONV_IMAGE_CACHE.get(conv_id, ([], 0.0))
-    if file_id and file_id not in ids:
-        ids = ids + [file_id]  # 新列表, 不就地改
-    _CONV_IMAGE_CACHE[conv_id] = (ids, now + _CONV_IMAGE_TTL)
-
-
-def _conv_image_get(conv_id: str) -> List[str]:
-    """取会话累积的图片 file_id 列表 (过期返回 [])。"""
-    v = _CONV_IMAGE_CACHE.get(conv_id)
-    if not v:
-        return []
-    if v[1] < time.time():
-        _CONV_IMAGE_CACHE.pop(conv_id, None)
-        return []
-    return list(v[0])
-
-
-def _conv_image_clear(conv_id: str) -> None:
-    """清空会话图片缓存 (写表后调用, 防同会话下个 bug 复用旧图)。"""
-    _CONV_IMAGE_CACHE.pop(conv_id, None)
 
 
 def _guess_audio_mime(filename: str) -> str:
@@ -325,7 +283,7 @@ class DifyService:
                 content=file_content,
                 content_type=ctype,
             )
-            # 缓存原始字节, 供 bug 截图入飞书附件回取 (workers=1 进程内可靠)
+            # 旧 image_file_ids 兼容缓存；草稿附件主链路走关系型绑定 + 持久文件。
             _cache_put(str(file_id), file_content, file_name, ctype or "application/octet-stream")
             return file_id
         except DifyError as e:
@@ -336,6 +294,7 @@ class DifyService:
         input_data: Any,
         client: "DifyClient",
         conversation_id: Optional[str] = None,
+        app: str = "A",
     ) -> Dict[str, Any]:
         """Chatflow (advanced-chat) app 调用路径。
 
@@ -421,6 +380,54 @@ class DifyService:
         if region:
             inputs["input_hint_region"] = region
 
+        attachment_persisted = False
+
+        async def _persist_bug_attachment(target_conversation_id: str) -> None:
+            nonlocal attachment_persisted
+            conv = (target_conversation_id or "").strip()
+            if app != "B" or not upload_file_id:
+                return
+            if not conv:
+                raise AIBackendError("Bug 图片缺少 Dify conversation_id，未安全保存")
+            try:
+                from app.core.database import session_scope
+                from app.services.bugtrack_service import DraftIdentity, bugtrack_service
+
+                async with session_scope() as db_session:
+                    draft = await bugtrack_service.ensure_draft(
+                        db_session,
+                        identity=DraftIdentity(
+                            channel="wecom",
+                            user_key=client.end_user,
+                            session_id=client.end_user,
+                            conversation_id=conv,
+                        ),
+                        event_type="wecom_attachment_context_resolved",
+                    )
+                    await bugtrack_service.add_attachment(
+                        db_session,
+                        draft=draft,
+                        content=img_bytes,
+                        original_name=img_name,
+                        mime_type=ctype,
+                        source_file_id=upload_file_id,
+                    )
+                attachment_persisted = True
+                logger.info(
+                    "[DIFY] Bug 图片已持久化 draft=%s conv=%s size=%dB",
+                    str(draft.id)[:8], conv[:8], len(img_bytes),
+                )
+            except AIBackendError:
+                raise
+            except Exception as exc:
+                logger.error("[DIFY] Bug 图片持久化失败: %s", exc, exc_info=True)
+                raise AIBackendError("Bug 图片未安全保存，请重新发送") from exc
+
+        # 已有 B conversation 表示当前可能是确认/修改轮；先持久化图片，避免工作流
+        # 在本轮 /add 或 /update 后图片才落库。
+        if app == "B" and upload_file_id and conversation_id:
+            await _persist_bug_attachment(conversation_id)
+
         # 2) 调 chatflow (透传 conversation_id 续接多轮)
         try:
             logger.info("[DIFY] chatflow end_user=%s files=%d conv=%s", client.end_user, len(files or []), conversation_id or "")
@@ -435,15 +442,12 @@ class DifyService:
             logger.error("Dify chatflow error: %s", e)
             raise AIBackendError(f"Dify chatflow 失败: {e}") from e
 
-        # bug 截图跨轮缓存: 本轮若上传了图片, 按 Dify 返回的 conversation_id 记录
-        # upload_file_id(目标 app 绑定), 供 /add 写飞书附件时按 conv_id 回取
-        # (turn1 发图 turn2 写表)。隔离 try/except, 永不影响主路径。
-        try:
-            _conv = (raw or {}).get("conversation_id") or ""
-            if _conv and upload_file_id:
-                _conv_image_put(_conv, upload_file_id)
-        except Exception:
-            pass
+        # Bug 图片按“具体草稿”持久化，不再使用 conversation -> 进程内列表。
+        # Dify 工作流在本次调用内已先访问 /search 建立 conversation -> draft 绑定；
+        # 若异常路径未建绑定，ensure_draft 会创建一个可审计草稿。持久化失败必须显式
+        # 失败，禁止回复“已收到图片”后实际丢图。
+        if app == "B" and upload_file_id and not attachment_persisted:
+            await _persist_bug_attachment(str((raw or {}).get("conversation_id") or ""))
 
         # 3) 提取 answer + 归一化
         answer = (raw or {}).get("answer") or ""
@@ -532,7 +536,7 @@ class DifyService:
 
         # 路由: chatflow / advanced-chat app 用 run_chatflow
         if (client.app_mode or "chatflow") == "chatflow":
-            return await self._run_chatflow(input_data, client, conversation_id)
+            return await self._run_chatflow(input_data, client, conversation_id, app=app)
 
         # 构造 workflow inputs
         inputs: Dict[str, Any] = {}

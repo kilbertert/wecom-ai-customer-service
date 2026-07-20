@@ -1,39 +1,36 @@
-"""Dify chatflow 调 wecom-ai 的二阶段 bug 反馈内部端点。
+"""Internal API owned by the relational Bug feedback service.
 
-由 Dify 工作流的 HTTP 请求节点调用 (N2 查表 / N9 读旧行)。后端持企微 corp_secret
-换取 access_token 查询智能表格 (webhook 不支持查询, 见决策点3)。
-
-鉴权: 来源 IP 白名单 ``BUGTRACK_ALLOWED_IPS`` (逗号分隔; 生产配 127.0.0.1,::1,<dify_server_ip>)。
-替代原 Bearer token (token 已从 Dify 侧移除)。未配置时仅记 warning 不强制 (开发期便利, 生产必配)。
-
-端点:
-    POST /internal/bugtrack/search    — N2 关键词查表, 返回命中行
-    GET  /internal/bugtrack/record/{record_id} — N9 读旧行
-    POST /internal/bugtrack/cache-image — H5 首轮截图跨轮缓存
-    POST /internal/bugtrack/add       — N16 新增记录 (写飞书主表), 返回 record_id
-    POST /internal/bugtrack/update    — N14 修改记录 (增量更新飞书主表)
-    GET  /internal/bugtrack/health    — 健康检查
+PostgreSQL is the source of truth for drafts, turns, state transitions and
+attachment ownership. Dify remains an intent/field extraction client during
+the compatibility migration; Feishu is the final synchronized view.
 """
+
+from __future__ import annotations
+
 import asyncio
-import hashlib
 import logging
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.core.config import settings
-from app.services.dify import (
-    _cache_put,
-    _conv_image_clear,
-    _conv_image_get,
-    _conv_image_put,
-    fetch_upload_bytes,
+from app.core.database import session_scope, verify_database
+from app.models.bugtrack_db import BugAttachment, BugOutbox
+from app.services.bugtrack_attachment_storage import attachment_storage
+from app.services.bugtrack_service import (
+    DraftIdentity,
+    bugtrack_service,
+    draft_to_dict,
+    fields_patch_from_feishu,
 )
+from app.services.dify import fetch_upload_bytes
 from app.services.feishu_bitable import (
-    FeishuBitableError,
     add_record as feishu_add_record,
+    get_record as feishu_get_record,
+    search_records as feishu_search_records,
     update_record as feishu_update_record,
     upload_attachment as feishu_upload_attachment,
 )
@@ -45,49 +42,78 @@ router = APIRouter(prefix="/internal/bugtrack", tags=["bugtrack-internal"])
 
 
 def _verify_access(request: Request) -> None:
-    """校验来源 IP 白名单 (替代 Bearer token; token 已从 Dify 侧移除)。
-
-    未配置 BUGTRACK_ALLOWED_IPS 时放行 (开发期便利, 生产必配)。
-    生产应配: ``127.0.0.1,::1,<dify_server_ip>``。
-    """
     raw = getattr(settings.bugtrack, "allowed_ips", "") or ""
     allowed = {ip.strip() for ip in raw.split(",") if ip.strip()}
     if not allowed:
         logger.warning(
-            "[bugtrack/internal] BUGTRACK_ALLOWED_IPS 未配置, 跳过鉴权 "
-            "(生产环境务必配置: 127.0.0.1,::1,<dify_server_ip>)"
+            "[bugtrack/internal] BUGTRACK_ALLOWED_IPS 未配置，生产环境必须配置"
         )
         return
     client_ip = (request.client.host if request.client else "") or ""
     if client_ip not in allowed:
-        logger.warning(
-            "[bugtrack/internal] 拒绝来源 IP: %s (allowed: %s)", client_ip, allowed
+        logger.warning("[bugtrack/internal] 拒绝来源 IP: %s", client_ip)
+        raise HTTPException(status_code=403, detail="ip not allowed")
+
+
+class DraftContext(BaseModel):
+    draft_id: str = ""
+    conversation_id: str = ""
+    session_id: str = ""
+    channel: str = "dify"
+    user_key: str = ""
+    source_text: str = ""
+    flow_state: str = ""
+    idempotency_key: str = ""
+
+    def identity(self) -> DraftIdentity:
+        return DraftIdentity(
+            channel=(self.channel or "dify").strip(),
+            user_key=(self.user_key or "").strip(),
+            session_id=(self.session_id or "").strip(),
+            conversation_id=(self.conversation_id or "").strip(),
         )
-        raise HTTPException(status_code=403, detail=f"ip not allowed: {client_ip}")
 
 
-class SearchRequest(BaseModel):
-    keyword: str = Field(..., description="客户反馈关键词 (建议 LLM 提取核心词)")
-    module: str = Field(default="", description="结构化模块名，用于模块字段补充召回")
-    op_desc: str = Field(default="", description="完整操作描述，用于候选相似度排序")
-    limit: int = Field(20, description="最多返回条数")
+class SearchRequest(DraftContext):
+    keyword: str = Field(default="", description="客户反馈查重关键词")
+    module: str = ""
+    op_desc: str = ""
+    environment: str = ""
+    issue_type: str = "bug"
+    limit: int = 20
+    force_new: bool = False
 
 
 @router.post("/search")
-async def search_bugtrack(
-    req: SearchRequest,
-    request: Request,
-):
-    """N2 查表: 关键词/模块多字段召回并按问题描述相似度排序。
+async def search_bugtrack(req: SearchRequest, request: Request):
+    """Persist the structured draft first, then query Feishu for duplicates."""
 
-    Body: ``{"keyword": "...", "module": "...", "op_desc": "...", "limit": 20}``
-    旧调用方只传 ``keyword`` 仍保持兼容。
-    Response: ``{"success": true, "hits": [{record_id, module, op_desc, summary}, ...]}``
-    """
     _verify_access(request)
+    patch = {
+        "module": req.module,
+        "operation_description": req.op_desc,
+        "environment": req.environment,
+        "issue_type": req.issue_type,
+        "search_keyword": req.keyword,
+    }
+    async with session_scope() as session:
+        draft = await bugtrack_service.ensure_draft(
+            session,
+            identity=req.identity(),
+            draft_id=req.draft_id,
+            force_new=req.force_new,
+            fields_patch=patch,
+            flow_state=req.flow_state or "searching",
+            source_text=req.source_text,
+            intent="SEARCH",
+            idempotency_key=req.idempotency_key,
+            event_type="search_requested",
+        )
+        draft_id = str(draft.id)
+
     if not settings.bugtrack.enabled:
         return JSONResponse(
-            content={"success": True, "hits": [], "enabled": False}
+            content={"success": True, "hits": [], "enabled": False, "draft_id": draft_id}
         )
 
     wechat_svc = WeChatService()
@@ -97,17 +123,26 @@ async def search_bugtrack(
             req.keyword,
             module=req.module,
             op_desc=req.op_desc,
-            limit=req.limit,
+            limit=max(1, min(req.limit, 100)),
         )
-        hits = [svc.record_to_summary(r) for r in records]
+        hits = [svc.record_to_summary(record) for record in records]
+        async with session_scope() as session:
+            draft = await bugtrack_service.get_draft(session, draft_id)
+            if draft is not None:
+                await bugtrack_service.record_search_result(session, draft, hits)
         return JSONResponse(
-            content={"success": True, "hits": hits, "count": len(hits)}
+            content={
+                "success": True,
+                "hits": hits,
+                "count": len(hits),
+                "draft_id": draft_id,
+            }
         )
-    except Exception as e:
-        logger.error("[bugtrack/internal/search] failed: %s", e, exc_info=True)
+    except Exception as exc:
+        logger.error("[bugtrack/search] failed: %s", exc, exc_info=True)
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": str(e), "hits": []},
+            content={"success": False, "error": str(exc), "hits": [], "draft_id": draft_id},
         )
     finally:
         await wechat_svc.close()
@@ -115,66 +150,52 @@ async def search_bugtrack(
 
 @router.get("/record/{record_id}")
 async def get_record(record_id: str, request: Request):
-    """N9 读旧行: 按 record_id 精确取单条, 返回内容快照供差异对比。
-
-    Response: ``{"success": true, "record": {record_id, module, op_desc, summary}}``
-    未找到: ``{"success": true, "record": null}``
-    """
     _verify_access(request)
     if not settings.bugtrack.enabled:
-        return JSONResponse(
-            content={"success": True, "record": None, "enabled": False}
-        )
-
+        return JSONResponse(content={"success": True, "record": None, "enabled": False})
     wechat_svc = WeChatService()
     try:
         svc = SmartSheetQueryService(wechat_svc)
         record = await svc.get_record(record_id)
-        if record is None:
-            return JSONResponse(
-                content={"success": True, "record": None}
-            )
         return JSONResponse(
-            content={"success": True, "record": svc.record_to_summary(record)}
+            content={
+                "success": True,
+                "record": svc.record_to_summary(record) if record is not None else None,
+            }
         )
-    except Exception as e:
-        logger.error(
-            "[bugtrack/internal/record/%s] failed: %s", record_id, e,
-            exc_info=True,
-        )
+    except Exception as exc:
+        logger.error("[bugtrack/record/%s] failed: %s", record_id, exc, exc_info=True)
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": str(e), "record": None},
+            content={"success": False, "error": str(exc), "record": None},
         )
     finally:
         await wechat_svc.close()
 
 
-class AddRecordRequest(BaseModel):
-    fields: Dict[str, Any] = Field(
-        ..., description="飞书字段名(中文标题)→值;单选字段传选项名字符串"
-    )
-    image_file_ids: List[str] = Field(
-        default_factory=list,
-        description="用户 bug 截图的 Dify upload_file_id 列表; 后端回取字节->"
-        "上传飞书附件字段 'Bug截图'。空则不附图。",
-    )
-    conversation_id: str = Field(
-        default="",
-        description="Dify 会话 id; image_file_ids 为空时, 后端按 conv_id 从跨轮"
-        "图片缓存回取本会话累积的截图 file_id (turn1 发图 turn2 写表场景)。",
-    )
+class AddRecordRequest(DraftContext):
+    fields: Dict[str, Any]
+    image_file_ids: List[str] = Field(default_factory=list)
 
 
-class UpdateRecordRequest(BaseModel):
-    record_id: str = Field(..., description="要修改的记录 id (来自 add 返回或 search)")
-    fields: Dict[str, Any] = Field(..., description="要增量更新的字段(未传保持不变)")
+class UpdateRecordRequest(DraftContext):
+    record_id: str
+    fields: Dict[str, Any]
+
+
+class TransitionRequest(DraftContext):
+    event_type: str
+    next_state: str = ""
+    status: str = ""
+    intent: str = ""
+    force_new: bool = False
+    fields: Dict[str, Any] = Field(default_factory=dict)
 
 
 _MAX_CACHED_IMAGE_BYTES = 10 * 1024 * 1024
 
 
-def _image_mime(content: bytes) -> str:
+def _file_mime(content: bytes) -> str:
     if content[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if content[:3] == b"\xff\xd8\xff":
@@ -183,174 +204,449 @@ def _image_mime(content: bytes) -> str:
         return "image/gif"
     if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
         return "image/webp"
+    if content[:5] == b"%PDF-":
+        return "application/pdf"
     return ""
 
 
 @router.post("/cache-image")
 async def cache_bug_image(
     request: Request,
-    conversation_id: str = Form(...),
+    conversation_id: str = Form(""),
+    draft_id: str = Form(""),
+    session_id: str = Form(""),
+    channel: str = Form("h5"),
+    user_key: str = Form(""),
+    source_file_id: str = Form(""),
     image: UploadFile = File(...),
 ):
-    """缓存 H5 首轮原图，确认写表时按 Dify B conversation_id 回取。"""
+    """Persist an attachment and bind it to the current concrete draft."""
+
     _verify_access(request)
-    conv_id = (conversation_id or "").strip()
-    if not conv_id:
+    if not (conversation_id or draft_id or session_id):
         return JSONResponse(
             status_code=400,
-            content={"success": False, "error": "conversation_id required"},
+            content={"success": False, "error": "draft or conversation identity required"},
         )
     content = await image.read(_MAX_CACHED_IMAGE_BYTES + 1)
     if not content:
-        return JSONResponse(
-            status_code=400,
-            content={"success": False, "error": "empty image"},
-        )
+        return JSONResponse(status_code=400, content={"success": False, "error": "empty file"})
     if len(content) > _MAX_CACHED_IMAGE_BYTES:
         return JSONResponse(
-            status_code=413,
-            content={"success": False, "error": "image exceeds 10MB"},
+            status_code=413, content={"success": False, "error": "file exceeds 10MB"}
         )
-    content_type = _image_mime(content)
-    if not content_type:
+    mime_type = _file_mime(content)
+    if not mime_type:
         return JSONResponse(
             status_code=400,
-            content={"success": False, "error": "unsupported image format"},
+            content={"success": False, "error": "unsupported image/document format"},
         )
 
-    cache_id = "h5-" + hashlib.sha256(content).hexdigest()
-    _cache_put(
-        cache_id,
-        content,
-        image.filename or "bug-screenshot.jpg",
-        content_type,
+    identity = DraftIdentity(
+        channel=channel or "h5",
+        user_key=user_key,
+        session_id=session_id,
+        conversation_id=conversation_id,
     )
-    _conv_image_put(conv_id, cache_id)
+    async with session_scope() as session:
+        draft = await bugtrack_service.ensure_draft(
+            session,
+            identity=identity,
+            draft_id=draft_id,
+            event_type="attachment_context_resolved",
+        )
+        attachment = await bugtrack_service.add_attachment(
+            session,
+            draft=draft,
+            content=content,
+            original_name=image.filename or "bug-screenshot",
+            mime_type=mime_type,
+            source_file_id=source_file_id,
+        )
+        response = {
+            "success": True,
+            "draft_id": str(draft.id),
+            "attachment_id": str(attachment.id),
+            "sha256": attachment.sha256,
+        }
     logger.info(
-        "[bugtrack/internal/cache-image] 已缓存 conv=%s image=%s size=%dB",
-        conv_id[:8], cache_id[:12], len(content),
+        "[bugtrack/cache-image] draft=%s attachment=%s size=%dB",
+        response["draft_id"][:8],
+        response["attachment_id"][:8],
+        len(content),
     )
-    return JSONResponse(content={"success": True})
+    return JSONResponse(content=response)
+
+
+async def _import_legacy_file_ids(
+    *, draft_id: str, identity: DraftIdentity, file_ids: list[str]
+) -> None:
+    for file_id in [item.strip() for item in file_ids if item and item.strip()]:
+        got = await fetch_upload_bytes(file_id)
+        if not got:
+            raise RuntimeError(f"attachment {file_id[:12]} unavailable")
+        content, filename, content_type = got
+        mime_type = _file_mime(content) or content_type or "application/octet-stream"
+        async with session_scope() as session:
+            draft = await bugtrack_service.ensure_draft(
+                session,
+                identity=identity,
+                draft_id=draft_id,
+                event_type="legacy_attachment_imported",
+            )
+            await bugtrack_service.add_attachment(
+                session,
+                draft=draft,
+                content=content,
+                original_name=filename,
+                mime_type=mime_type,
+                source_file_id=file_id,
+            )
+
+
+async def _upload_draft_attachments(draft_id: str) -> list[dict[str, str]]:
+    async with session_scope() as session:
+        draft = await bugtrack_service.get_draft(session, draft_id)
+        if draft is None:
+            raise RuntimeError("draft not found")
+        attachments = await bugtrack_service.staged_attachments(session, draft.id)
+
+    tokens: list[dict[str, str]] = []
+    for attachment in attachments:
+        if attachment.feishu_file_token:
+            tokens.append({"file_token": attachment.feishu_file_token})
+            continue
+        try:
+            content = await asyncio.to_thread(attachment_storage.read, attachment.storage_key)
+            token = await asyncio.to_thread(
+                feishu_upload_attachment,
+                content,
+                attachment.original_name,
+                attachment.mime_type,
+            )
+        except Exception as exc:
+            async with session_scope() as session:
+                current = await session.get(BugAttachment, attachment.id)
+                if current is not None:
+                    current.status = "failed"
+                    current.last_error = str(exc)[:2000]
+            raise
+        async with session_scope() as session:
+            current = await session.get(BugAttachment, attachment.id)
+            if current is not None:
+                current.feishu_file_token = token
+                current.status = "synced"
+                current.last_error = ""
+        tokens.append({"file_token": token})
+    return tokens
+
+
+async def _find_existing_record_for_draft(draft_id: str) -> str:
+    records = await asyncio.to_thread(
+        feishu_search_records, draft_id, "业务草稿ID", 2
+    )
+    if not records:
+        return ""
+    first = records[0]
+    return str(first.get("record_id") or first.get("id") or "")
 
 
 @router.post("/add")
-async def add_record_endpoint(
-    req: AddRecordRequest,
-    request: Request,
-):
-    """N16 新增记录: 写飞书主表, 返回新 record_id (存 cv_record_id)。
-
-    Body: ``{"fields": {"模块/功能点": "...", "操作描述": "...", "类型": "bug", ...}}``
-    Response: ``{"success": true, "record_id": "recXXXX"}``
-    """
+async def add_record_endpoint(req: AddRecordRequest, request: Request):
     _verify_access(request)
     if not settings.bugtrack.enabled:
         return JSONResponse(
             content={"success": False, "error": "bugtrack disabled", "record_id": ""}
         )
-    try:
-        # 不可变拷贝, 不就地改入参 (coding-style)
-        fields = dict(req.fields)
-        # 解析要附的图片 file_id: 优先显式 image_file_ids, 否则按 conversation_id
-        # 从跨轮图片缓存回取 (turn1 发图 turn2 写表场景)
-        img_ids: List[str] = [i for i in req.image_file_ids if (i or "").strip()]
-        used_conv_cache = False
-        if not img_ids and req.conversation_id:
-            img_ids = _conv_image_get(req.conversation_id)
-            used_conv_cache = bool(img_ids)
-        # 用户 bug 截图 -> 飞书附件字段 "Bug截图" (type=17)
-        # 单张失败只记 warning 跳过, 不阻断主表写入
-        if img_ids:
-            tokens: List[Dict[str, str]] = []
-            for fid in img_ids:
-                fid = (fid or "").strip()
-                if not fid:
-                    continue
-                try:
-                    got = await fetch_upload_bytes(fid)
-                    if not got:
-                        logger.warning(
-                            "[bugtrack/internal/add] 截图 %s 取字节失败,跳过", fid
-                        )
-                        continue
-                    img_bytes, fname, ctype = got
-                    tok = await asyncio.to_thread(
-                        feishu_upload_attachment, img_bytes, fname, ctype
-                    )
-                    tokens.append({"file_token": tok})
-                except Exception as ie:
-                    logger.warning(
-                        "[bugtrack/internal/add] 截图 %s 入飞书失败,跳过: %s", fid, ie
-                    )
-                    continue
-            if tokens:
-                fields["Bug截图"] = tokens
-                logger.info("[bugtrack/internal/add] 附图 %d 张", len(tokens))
-        record_id = await asyncio.to_thread(feishu_add_record, fields)
-        # 写表成功后清空会话图片缓存, 防同会话下个 bug 复用旧图
-        if used_conv_cache:
-            _conv_image_clear(req.conversation_id)
-        return JSONResponse(content={"success": True, "record_id": record_id})
-    except FeishuBitableError as e:
-        logger.error("[bugtrack/internal/add] failed: %s", e, exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e), "record_id": ""},
+
+    identity = req.identity()
+    async with session_scope() as session:
+        draft = await bugtrack_service.ensure_draft(
+            session,
+            identity=identity,
+            draft_id=req.draft_id,
+            fields_patch=fields_patch_from_feishu(req.fields),
+            flow_state=req.flow_state or "submitting",
+            source_text=req.source_text,
+            intent="CONFIRM_NEW",
+            idempotency_key=req.idempotency_key,
+            event_type="submission_requested",
         )
-    except Exception as e:
-        logger.error("[bugtrack/internal/add] unexpected: %s", e, exc_info=True)
+        draft_id = str(draft.id)
+        if draft.feishu_record_id:
+            return JSONResponse(
+                content={
+                    "success": True,
+                    "record_id": draft.feishu_record_id,
+                    "draft_id": draft_id,
+                    "idempotent": True,
+                }
+            )
+        await bugtrack_service.prepare_outbox(
+            session, draft=draft, operation="add", payload={"fields": dict(req.fields)}
+        )
+
+    try:
+        if req.image_file_ids:
+            await _import_legacy_file_ids(
+                draft_id=draft_id, identity=identity, file_ids=req.image_file_ids
+            )
+        tokens = await _upload_draft_attachments(draft_id)
+        fields = dict(req.fields)
+        fields["业务草稿ID"] = draft_id
+        if tokens:
+            fields["Bug截图"] = tokens
+
+        record_id = await _find_existing_record_for_draft(draft_id)
+        if record_id:
+            await asyncio.to_thread(feishu_update_record, record_id, fields)
+            idempotent = True
+        else:
+            record_id = await asyncio.to_thread(feishu_add_record, fields)
+            idempotent = False
+
+        async with session_scope() as session:
+            draft = await bugtrack_service.get_draft(session, draft_id)
+            if draft is None:
+                raise RuntimeError("draft disappeared after Feishu write")
+            draft.feishu_record_id = record_id
+            draft.status = "submitted"
+            draft.flow_state = "await_modify_window"
+            from app.models.bugtrack_db import utcnow
+
+            draft.submitted_at = utcnow()
+            await bugtrack_service.transition(
+                session,
+                draft,
+                event_type="submission_succeeded",
+                flow_state="await_modify_window",
+                status="submitted",
+                data={"record_id": record_id, "attachment_count": len(tokens)},
+            )
+            outbox = (
+                await session.execute(
+                    select(BugOutbox).where(BugOutbox.idempotency_key == f"add:{draft.id}")
+                )
+            ).scalar_one()
+            await bugtrack_service.complete_outbox(session, outbox=outbox, success=True)
         return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e), "record_id": ""},
+            content={
+                "success": True,
+                "record_id": record_id,
+                "draft_id": draft_id,
+                "attachment_count": len(tokens),
+                "idempotent": idempotent,
+            }
+        )
+    except Exception as exc:
+        logger.error("[bugtrack/add] failed draft=%s: %s", draft_id, exc, exc_info=True)
+        async with session_scope() as session:
+            outbox = (
+                await session.execute(
+                    select(BugOutbox).where(BugOutbox.idempotency_key == f"add:{draft_id}")
+                )
+            ).scalar_one_or_none()
+            if outbox is not None:
+                await bugtrack_service.complete_outbox(
+                    session, outbox=outbox, success=False, error=str(exc)
+                )
+        return JSONResponse(
+            status_code=502,
+            content={"success": False, "error": str(exc), "record_id": "", "draft_id": draft_id},
         )
 
 
 @router.post("/update")
-async def update_record_endpoint(
-    req: UpdateRecordRequest,
-    request: Request,
-):
-    """N14 修改记录: 增量更新飞书主表 (只改传入字段)。
-
-    Body: ``{"record_id": "recXXXX", "fields": {"操作描述": "..."}}``
-    Response: ``{"success": true}``
-    """
+async def update_record_endpoint(req: UpdateRecordRequest, request: Request):
     _verify_access(request)
     if not settings.bugtrack.enabled:
         return JSONResponse(content={"success": False, "error": "bugtrack disabled"})
-    if not req.record_id:
-        return JSONResponse(
-            status_code=400,
-            content={"success": False, "error": "record_id required"},
+
+    identity = req.identity()
+    async with session_scope() as session:
+        draft = await bugtrack_service.ensure_draft(
+            session,
+            identity=identity,
+            draft_id=req.draft_id,
+            fields_patch=fields_patch_from_feishu(req.fields),
+            flow_state=req.flow_state or "submitting_update",
+            source_text=req.source_text,
+            intent="CONFIRM_MODIFY",
+            idempotency_key=req.idempotency_key,
+            event_type="update_requested",
         )
+        draft_id = str(draft.id)
+        draft.feishu_record_id = req.record_id
+        await bugtrack_service.prepare_outbox(
+            session,
+            draft=draft,
+            operation="update",
+            payload={"record_id": req.record_id, "fields": dict(req.fields)},
+        )
+
     try:
-        await asyncio.to_thread(feishu_update_record, req.record_id, req.fields)
-        return JSONResponse(content={"success": True})
-    except FeishuBitableError as e:
-        logger.error("[bugtrack/internal/update] failed: %s", e, exc_info=True)
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
-    except Exception as e:
-        logger.error("[bugtrack/internal/update] unexpected: %s", e, exc_info=True)
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+        tokens = await _upload_draft_attachments(draft_id)
+        fields = dict(req.fields)
+        fields["业务草稿ID"] = draft_id
+        if tokens:
+            old = await asyncio.to_thread(feishu_get_record, req.record_id)
+            existing = ((old or {}).get("fields") or {}).get("Bug截图") or []
+            existing_tokens = [item for item in existing if isinstance(item, dict)]
+            seen = {str(item.get("file_token") or "") for item in existing_tokens}
+            fields["Bug截图"] = existing_tokens + [
+                item for item in tokens if item["file_token"] not in seen
+            ]
+        await asyncio.to_thread(feishu_update_record, req.record_id, fields)
+        async with session_scope() as session:
+            draft = await bugtrack_service.get_draft(session, draft_id)
+            if draft is not None:
+                draft.feishu_record_id = req.record_id
+                draft.status = "submitted"
+                await bugtrack_service.transition(
+                    session,
+                    draft,
+                    event_type="update_succeeded",
+                    flow_state="await_modify_window",
+                    status="submitted",
+                    data={"record_id": req.record_id},
+                )
+            outbox = (
+                await session.execute(
+                    select(BugOutbox).where(
+                        BugOutbox.idempotency_key == f"update:{draft_id}"
+                    )
+                )
+            ).scalar_one()
+            await bugtrack_service.complete_outbox(session, outbox=outbox, success=True)
+        return JSONResponse(content={"success": True, "draft_id": draft_id})
+    except Exception as exc:
+        logger.error("[bugtrack/update] failed draft=%s: %s", draft_id, exc, exc_info=True)
+        async with session_scope() as session:
+            outbox = (
+                await session.execute(
+                    select(BugOutbox).where(
+                        BugOutbox.idempotency_key == f"update:{draft_id}"
+                    )
+                )
+            ).scalar_one_or_none()
+            if outbox is not None:
+                await bugtrack_service.complete_outbox(
+                    session, outbox=outbox, success=False, error=str(exc)
+                )
+        return JSONResponse(
+            status_code=502,
+            content={"success": False, "error": str(exc), "draft_id": draft_id},
+        )
+
+
+@router.post("/transition")
+async def transition_draft(req: TransitionRequest, request: Request):
+    _verify_access(request)
+    patch = fields_patch_from_feishu(req.fields)
+    async with session_scope() as session:
+        draft = await bugtrack_service.ensure_draft(
+            session,
+            identity=req.identity(),
+            draft_id=req.draft_id,
+            force_new=req.force_new,
+            fields_patch=patch,
+            source_text=req.source_text,
+            intent=req.intent,
+            idempotency_key=req.idempotency_key,
+            event_type=req.event_type,
+        )
+        await bugtrack_service.transition(
+            session,
+            draft,
+            event_type=req.event_type,
+            flow_state=req.next_state or draft.flow_state,
+            status=req.status,
+            actor="dify",
+        )
+        body = draft_to_dict(draft)
+    return JSONResponse(content={"success": True, **body})
+
+
+@router.get("/draft/{draft_id}")
+async def get_draft(draft_id: str, request: Request):
+    _verify_access(request)
+    async with session_scope() as session:
+        draft = await bugtrack_service.get_draft(
+            session, draft_id, include_attachments=True
+        )
+        if draft is None:
+            return JSONResponse(status_code=404, content={"success": False, "error": "not found"})
+        body = draft_to_dict(draft, include_attachments=True)
+    return JSONResponse(content={"success": True, "draft": body})
+
+
+class RouteSessionRequest(BaseModel):
+    active: str = "A"
+    conv_a: str = ""
+    conv_b: str = ""
+    route_data: Dict[str, Any] = Field(default_factory=dict)
+
+
+@router.get("/route-session/{channel}/{session_id}")
+async def get_route_session(channel: str, session_id: str, request: Request):
+    _verify_access(request)
+    async with session_scope() as session:
+        route = await bugtrack_service.get_route_session(
+            session, channel=channel, session_id=session_id
+        )
+        if route is None:
+            return JSONResponse(content={"success": True, "route": None})
+        body = {
+            "active": route.active_app,
+            "conv_a": route.conv_a,
+            "conv_b": route.conv_b,
+            **(route.route_data or {}),
+        }
+    return JSONResponse(content={"success": True, "route": body})
+
+
+@router.put("/route-session/{channel}/{session_id}")
+async def put_route_session(
+    channel: str,
+    session_id: str,
+    req: RouteSessionRequest,
+    request: Request,
+):
+    _verify_access(request)
+    async with session_scope() as session:
+        route = await bugtrack_service.put_route_session(
+            session,
+            channel=channel,
+            session_id=session_id,
+            active_app=req.active,
+            conv_a=req.conv_a,
+            conv_b=req.conv_b,
+            route_data=req.route_data,
+        )
+    return JSONResponse(content={"success": True, "version": route.version})
 
 
 @router.get("/health")
-async def health():
+async def bugtrack_health(request: Request):
+    _verify_access(request)
+    database_ok = True
+    database_error = ""
+    try:
+        await verify_database()
+    except Exception as exc:
+        database_ok = False
+        database_error = str(exc)[:200]
     return {
-        "status": "ok",
+        "ok": bool(settings.bugtrack.enabled and database_ok),
         "bugtrack_enabled": settings.bugtrack.enabled,
+        "database_ok": database_ok,
+        "database_error": database_error,
+        "attachment_root_set": bool(settings.bugtrack.attachment_root),
         "feishu_configured": bool(
             settings.bugtrack.feishu_app_id
             and settings.bugtrack.feishu_app_secret
             and settings.bugtrack.feishu_app_token
             and settings.bugtrack.feishu_table_id
         ),
-        "feishu_app_id_set": bool(settings.bugtrack.feishu_app_id),
-        "feishu_app_token_set": bool(settings.bugtrack.feishu_app_token),
-        "feishu_table_id_set": bool(settings.bugtrack.feishu_table_id),
-        "internal_token_set": bool(settings.bugtrack.internal_token),
         "allowed_ips_set": bool(settings.bugtrack.allowed_ips),
     }
-
-
-__all__ = ["router"]

@@ -8,6 +8,12 @@ pydantic-settings>=2.3,<3
 httpx==0.28.0
 aiofiles>=24.1.0
 
+# Bug 反馈关系型事实源 (PostgreSQL 生产 / SQLite 测试)
+SQLAlchemy>=2.0,<3
+asyncpg>=0.29,<1
+aiosqlite>=0.20,<1
+alembic>=1.13,<2
+
 # 加密和安全
 cryptography==41.0.7
 python-multipart==0.0.6

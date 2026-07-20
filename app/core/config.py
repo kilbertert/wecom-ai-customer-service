@@ -72,9 +72,13 @@ class RedisSettings(BaseSettings):
 class DatabaseSettings(BaseSettings):
     """数据库配置"""
 
-    url: str = Field("sqlite:///./wecom.db", description="数据库URL")
+    url: str = Field(
+        "sqlite+aiosqlite:///./wecom.db",
+        description="异步数据库URL；生产使用 postgresql+asyncpg://",
+    )
     pool_size: int = Field(10, description="连接池大小")
     max_overflow: int = Field(20, description="最大溢出连接数")
+    echo: bool = Field(False, description="是否输出 SQL 日志")
 
     class Config:
         env_prefix = "DATABASE_"
@@ -142,6 +146,16 @@ class BugtrackSettings(BaseSettings):
 
     # 超时窗口 (秒)
     timeout_seconds: int = Field(1800, description="待确认超时窗口 (秒, 默认30分钟)")
+
+    # 关系型草稿/附件事实源。图片二进制不进数据库，只保存到持久目录；数据库保存归属和元数据。
+    attachment_root: str = Field(
+        "./data/bugtrack/attachments",
+        description="Bug 附件持久化根目录",
+    )
+    route_session_ttl: int = Field(
+        1800,
+        description="H5 A/B 路由会话持久化 TTL（秒）",
+    )
 
     class Config:
         env_prefix = "BUGTRACK_"

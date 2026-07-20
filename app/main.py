@@ -28,6 +28,7 @@ from app.services.pending_timer_store import create_pending_timer_store
 from app.services.dedup_store import create_dedup_store
 from app.services.message_queue import create_message_queue
 from app.services.message_processor import MessageProcessor
+from app.core.database import close_database, verify_database
 
 # 配置标准日志
 logging.basicConfig(
@@ -80,6 +81,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if app.state.message_queue is not None:
         await app.state.message_queue.start()
 
+    if settings.bugtrack.enabled:
+        await verify_database()
+        logger.info("Bugtrack relational database connection verified")
+
     yield
 
     # 清理资源: 先停队列 (in-flight 回灌 main), 再关服务连接
@@ -94,6 +99,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         await app.state.wechat_service.close()
         await app.state.ai_service.close()
+        await close_database()
     except Exception as e:
         logger.error("Error during shutdown: %s", e, exc_info=True)
 
