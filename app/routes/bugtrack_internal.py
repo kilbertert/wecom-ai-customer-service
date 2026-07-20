@@ -64,6 +64,8 @@ def _verify_access(request: Request) -> None:
 
 class SearchRequest(BaseModel):
     keyword: str = Field(..., description="客户反馈关键词 (建议 LLM 提取核心词)")
+    module: str = Field(default="", description="结构化模块名，用于模块字段补充召回")
+    op_desc: str = Field(default="", description="完整操作描述，用于候选相似度排序")
     limit: int = Field(20, description="最多返回条数")
 
 
@@ -72,9 +74,10 @@ async def search_bugtrack(
     req: SearchRequest,
     request: Request,
 ):
-    """N2 查表: 关键词在主表 (操作描述) 字段 CONTAINS 匹配, 返回命中行。
+    """N2 查表: 关键词/模块多字段召回并按问题描述相似度排序。
 
-    Body: ``{"keyword": "...", "limit": 20}``
+    Body: ``{"keyword": "...", "module": "...", "op_desc": "...", "limit": 20}``
+    旧调用方只传 ``keyword`` 仍保持兼容。
     Response: ``{"success": true, "hits": [{record_id, module, op_desc, summary}, ...]}``
     """
     _verify_access(request)
@@ -86,7 +89,12 @@ async def search_bugtrack(
     wechat_svc = WeChatService()
     try:
         svc = SmartSheetQueryService(wechat_svc)
-        records = await svc.search_by_keyword(req.keyword, limit=req.limit)
+        records = await svc.search_by_feedback(
+            req.keyword,
+            module=req.module,
+            op_desc=req.op_desc,
+            limit=req.limit,
+        )
         hits = [svc.record_to_summary(r) for r in records]
         return JSONResponse(
             content={"success": True, "hits": hits, "count": len(hits)}
