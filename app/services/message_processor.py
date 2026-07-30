@@ -33,6 +33,7 @@ from app.services.bot_trace import (
 )
 from app.services.conversation_store import ConversationStore
 from app.services.charge_reply_policy import ChargeReplyPolicy, get_charge_reply_policy
+from app.services.customer_intent import classify_customer_intent
 from app.services.bug_assistant_message_service import (
     BugAssistantMessageResult,
     BugAssistantMessageService,
@@ -181,27 +182,119 @@ class MessageProcessor:
                     done_flag[0] = True
                     return
 
+                data = prepared.input_data or {}
+                language = str(data.get("language") or "")
+                text = str(data.get("text") or "")
+                has_image = isinstance(data.get("file_image_bytes"), bytes)
+                intent = classify_customer_intent(
+                    self._reply_policy,
+                    text=text,
+                    language=language,
+                    has_attachments=has_image,
+                )
                 policy_reply = None
                 if not bool(state.get("bug_v2_active")):
-                    data = prepared.input_data or {}
                     policy_reply = self._reply_policy.evaluate(
-                        text=str(data.get("text") or ""),
-                        language=str(data.get("language") or ""),
+                        text=text,
+                        language=language,
                         active_app="A",
-                        has_attachments=isinstance(data.get("file_image_bytes"), bytes),
+                        has_attachments=has_image,
                         vague_count=max(0, int(state.get("vague_count") or 0)),
                         vague_exhausted=bool(state.get("vague_exhausted")),
                     )
 
                 v2_result = None
-                should_run_v2 = self._should_start_bug_v2(prepared, state)
+                handled_read_only = False
+                if bool(state.get("bug_v2_active")) and intent.intent == "bug_progress":
+                    handled_read_only = True
+                    if self._bug_status is None:
+                        reply_text = "暂时无法查询问题进度，请稍后重试。"
+                        progress_items = []
+                    else:
+                        progress_items = await self._bug_status.progress_for_subscriber(
+                            channel="wecom_bot" if inbound.protocol == "bot" else "wecom_kf",
+                            user_key=inbound.user_id,
+                            session_id=f"{inbound.user_id}:{scope}",
+                        )
+                        if progress_items:
+                            lines = []
+                            for item in progress_items:
+                                progress = dict(item.get("progress") or {})
+                                title = str(item.get("title") or item.get("external_record_id") or "问题反馈")
+                                parts = [str(value) for value in (progress.get("status"), progress.get("reply"), progress.get("result")) if value]
+                                lines.append(f"{title}：{'；'.join(parts) or '暂未同步到最新进度'}")
+                            reply_text = "\n".join(lines)
+                        else:
+                            reply_text = "暂未找到你订阅的问题进度。草稿仍已保留，可继续补充反馈。"
+                    final_wf = {
+                        "assistant_text": reply_text,
+                        "intent": intent.to_dict(),
+                        "actions": [
+                            {"id": "bug.suspend", "label": "先查询解决方法", "style": "secondary"},
+                        ],
+                    }
+                # A verified knowledge question pauses an unfinished Bug draft.
+                # The subsequent RAG call has no authority to mutate the draft.
+                if (
+                    bool(state.get("bug_v2_active"))
+                    and intent.intent == "qa"
+                    and intent.confidence >= 0.9
+                    and not has_image
+                ):
+                    if self._bug_assistant is None:
+                        reply_text = "问题反馈仍在进行中，暂时无法安全暂停，请稍后重试。"
+                        final_wf = {"assistant_text": reply_text}
+                        await self._conv.save_state(inbound.user_id, scope, state)
+                        policy_reply = None
+                    else:
+                        try:
+                            await self._run_bug_v2(
+                                inbound, prepared, scope, event="SUSPEND"
+                            )
+                        except Exception as exc:
+                            logger.error("[PROC] Bug v2 suspend failed msgid=%s: %s", msgid, exc)
+                            reply_text = "问题反馈仍在进行中，暂时无法安全暂停，请稍后重试。"
+                            final_wf = {"assistant_text": reply_text}
+                            await self._conv.save_state(inbound.user_id, scope, state)
+                        else:
+                            state["bug_v2_active"] = False
+                            state["bug_v2_suspended"] = True
+                            policy_reply = self._reply_policy.evaluate(
+                                text=text,
+                                language=language,
+                                active_app="A",
+                                has_attachments=has_image,
+                                vague_count=max(0, int(state.get("vague_count") or 0)),
+                                vague_exhausted=bool(state.get("vague_exhausted")),
+                            )
+                should_run_v2 = not handled_read_only and self._should_start_bug_v2(prepared, state)
+                resume_requested = self._is_resume_request(text)
+                cancel_requested = self._is_cancel_request(text)
+                qa_switch_requested = self._is_qa_switch_request(text)
+                blocked_new_bug = (
+                    bool(state.get("bug_v2_suspended"))
+                    and not resume_requested
+                    and not cancel_requested
+                    and intent.intent == "bug_report"
+                )
+                if blocked_new_bug:
+                    should_run_v2 = False
+                if bool(state.get("bug_v2_suspended")) and (resume_requested or cancel_requested):
+                    should_run_v2 = True
                 if (
                     policy_reply is None
                     and self._bug_assistant is not None
                     and should_run_v2
                 ):
                     try:
-                        v2_result = await self._run_bug_v2(inbound, prepared, scope)
+                        event = (
+                            "RESUME" if resume_requested else "CANCEL" if cancel_requested else ""
+                        )
+                        if qa_switch_requested:
+                            event = "SUSPEND"
+                        v2_result = await self._run_bug_v2(
+                            inbound, prepared, scope, event=event
+                        )
                     except Exception as exc:
                         logger.error(
                             "[PROC] Bug v2 failed msgid=%s: %s",
@@ -220,10 +313,22 @@ class MessageProcessor:
                             state="fallback_disabled",
                         )
                     state["bug_v2_active"] = bool(v2_result.continue_session)
+                    state["bug_v2_suspended"] = v2_result.state == "suspended"
                     state["active"] = "A"
                     state["vague_count"] = 0
                     state["vague_exhausted"] = False
-                elif policy_reply is None and should_run_v2:
+
+                if blocked_new_bug and policy_reply is None and v2_result is None:
+                    reply_text = "你有一份已暂停的问题反馈。请回复“继续反馈”继续原草稿，或回复“取消反馈”后再提交新问题。"
+                    final_wf = {
+                        "assistant_text": reply_text,
+                        "intent": intent.to_dict(),
+                        "actions": [
+                            {"id": "bug.resume", "label": "继续反馈", "style": "primary"},
+                            {"id": "bug.cancel", "label": "取消反馈", "style": "secondary"},
+                        ],
+                    }
+                elif policy_reply is None and should_run_v2 and v2_result is None:
                     v2_result = BugAssistantMessageResult(
                         assistant_text=("已识别为问题反馈，但 Bug 提交服务暂时不可用，" "本次消息尚未处理，请稍后重试。"),
                         state="retry_required",
@@ -257,7 +362,9 @@ class MessageProcessor:
                         trace.event("context", "ok", "首次会话, 新建多轮")
 
                 # 5) Bug v2 或 A FAQ 二选一；不再存在 B 改投和 marker 循环。
-                if policy_reply is not None:
+                if handled_read_only or (reply_text and isinstance(final_wf, dict) and final_wf.get("intent")):
+                    await self._conv.save_state(inbound.user_id, scope, state)
+                elif policy_reply is not None:
                     reply_text = policy_reply.text
                     final_wf = {
                         "assistant_text": reply_text,
@@ -275,10 +382,14 @@ class MessageProcessor:
                     await self._conv.save_state(inbound.user_id, scope, state)
                 elif v2_result is not None:
                     reply_text = v2_result.assistant_text
+                    if v2_result.actions:
+                        reply_text = self._append_text_actions(reply_text, v2_result.actions)
                     final_wf = {
                         "assistant_text": reply_text,
                         "conversation_id": "",
                         "bug_v2": v2_result.to_dict(),
+                        "intent": v2_result.intent or {"intent": "bug_report", "confidence": 1.0, "entities": {}},
+                        "actions": v2_result.actions,
                     }
                     await self._conv.save_state(inbound.user_id, scope, state)
                 else:
@@ -321,6 +432,14 @@ class MessageProcessor:
                         if new_conv:
                             state["conv_a"] = new_conv
                         final_wf = wf
+                        if isinstance(final_wf, dict):
+                            final_wf["intent"] = intent.to_dict()
+                            if state.get("bug_v2_suspended"):
+                                final_wf["actions"] = [
+                                    {"id": "bug.resume", "label": "继续反馈", "style": "primary"},
+                                    {"id": "bug.cancel", "label": "取消反馈", "style": "secondary"},
+                                ]
+                                reply_text = self._append_text_actions(reply_text, final_wf["actions"])
                         await self._conv.save_state(inbound.user_id, scope, state)
 
                 # 意图门控未覆盖的表达可能让 Dify A 返回历史 Bug 标记。
@@ -527,14 +646,20 @@ class MessageProcessor:
         inbound: InboundMessage,
         prepared: PreparedInput,
         scope: str,
+        event: str = "",
     ):
         if self._bug_assistant is None:
             raise RuntimeError("Bug v2 service is not configured")
         input_data = dict(prepared.input_data or {})
         text = str(input_data.get("text") or "").strip()
+        normalized_event = (event or "").strip().upper()
+        if normalized_event in {"SUSPEND", "RESUME", "CANCEL"}:
+            text = ""
         if text in {"[image]", "[图片]"}:
             text = ""
         image_bytes = input_data.get("file_image_bytes")
+        if normalized_event in {"SUSPEND", "RESUME", "CANCEL"}:
+            image_bytes = None
         image_name = str(input_data.get("file_image_name") or "")
         return await self._bug_assistant.process(
             channel="wecom_bot" if inbound.protocol == "bot" else "wecom_kf",
@@ -546,7 +671,34 @@ class MessageProcessor:
             image_bytes=image_bytes if isinstance(image_bytes, bytes) else None,
             image_name=image_name,
             image_mime=self._image_mime(image_bytes, image_name),
+            event=event,
         )
+
+    @staticmethod
+    def _is_resume_request(text: str) -> bool:
+        return "".join((text or "").strip().lower().split()) in {
+            "继续反馈", "恢复反馈", "继续提交", "resume"
+        }
+
+    @staticmethod
+    def _is_cancel_request(text: str) -> bool:
+        return "".join((text or "").strip().lower().split()) in {
+            "取消反馈", "取消", "不报了", "放弃"
+        }
+
+    @staticmethod
+    def _is_qa_switch_request(text: str) -> bool:
+        return "".join((text or "").strip().lower().split()) in {
+            "先查询解决方法", "查询解决方法", "先查解决方法", "转知识库", "问一下怎么解决"
+        }
+
+    @staticmethod
+    def _append_text_actions(text: str, actions: list[dict[str, str]]) -> str:
+        labels = [str(item.get("label") or "").strip() for item in actions]
+        labels = [label for label in labels if label]
+        if not labels:
+            return text
+        return f"{text}\n可回复：{' / '.join(labels)}"
 
     @staticmethod
     def _image_mime(content: Any, filename: str) -> str:

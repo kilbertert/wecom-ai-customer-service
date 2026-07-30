@@ -64,6 +64,7 @@ class ConversationStore(ABC):
         normalized["conv_a"] = str(normalized.get("conv_a") or "")
         normalized["conv_b"] = ""
         normalized["bug_v2_active"] = bool(normalized.get("bug_v2_active"))
+        normalized["bug_v2_suspended"] = bool(normalized.get("bug_v2_suspended"))
         return normalized
 
 
@@ -88,6 +89,7 @@ class InMemoryConversationStore(ConversationStore):
             "conv_a": "",
             "conv_b": "",
             "bug_v2_active": False,
+            "bug_v2_suspended": False,
         }
 
     @staticmethod
@@ -134,6 +136,7 @@ class RedisConversationStore(ConversationStore):
             "conv_a": "",
             "conv_b": "",
             "bug_v2_active": False,
+            "bug_v2_suspended": False,
         }
 
     async def get_state(self, user_id: str, scope: str) -> Dict[str, Any]:

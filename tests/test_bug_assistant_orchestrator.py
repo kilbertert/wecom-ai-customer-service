@@ -439,3 +439,37 @@ async def test_explicit_unknown_draft_id_never_falls_back_to_bound_draft() -> No
                 draft_id=str(uuid.uuid4()),
             )
     assert exc_info.value.state == "missing_draft"
+
+
+@pytest.mark.asyncio
+async def test_suspend_then_resume_restores_previous_confirmation_state() -> None:
+    orchestrator = BugAssistantOrchestrator(FakeCandidateService())
+    async with session_scope() as session:
+        started = await orchestrator.handle(
+            session,
+            event="START_REPORT",
+            identity=_identity(),
+            fields_patch=_fields(),
+            source_text="Web 后台订单结算失败",
+            idempotency_key="pause-start",
+        )
+        paused = await orchestrator.handle(
+            session,
+            event="SUSPEND",
+            identity=_identity(),
+            draft_id=started.draft_id,
+            idempotency_key="pause-event",
+        )
+        resumed = await orchestrator.handle(
+            session,
+            event="RESUME",
+            identity=_identity(),
+            draft_id=started.draft_id,
+            idempotency_key="resume-event",
+        )
+
+    assert started.state == "ready_to_submit"
+    assert paused.state == "suspended"
+    assert paused.next_action == "HANDOFF_QA"
+    assert resumed.state == "ready_to_submit"
+    assert resumed.next_action == "CONFIRM_SUBMIT"

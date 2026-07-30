@@ -246,3 +246,29 @@ async def test_wecom_delivery_and_issue_impact() -> None:
     assert impact["report_count"] == 1
     assert impact["subscriber_count"] == 2
     assert external_impact["issue_id"] == issue_id
+
+
+@pytest.mark.asyncio
+async def test_progress_lookup_is_read_only_and_scoped_to_subscriber() -> None:
+    await _seed_issue()
+    service = BugIssueStatusService(FakeCandidateService({}))
+
+    items = await service.progress_for_subscriber(
+        channel="h5",
+        user_key="h5-user",
+        session_id="h5-session",
+    )
+    other = await service.progress_for_subscriber(
+        channel="h5",
+        user_key="another-user",
+        session_id="another-session",
+    )
+
+    assert len(items) == 1
+    assert items[0]["title"] == "订单结算失败"
+    assert items[0]["progress"]["status"] == "开发中"
+    assert other == []
+    async with session_scope() as session:
+        assert (
+            await session.execute(select(func.count(BugIssueStatusEvent.id)))
+        ).scalar_one() == 0

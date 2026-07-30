@@ -67,7 +67,19 @@ async def test_historical_b_state_is_normalized_to_a_runtime_shape():
         "conv_a": "conv-a",
         "conv_b": "",
         "bug_v2_active": True,
+        "bug_v2_suspended": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_suspended_bug_draft_state_survives_roundtrip():
+    store = InMemoryConversationStore()
+    await store.save_state(
+        "user-1",
+        "bot",
+        {"bug_v2_active": False, "bug_v2_suspended": True},
+    )
+    assert (await store.get_state("user-1", "bot"))["bug_v2_suspended"] is True
 
 
 def test_key_normalizes_empty_values():

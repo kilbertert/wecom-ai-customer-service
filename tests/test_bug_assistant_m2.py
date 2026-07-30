@@ -97,6 +97,7 @@ async def test_candidate_search_failure_keeps_v2_draft_without_legacy_fallback()
     assert result.state == "collecting"
     assert result.continue_session is True
     assert result.fallback_required is False
+    assert result.intent["intent"] == "bug_report"
     assert "反馈已保留" in result.assistant_text
     async with session_scope() as session:
         draft = (await session.execute(select(BugDraft))).scalar_one()

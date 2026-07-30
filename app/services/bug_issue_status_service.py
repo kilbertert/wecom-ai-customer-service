@@ -408,6 +408,48 @@ class BugIssueStatusService:
                 delivery.read_at = delivery.read_at or now
             return len(deliveries)
 
+    async def progress_for_subscriber(
+        self,
+        *,
+        channel: str,
+        user_key: str,
+        session_id: str,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, read-only progress view for the channel user."""
+
+        recipient = (user_key or session_id).strip()
+        if not recipient:
+            return []
+        async with session_scope() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(BugIssue)
+                        .join(BugSubscription, BugSubscription.issue_id == BugIssue.id)
+                        .where(
+                            BugSubscription.channel == channel.strip(),
+                            BugSubscription.status == "active",
+                            (BugSubscription.subscriber_key == recipient)
+                            | (BugSubscription.user_key == recipient)
+                            | (BugSubscription.session_id == session_id.strip()),
+                        )
+                        .order_by(BugIssue.updated_at.desc(), BugIssue.id.desc())
+                        .limit(max(1, min(limit, 10)))
+                    )
+                ).scalars()
+            )
+        return [
+            {
+                "issue_id": str(issue.id),
+                "external_record_id": issue.external_record_id or "",
+                "title": issue.title,
+                "module": issue.module,
+                "progress": _progress_from_issue(issue),
+            }
+            for issue in rows
+        ]
+
     async def issue_impact(self, issue_id: str) -> dict[str, Any]:
         try:
             issue_uuid = uuid.UUID(str(issue_id))

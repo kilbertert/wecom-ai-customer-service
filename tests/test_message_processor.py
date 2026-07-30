@@ -479,6 +479,140 @@ async def test_active_bug_draft_owns_vague_follow_up():
     assert adapter.sent[0][1].text == "已记录补充信息，请确认提交。"
 
 
+@pytest.mark.asyncio
+async def test_verified_faq_pauses_active_bug_draft_and_answers_qa():
+    bug = MagicMock()
+    bug.process = AsyncMock(
+        return_value=BugAssistantMessageResult(
+            assistant_text="草稿已暂停。",
+            state="suspended",
+            draft_id="draft-pause",
+            actions=[{"id": "bug.resume", "label": "继续反馈", "style": "primary"}],
+        )
+    )
+    conv = InMemoryConversationStore()
+    await conv.save_state(
+        "ext_u",
+        "kf_1",
+        {"bug_v2_active": True, "bug_v2_suspended": False},
+    )
+    proc, ai, _, _, _ = _make_processor(conv=conv, bug=bug)
+    adapter = _FakeAdapter(InMemoryDedupStore())
+
+    await proc.process(
+        _inbound(msgid="pause-faq", text="PC后台的计费模板入口在哪里？"), adapter
+    )
+
+    ai.run_workflow.assert_not_awaited()
+    assert "充电桩 > 计费管理 > 充电计费模板" in adapter.sent[0][1].text
+    assert bug.process.await_args.kwargs["event"] == "SUSPEND"
+    assert bug.process.await_args.kwargs["text"] == ""
+    state = await conv.get_state("ext_u", "kf_1")
+    assert state["bug_v2_active"] is False
+    assert state["bug_v2_suspended"] is True
+
+
+@pytest.mark.asyncio
+async def test_suspended_bug_draft_resumes_only_for_explicit_text_fallback():
+    bug = MagicMock()
+    bug.process = AsyncMock(
+        return_value=BugAssistantMessageResult(
+            assistant_text="我已整理问题，请确认提交。",
+            state="ready_to_submit",
+            draft_id="draft-resume",
+            continue_session=True,
+        )
+    )
+    conv = InMemoryConversationStore()
+    await conv.save_state(
+        "ext_u",
+        "kf_1",
+        {"bug_v2_active": False, "bug_v2_suspended": True},
+    )
+    proc, ai, _, _, _ = _make_processor(conv=conv, bug=bug)
+    adapter = _FakeAdapter(InMemoryDedupStore())
+
+    await proc.process(_inbound(msgid="resume-faq", text="继续反馈"), adapter)
+
+    ai.run_workflow.assert_not_awaited()
+    assert adapter.sent[0][1].text == "我已整理问题，请确认提交。"
+    assert bug.process.await_args.kwargs["event"] == "RESUME"
+    assert bug.process.await_args.kwargs["text"] == ""
+    state = await conv.get_state("ext_u", "kf_1")
+    assert state["bug_v2_active"] is True
+    assert state["bug_v2_suspended"] is False
+
+
+@pytest.mark.asyncio
+async def test_suspended_bug_draft_is_not_overwritten_by_new_bug_text():
+    bug = MagicMock()
+    bug.process = AsyncMock()
+    conv = InMemoryConversationStore()
+    await conv.save_state(
+        "ext_u",
+        "kf_1",
+        {"bug_v2_active": False, "bug_v2_suspended": True},
+    )
+    proc, ai, _, _, _ = _make_processor(conv=conv, bug=bug)
+    adapter = _FakeAdapter(InMemoryDedupStore())
+
+    await proc.process(_inbound(msgid="suspended-new-bug", text="订单结算失败"), adapter)
+
+    ai.run_workflow.assert_not_awaited()
+    bug.process.assert_not_awaited()
+    assert "已暂停的问题反馈" in adapter.sent[0][1].text
+
+
+@pytest.mark.asyncio
+async def test_wecom_text_action_can_pause_bug_draft():
+    bug = MagicMock()
+    bug.process = AsyncMock(
+        return_value=BugAssistantMessageResult(
+            assistant_text="草稿已暂停。",
+            state="suspended",
+            draft_id="draft-text-suspend",
+        )
+    )
+    conv = InMemoryConversationStore()
+    await conv.save_state("ext_u", "kf_1", {"bug_v2_active": True})
+    proc, ai, _, _, _ = _make_processor(conv=conv, bug=bug)
+    adapter = _FakeAdapter(InMemoryDedupStore())
+
+    await proc.process(
+        _inbound(msgid="text-suspend", text="先查询解决方法"), adapter
+    )
+
+    ai.run_workflow.assert_not_awaited()
+    assert bug.process.await_args.kwargs["event"] == "SUSPEND"
+    assert adapter.sent[0][1].text == "草稿已暂停。"
+
+
+@pytest.mark.asyncio
+async def test_progress_query_does_not_mutate_active_bug_draft():
+    bug = MagicMock()
+    bug.process = AsyncMock()
+    status = MagicMock()
+    status.progress_for_subscriber = AsyncMock(
+        return_value=[
+            {
+                "title": "订单结算失败",
+                "progress": {"status": "开发中", "reply": "正在定位", "result": ""},
+            }
+        ]
+    )
+    conv = InMemoryConversationStore()
+    await conv.save_state("ext_u", "kf_1", {"bug_v2_active": True})
+    proc, ai, _, _, _ = _make_processor(conv=conv, bug=bug, bug_status=status)
+    adapter = _FakeAdapter(InMemoryDedupStore())
+
+    await proc.process(_inbound(msgid="progress-read-only", text="当前进度"), adapter)
+
+    ai.run_workflow.assert_not_awaited()
+    bug.process.assert_not_awaited()
+    assert "订单结算失败：开发中；正在定位" in adapter.sent[0][1].text
+    assert (await conv.get_state("ext_u", "kf_1"))["bug_v2_active"] is True
+
+
 async def test_bug_v2_confirmation_failure_keeps_session_and_skips_dify():
     bug = MagicMock()
     bug.process = AsyncMock(side_effect=RuntimeError("orchestrator timeout"))
