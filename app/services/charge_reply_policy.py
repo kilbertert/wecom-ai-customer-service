@@ -84,6 +84,9 @@ class ChargeReplyPolicy:
         self._knowledge_question_terms = tuple(
             str(item).lower() for item in routing.get("knowledge_question_terms") or []
         )
+        self._why_question_terms = tuple(
+            str(item).lower() for item in routing.get("why_question_terms") or []
+        )
         self._strong_incident_terms = tuple(
             str(item).lower() for item in routing.get("strong_incident_terms") or []
         )
@@ -277,13 +280,17 @@ class ChargeReplyPolicy:
         query = (text or "").strip().lower()
         if self._has_any(query, self._progress_terms):
             return "B"
-        if has_attachments and self._has_any(query, self._attachment_bug_terms):
-            return "B"
-        if self.blocks_bug_route(query):
-            return None
         has_inability = self._has_any(query, self._inability_terms)
         bug_hits = self._count_matches(query, self._bug_terms)
         capability_question = self._has_any(query, self._capability_terms)
+        if self.blocks_bug_route(query):
+            return None
+        if (
+            has_attachments
+            and self._has_any(query, self._attachment_bug_terms)
+            and (bug_hits or has_inability)
+        ):
+            return "B"
         if bug_hits or (has_inability and not capability_question):
             return "B"
         return None
@@ -301,10 +308,13 @@ class ChargeReplyPolicy:
         has_strong_incident = self._has_any(query, self._strong_incident_terms)
         informational_question = self._has_any(query, self._informational_terms)
         knowledge_question = self._has_any(query, self._knowledge_question_terms)
+        why_question = self._has_any(query, self._why_question_terms)
 
         if capability_question:
             return True
-        if knowledge_question and not has_strong_incident:
+        if knowledge_question and not why_question:
+            return True
+        if why_question and not has_incident_context and not has_strong_incident:
             return True
         if (
             informational_question

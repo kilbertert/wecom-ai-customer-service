@@ -203,6 +203,11 @@ routing:
   - how to export
   - why does
   - documentation
+  why_question_terms:
+  - 为什么会
+  - 为什么
+  - 原因是什么
+  - why does
   strong_incident_terms:
   - 这次
   - 刚刚

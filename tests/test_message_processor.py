@@ -319,6 +319,30 @@ async def test_bug_route_resets_vague_state():
     assert state["bug_v2_active"] is True
 
 
+async def test_attachment_knowledge_question_stays_in_faq() -> None:
+    proc, ai, wechat, media, conv = _make_processor()
+    assert (
+        proc._reply_policy.route_target(
+            text="截图功能在哪里？",
+            active_app="A",
+            has_attachments=True,
+        )
+        is None
+    )
+
+
+async def test_incident_why_failure_routes_to_bug() -> None:
+    proc, ai, wechat, media, conv = _make_processor()
+    assert (
+        proc._reply_policy.route_target(
+            text="我的订单支付为什么失败？",
+            active_app="A",
+            has_attachments=False,
+        )
+        == "B"
+    )
+
+
 async def test_verified_billing_location_bypasses_dify_with_canonical_answer():
     bug = MagicMock()
     bug.process = AsyncMock()
