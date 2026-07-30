@@ -295,6 +295,10 @@ class ChargeReplyPolicy:
             return "B"
         return None
 
+    def is_progress_query(self, text: str) -> bool:
+        """Return whether the message explicitly asks for Bug progress."""
+        return self._has_any((text or "").strip().lower(), self._progress_terms)
+
     def blocks_bug_route(self, text: str) -> bool:
         """Return whether the query is explicitly informational/capability-only."""
         query = (text or "").strip().lower()

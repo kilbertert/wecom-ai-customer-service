@@ -13,6 +13,7 @@ from app.models.bugtrack_db import (
     BugDraft,
     BugIssue,
     BugReport,
+    BugStateEvent,
     BugSubscription,
     utcnow,
 )
@@ -38,6 +39,7 @@ SUPPORTED_EVENTS = {
     "REJECT_MATCH",
     "CONFIRM_SUBMIT",
     "SUSPEND",
+    "RESUME",
     "CANCEL",
 }
 IMMUTABLE_FLOW_STATES = {
@@ -178,6 +180,8 @@ class BugAssistantOrchestrator:
             return await self._confirm_submit(session, draft, identity)
         if normalized_event == "SUSPEND":
             return await self._suspend(session, draft)
+        if normalized_event == "RESUME":
+            return await self._resume(session, draft)
         return await self._cancel(session, draft)
 
     async def _collect_and_match(
@@ -526,6 +530,45 @@ class BugAssistantOrchestrator:
         )
         return BugAssistantDecision(
             draft_id=str(draft.id), state="suspended", next_action="HANDOFF_QA"
+        )
+
+    async def _resume(
+        self, session: AsyncSession, draft: BugDraft
+    ) -> BugAssistantDecision:
+        if draft.flow_state != "suspended":
+            raise InvalidBugAssistantTransition("RESUME", draft.flow_state)
+        event = (
+            await session.execute(
+                select(BugStateEvent)
+                .where(
+                    BugStateEvent.draft_id == draft.id,
+                    BugStateEvent.event_type == "assistant_suspended",
+                )
+                .order_by(BugStateEvent.created_at.desc(), BugStateEvent.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        previous = (event.from_state if event is not None else "collecting") or "collecting"
+        next_actions = {
+            "collecting": "REQUEST_INFORMATION",
+            "matching": "RETRY_MATCHING",
+            "awaiting_match_confirmation": "CONFIRM_MATCH",
+            "ready_to_submit": "CONFIRM_SUBMIT",
+        }
+        if previous not in next_actions:
+            previous = "collecting"
+        await bugtrack_service.transition(
+            session,
+            draft,
+            event_type="assistant_resumed",
+            flow_state=previous,
+            actor="bug_assistant_v2",
+        )
+        return BugAssistantDecision(
+            draft_id=str(draft.id),
+            state=previous,
+            next_action=next_actions[previous],
+            candidate=dict(draft.matched_snapshot or {}),
         )
 
     async def _cancel(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import logging
 from typing import Any
@@ -19,6 +19,8 @@ from app.services.bug_issue_sync_service import (
     bug_issue_sync_service,
 )
 from app.services.bugtrack_service import DraftIdentity, bugtrack_service
+from app.services.charge_reply_policy import get_charge_reply_policy
+from app.services.customer_intent import classify_customer_intent
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,13 @@ _REJECT_MATCH_TEXTS = {
 _REJECT_MATCH_MARKERS = ("不是同一个", "不是这个", "不一样", "不同问题", "新问题")
 _CONFIRM_MATCH_MARKERS = ("确认相同", "是同一个", "同一个问题")
 _CANCEL_WORDS = ("取消", "算了", "不报了", "不用提交", "放弃")
+_QA_SWITCH_WORDS = {
+    "先查询解决方法",
+    "查询解决方法",
+    "先查解决方法",
+    "转知识库",
+    "问一下怎么解决",
+}
 _FINAL_STATES = {"submitted", "linked_existing", "abandoned"}
 
 
@@ -69,6 +78,8 @@ class BugAssistantMessageResult:
     fallback_text: str = ""
     sync_pending: bool = False
     candidate: dict[str, Any] = field(default_factory=dict)
+    intent: dict[str, Any] = field(default_factory=dict)
+    actions: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +95,8 @@ class BugAssistantMessageResult:
             "fallback_text": self.fallback_text,
             "sync_pending": self.sync_pending,
             "candidate": dict(self.candidate),
+            "intent": dict(self.intent),
+            "actions": [dict(item) for item in self.actions],
         }
 
 
@@ -92,7 +105,21 @@ class BugAssistantMessageService:
         self._orchestrator = orchestrator or bug_assistant_orchestrator
         self._sync_service = sync_service or bug_issue_sync_service
 
-    async def process(
+    async def process(self, **kwargs: Any) -> BugAssistantMessageResult:
+        """Process one message and attach the stable top-level intent contract."""
+
+        intent = classify_customer_intent(
+            get_charge_reply_policy(),
+            text=str(kwargs.get("text") or ""),
+            language=str(kwargs.get("language") or ""),
+            has_attachments=bool(kwargs.get("image_bytes")),
+        )
+        result = await self._process(**kwargs)
+        if result.intent:
+            return result
+        return replace(result, intent=intent.to_dict())
+
+    async def _process(
         self,
         *,
         channel: str,
@@ -105,6 +132,7 @@ class BugAssistantMessageService:
         image_name: str = "",
         image_mime: str = "",
         source_file_id: str = "",
+        event: str = "",
     ) -> BugAssistantMessageResult:
         identity = DraftIdentity(
             channel=(channel or "unknown").strip(),
@@ -114,7 +142,7 @@ class BugAssistantMessageService:
         storage_identity = v2_storage_identity(identity)
         current = await self._current_draft(storage_identity)
         current_state = current.flow_state if current is not None else ""
-        event = self._event_for(current_state, text)
+        event = (event or "").strip().upper() or self._event_for(current_state, text)
         idempotency_key = message_id.strip() or self._idempotency_key(
             identity=identity,
             event=event,
@@ -202,6 +230,18 @@ class BugAssistantMessageService:
                 state=decision.state,
                 draft_id=decision.draft_id,
                 continue_session=True,
+            )
+        if decision.next_action == "HANDOFF_QA":
+            return BugAssistantMessageResult(
+                assistant_text=self._text(
+                    language,
+                    zh="问题反馈草稿已暂停并保留。你可以先查询解决方法，稍后再继续反馈。",
+                    en="The Bug draft is paused and saved. You can ask a knowledge question and resume later.",
+                    vi="Bản nháp báo lỗi đã được tạm dừng và lưu lại. Bạn có thể hỏi trước rồi tiếp tục sau.",
+                ),
+                state=decision.state,
+                draft_id=decision.draft_id,
+                actions=self._draft_actions(language, suspended=True),
             )
         if decision.state == "queued_for_submission":
             return await self._sync_submission(decision, language)
@@ -295,6 +335,7 @@ class BugAssistantMessageService:
                 state=decision.state,
                 draft_id=decision.draft_id,
                 continue_session=True,
+                actions=self._draft_actions(language),
             )
         if decision.state == "ready_to_submit":
             description = await self._draft_description(decision.draft_id)
@@ -315,6 +356,7 @@ class BugAssistantMessageService:
                 state=decision.state,
                 draft_id=decision.draft_id,
                 continue_session=True,
+                actions=self._confirm_submit_actions(language),
             )
         if decision.state == "awaiting_match_confirmation":
             candidate = dict(decision.candidate or {})
@@ -348,6 +390,7 @@ class BugAssistantMessageService:
                 draft_id=decision.draft_id,
                 continue_session=True,
                 candidate=candidate,
+                actions=self._confirm_match_actions(language),
             )
         if decision.state == "linked_existing":
             candidate = dict(decision.candidate or {})
@@ -396,11 +439,20 @@ class BugAssistantMessageService:
             state=decision.state,
             draft_id=decision.draft_id,
             continue_session=decision.state not in _FINAL_STATES,
+            actions=(
+                self._confirm_submit_actions(language)
+                if decision.next_action == "CONFIRM_SUBMIT"
+                else self._confirm_match_actions(language)
+                if decision.next_action == "CONFIRM_MATCH"
+                else self._draft_actions(language)
+            ),
         )
 
     @staticmethod
     def _event_for(state: str, text: str) -> str:
         normalized = "".join((text or "").strip().lower().split())
+        if normalized in _QA_SWITCH_WORDS:
+            return "SUSPEND"
         if state == "awaiting_match_confirmation":
             if any(word in normalized for word in _CANCEL_WORDS):
                 return "CANCEL"
@@ -432,6 +484,13 @@ class BugAssistantMessageService:
                 return "CONFIRM_SUBMIT"
             return "PATCH_REPORT"
         if state in {"collecting", "matching", "suspended"}:
+            if state == "suspended" and normalized in {
+                "继续反馈",
+                "恢复反馈",
+                "继续提交",
+                "resume",
+            }:
+                return "RESUME"
             return "PATCH_REPORT"
         return "START_REPORT"
 
@@ -495,6 +554,34 @@ class BugAssistantMessageService:
         if normalized.startswith("vi") or "越南" in normalized:
             return vi
         return zh
+
+    @classmethod
+    def _draft_actions(cls, language: str, *, suspended: bool = False) -> list[dict[str, str]]:
+        if suspended:
+            return [
+                {"id": "bug.resume", "label": "继续反馈", "style": "primary"},
+                {"id": "bug.cancel", "label": "取消反馈", "style": "secondary"},
+            ]
+        return [
+            {"id": "bug.suspend", "label": "先查询解决方法", "style": "secondary"},
+            {"id": "bug.cancel", "label": "取消反馈", "style": "secondary"},
+        ]
+
+    @staticmethod
+    def _confirm_submit_actions(language: str) -> list[dict[str, str]]:
+        return [
+            {"id": "bug.confirm_submit", "label": "确认提交", "style": "primary"},
+            {"id": "bug.suspend", "label": "先查询解决方法", "style": "secondary"},
+            {"id": "bug.cancel", "label": "取消", "style": "secondary"},
+        ]
+
+    @staticmethod
+    def _confirm_match_actions(language: str) -> list[dict[str, str]]:
+        return [
+            {"id": "bug.confirm_match", "label": "是同一个问题", "style": "primary"},
+            {"id": "bug.reject_match", "label": "不是同一个", "style": "secondary"},
+            {"id": "bug.suspend", "label": "先查询解决方法", "style": "secondary"},
+        ]
 
 
 bug_assistant_message_service = BugAssistantMessageService()

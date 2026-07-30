@@ -161,6 +161,7 @@ async def bug_assistant_message(
     language: str = Form(""),
     message_id: str = Form(""),
     source_file_id: str = Form(""),
+    event: str = Form(""),
     image: UploadFile | None = File(None),
 ):
     """Process one raw channel message through the active Bug v2 path."""
@@ -200,18 +201,27 @@ async def bug_assistant_message(
             )
         image_name = image.filename or "bug-screenshot.png"
 
-    result = await bug_assistant_message_service.process(
-        channel=channel,
-        user_key=user_key or session_id,
-        session_id=session_id or user_key,
-        text=text,
-        language=language,
-        message_id=message_id,
-        image_bytes=image_bytes,
-        image_name=image_name,
-        image_mime=image_mime,
-        source_file_id=source_file_id,
-    )
+    try:
+        result = await bug_assistant_message_service.process(
+            channel=channel,
+            user_key=user_key or session_id,
+            session_id=session_id or user_key,
+            text=text,
+            language=language,
+            message_id=message_id,
+            image_bytes=image_bytes,
+            image_name=image_name,
+            image_mime=image_mime,
+            source_file_id=source_file_id,
+            event=event,
+        )
+    except InvalidBugAssistantEvent as exc:
+        raise HTTPException(status_code=400, detail=f"unsupported event: {exc}") from exc
+    except InvalidBugAssistantTransition as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"event": exc.event, "state": exc.state},
+        ) from exc
     return JSONResponse(
         status_code=202 if result.sync_pending else 200,
         content=result.to_dict(),
@@ -239,6 +249,54 @@ async def list_bug_notifications(
     )
     return JSONResponse(
         content={"success": True, "notifications": [item.to_dict() for item in items]}
+    )
+
+
+@router.get("/v2/progress")
+async def bug_progress(
+    request: Request,
+    channel: str = Query("h5"),
+    user_key: str = Query(""),
+    session_id: str = Query(""),
+):
+    """Read subscribed Issue progress without changing an active Bug draft."""
+
+    _verify_access(request)
+    items = await bug_issue_status_service.progress_for_subscriber(
+        channel=channel,
+        user_key=user_key,
+        session_id=session_id,
+    )
+    if not items:
+        return JSONResponse(
+            content={
+                "success": True,
+                "items": [],
+                "assistant_text": "暂未找到你订阅的问题进度。你可以提供问题编号，或继续补充问题现象。",
+                "actions": [],
+            }
+        )
+    lines = []
+    for item in items:
+        progress = dict(item.get("progress") or {})
+        title = str(item.get("title") or item.get("external_record_id") or "问题反馈")
+        parts = [
+            value
+            for value in (
+                progress.get("status"),
+                progress.get("reply"),
+                progress.get("result"),
+            )
+            if value
+        ]
+        lines.append(f"{title}：{'；'.join(parts) or '暂未同步到最新进度'}")
+    return JSONResponse(
+        content={
+            "success": True,
+            "items": items,
+            "assistant_text": "\n".join(lines),
+            "actions": [],
+        }
     )
 
 
