@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -31,34 +31,40 @@ class ConversationStore(ABC):
     """conversation_id 映射存储接口。"""
 
     @abstractmethod
-    async def get_state(self, user_id: str, scope: str) -> Dict[str, str]:
-        """取状态 {active, conv_a, conv_b}; 首次 {'active':'A','conv_a':'','conv_b':''}。
-
-        双 app 模式: active ∈ {'A','B'} 决定下条消息走哪个 Dify app;
-        conv_a/conv_b 各自独立续接 Dify 会话。单 app 模式只用 A+conv_a。
-        """
+    async def get_state(self, user_id: str, scope: str) -> Dict[str, Any]:
+        """取兼容状态；M4 运行态固定 active=A 且 conv_b 为空。"""
         ...
 
     @abstractmethod
-    async def save_state(self, user_id: str, scope: str, state: Dict[str, str]) -> None:
+    async def save_state(self, user_id: str, scope: str, state: Dict[str, Any]) -> None:
         """保存状态。"""
         ...
 
-    # —— 向后兼容: 旧 get/save 只读写 active app 的 conv_id ——
+    # —— 向后兼容: 旧 get/save 只读写 A 的 conv_id ——
     async def get(self, user_id: str, scope: str) -> Optional[str]:
         st = await self.get_state(user_id, scope)
-        val = st.get("conv_a") if st.get("active", "A") == "A" else st.get("conv_b")
-        return val or None
+        return st.get("conv_a") or None
 
     async def save(self, user_id: str, scope: str, conversation_id: str) -> None:
         if not conversation_id:
             return
         st = await self.get_state(user_id, scope)
-        if st.get("active", "A") == "A":
-            st["conv_a"] = conversation_id
-        else:
-            st["conv_b"] = conversation_id
+        st["conv_a"] = conversation_id
         await self.save_state(user_id, scope, st)
+
+    @staticmethod
+    def normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
+        """M4 runtime shape; retain only A conversation fields.
+
+        ``active``/``conv_b`` remain in the serialized schema for old callers
+        and database rows, but historical B values must never become live state.
+        """
+        normalized = dict(state or {})
+        normalized["active"] = "A"
+        normalized["conv_a"] = str(normalized.get("conv_a") or "")
+        normalized["conv_b"] = ""
+        normalized["bug_v2_active"] = bool(normalized.get("bug_v2_active"))
+        return normalized
 
 
 class InMemoryConversationStore(ConversationStore):
@@ -72,12 +78,17 @@ class InMemoryConversationStore(ConversationStore):
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._states: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._states: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._expires: Dict[Tuple[str, str], float] = {}  # key -> 过期时间戳
 
     @staticmethod
-    def _default() -> Dict[str, str]:
-        return {"active": "A", "conv_a": "", "conv_b": ""}
+    def _default() -> Dict[str, Any]:
+        return {
+            "active": "A",
+            "conv_a": "",
+            "conv_b": "",
+            "bug_v2_active": False,
+        }
 
     @staticmethod
     def _ttl() -> float:
@@ -85,7 +96,7 @@ class InMemoryConversationStore(ConversationStore):
 
         return float(getattr(settings.app, "conversation_ttl", 1800) or 1800)
 
-    async def get_state(self, user_id: str, scope: str) -> Dict[str, str]:
+    async def get_state(self, user_id: str, scope: str) -> Dict[str, Any]:
         k = _key(user_id, scope)
         async with self._lock:
             # 过期清理 (滑动 TTL): 30min 不活动 -> 视为新会话
@@ -93,12 +104,12 @@ class InMemoryConversationStore(ConversationStore):
                 self._states.pop(k, None)
                 self._expires.pop(k, None)
             st = self._states.get(k)
-            return dict(st) if st else self._default()
+            return self.normalize_state(st) if st else self._default()
 
-    async def save_state(self, user_id: str, scope: str, state: Dict[str, str]) -> None:
+    async def save_state(self, user_id: str, scope: str, state: Dict[str, Any]) -> None:
         k = _key(user_id, scope)
         async with self._lock:
-            self._states[k] = dict(state)
+            self._states[k] = self.normalize_state(state)
             self._expires[k] = time.time() + self._ttl()
 
 
@@ -117,10 +128,15 @@ class RedisConversationStore(ConversationStore):
         self._redis = redis_client
 
     @staticmethod
-    def _default() -> Dict[str, str]:
-        return {"active": "A", "conv_a": "", "conv_b": ""}
+    def _default() -> Dict[str, Any]:
+        return {
+            "active": "A",
+            "conv_a": "",
+            "conv_b": "",
+            "bug_v2_active": False,
+        }
 
-    async def get_state(self, user_id: str, scope: str) -> Dict[str, str]:
+    async def get_state(self, user_id: str, scope: str) -> Dict[str, Any]:
         import json
 
         val = await self._redis.get(f"{self._KEY_PREFIX}{user_id}:{scope}")
@@ -130,12 +146,15 @@ class RedisConversationStore(ConversationStore):
             return self._default()
         try:
             st = json.loads(val)
-            return {"active": st.get("active", "A"), "conv_a": st.get("conv_a", ""),
-                    "conv_b": st.get("conv_b", "")}
+            if not isinstance(st, dict):
+                return self._default()
+            state = self._default()
+            state.update(st)
+            return self.normalize_state(state)
         except Exception:
             return self._default()
 
-    async def save_state(self, user_id: str, scope: str, state: Dict[str, str]) -> None:
+    async def save_state(self, user_id: str, scope: str, state: Dict[str, Any]) -> None:
         import json
 
         from app.core.config import settings
@@ -143,7 +162,7 @@ class RedisConversationStore(ConversationStore):
         ttl = int(getattr(settings.app, "conversation_ttl", 1800) or 1800)
         await self._redis.set(
             f"{self._KEY_PREFIX}{user_id}:{scope}",
-            json.dumps(state, ensure_ascii=False),
+            json.dumps(self.normalize_state(state), ensure_ascii=False),
             ex=ttl,
         )
 
@@ -175,9 +194,7 @@ def create_conversation_store() -> ConversationStore:
             logger.info("ConversationStore: Redis 模式")
             return RedisConversationStore(client)
         except Exception as e:
-            logger.warning(
-                "Redis ConversationStore 初始化失败, 回退 InMemory: %s", e
-            )
+            logger.warning("Redis ConversationStore 初始化失败, 回退 InMemory: %s", e)
     return InMemoryConversationStore()
 
 

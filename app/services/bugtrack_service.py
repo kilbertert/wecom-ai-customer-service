@@ -40,7 +40,9 @@ class DraftIdentity:
         if self.conversation_id:
             out.append(("dify_conversation", self.conversation_id.strip()))
         if self.session_id:
-            out.append((f"{self.channel or 'unknown'}_session", self.session_id.strip()))
+            out.append(
+                (f"{self.channel or 'unknown'}_session", self.session_id.strip())
+            )
         if self.user_key:
             out.append((f"{self.channel or 'unknown'}_user", self.user_key.strip()))
         return [(namespace, key) for namespace, key in out if key]
@@ -83,7 +85,9 @@ def fields_patch_from_feishu(fields: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def draft_to_dict(draft: BugDraft, *, include_attachments: bool = False) -> dict[str, Any]:
+def draft_to_dict(
+    draft: BugDraft, *, include_attachments: bool = False
+) -> dict[str, Any]:
     body: dict[str, Any] = {
         "draft_id": str(draft.id),
         "status": draft.status,
@@ -150,7 +154,9 @@ class BugtrackService:
             )
             binding = (await session.execute(statement)).scalar_one_or_none()
             if binding is not None:
-                return await session.get(BugDraft, binding.draft_id, with_for_update=True)
+                return await session.get(
+                    BugDraft, binding.draft_id, with_for_update=True
+                )
         return None
 
     async def _upsert_bindings(
@@ -200,6 +206,22 @@ class BugtrackService:
             )
         )
 
+    async def resolve_draft(
+        self,
+        session: AsyncSession,
+        *,
+        identity: DraftIdentity,
+        draft_id: str | uuid.UUID | None = None,
+    ) -> Optional[BugDraft]:
+        """Resolve an existing draft without creating a new business object."""
+
+        bindings = identity.bindings()
+        await self._lock_bindings(session, bindings)
+        explicit_id = _uuid(draft_id)
+        if explicit_id is not None:
+            return await session.get(BugDraft, explicit_id, with_for_update=True)
+        return await self._find_bound_draft(session, bindings)
+
     async def ensure_draft(
         self,
         session: AsyncSession,
@@ -224,7 +246,11 @@ class BugtrackService:
         if draft is None:
             draft = await self._find_bound_draft(session, bindings)
 
-        if draft is not None and draft.status not in TERMINAL_STATUSES and _is_expired(draft.expires_at):
+        if (
+            draft is not None
+            and draft.status not in TERMINAL_STATUSES
+            and _is_expired(draft.expires_at)
+        ):
             old_state = draft.flow_state
             draft.status = "expired"
             draft.flow_state = "expired"
@@ -259,7 +285,8 @@ class BugtrackService:
                 user_key=identity.user_key,
                 session_id=identity.session_id,
                 dify_conversation_id=identity.conversation_id,
-                expires_at=_utcnow() + timedelta(seconds=settings.bugtrack.timeout_seconds),
+                expires_at=_utcnow()
+                + timedelta(seconds=settings.bugtrack.timeout_seconds),
             )
             session.add(draft)
             await session.flush()
@@ -306,7 +333,9 @@ class BugtrackService:
         if flow_state:
             draft.flow_state = flow_state
         if draft.status not in TERMINAL_STATUSES:
-            draft.expires_at = _utcnow() + timedelta(seconds=settings.bugtrack.timeout_seconds)
+            draft.expires_at = _utcnow() + timedelta(
+                seconds=settings.bugtrack.timeout_seconds
+            )
 
         await self._upsert_bindings(session, draft, identity)
 
@@ -314,7 +343,13 @@ class BugtrackService:
             idem = idempotency_key.strip()
             if not idem:
                 material = "|".join(
-                    [str(draft.id), identity.conversation_id, source_text, intent, event_type]
+                    [
+                        str(draft.id),
+                        identity.conversation_id,
+                        source_text,
+                        intent,
+                        event_type,
+                    ]
                 )
                 idem = "auto-" + hashlib.sha256(material.encode("utf-8")).hexdigest()
             existing = (
@@ -481,7 +516,9 @@ class BugtrackService:
         idem = f"{operation}:{draft.id}"
         existing = (
             await session.execute(
-                select(BugOutbox).where(BugOutbox.idempotency_key == idem).with_for_update()
+                select(BugOutbox)
+                .where(BugOutbox.idempotency_key == idem)
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if existing is not None:
@@ -538,6 +575,11 @@ class BugtrackService:
         conv_b: str,
         route_data: Optional[dict[str, Any]] = None,
     ) -> BugRouteSession:
+        # M4 keeps the columns for schema compatibility, while all new route
+        # writes are normalized to the single A runtime. Existing untouched rows
+        # remain available for audit and manual rollback.
+        active_app = "A"
+        conv_b = ""
         await self._lock_bindings(session, [(f"route:{channel}", session_id)])
         route = await self.get_route_session(
             session, channel=channel, session_id=session_id

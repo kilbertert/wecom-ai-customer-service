@@ -92,9 +92,7 @@ async def test_new_problem_in_same_conversation_does_not_reuse_old_images():
     async with session_scope() as session:
         draft_b = await bugtrack_service.ensure_draft(
             session,
-            identity=DraftIdentity(
-                channel="dify", conversation_id="conv-shared"
-            ),
+            identity=DraftIdentity(channel="dify", conversation_id="conv-shared"),
             force_new=True,
             fields_patch={"operation_description": "问题 B"},
             event_type="search_requested",
@@ -134,8 +132,12 @@ async def test_persisted_image_is_uploaded_on_confirmed_add(monkeypatch):
     draft_id = json.loads(cached.body)["draft_id"]
     captured_fields = {}
 
-    monkeypatch.setattr(route, "feishu_upload_attachment", lambda *_args: "file-token-1")
-    monkeypatch.setattr(route, "_find_existing_record_for_draft", lambda *_args: _async_value(""))
+    monkeypatch.setattr(
+        route, "feishu_upload_attachment", lambda *_args: "file-token-1"
+    )
+    monkeypatch.setattr(
+        route, "_find_existing_record_for_draft", lambda *_args: _async_value("")
+    )
 
     def fake_add(fields):
         captured_fields.update(fields)
@@ -173,7 +175,7 @@ async def _async_value(value):
 
 
 @pytest.mark.asyncio
-async def test_h5_route_session_survives_in_memory_loss():
+async def test_h5_route_session_normalizes_legacy_b_write_to_a():
     async with session_scope() as session:
         await bugtrack_service.put_route_session(
             session,
@@ -190,7 +192,7 @@ async def test_h5_route_session_survives_in_memory_loss():
         )
     assert restored is not None
     assert (restored.active_app, restored.conv_a, restored.conv_b) == (
-        "B",
+        "A",
         "conv-a",
-        "conv-b",
+        "",
     )

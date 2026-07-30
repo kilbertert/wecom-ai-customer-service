@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from app.core.config import settings
 from app.services.pending_timer_store import (
@@ -37,29 +37,7 @@ from app.services.pending_timer_store import (
 logger = logging.getLogger(__name__)
 
 # 匹配 answer 末尾的 TIMER 标记 (可能有多个, 取最后一个有效的)
-_TIMER_MARKER_RE = re.compile(
-    r"<!--SYS:TIMER\|([^>]*?)-->", re.DOTALL
-)
-
-# 匹配双 app 路由握手标记 (A↔B 切换)。SWITCH_TO_BUG / SWITCH_TO_KB_REENTRY / SWITCH_TO_KB_DONE
-_SWITCH_MARKER_RE = re.compile(r"<!--SYS:(SWITCH_TO_[A-Z_]+)-->")
-
-# 双 app 路由标记名
-SWITCH_TO_BUG = "SWITCH_TO_BUG"                # A→B: A 检测 bug 意图, wecom 改投 B (同条消息)
-SWITCH_TO_KB_REENTRY = "SWITCH_TO_KB_REENTRY"  # B→A: B IRRELEVANT/修改窗NEW, wecom 改投 A (同条消息)
-SWITCH_TO_KB_DONE = "SWITCH_TO_KB_DONE"        # B→A: B 结束(放弃/无差异), 发 B 话术, 下条→A
-
-
-def parse_switch_markers(text: str) -> Tuple[str, set]:
-    """剥离并返回 SWITCH 路由标记。返回 (剥离后文本, {标记名集合})。
-
-    标记名 ∈ {SWITCH_TO_BUG, SWITCH_TO_KB_REENTRY, SWITCH_TO_KB_DONE}。
-    """
-    if not text:
-        return text or "", set()
-    found = set(m.group(1) for m in _SWITCH_MARKER_RE.finditer(text))
-    stripped = _SWITCH_MARKER_RE.sub("", text)
-    return stripped, found
+_TIMER_MARKER_RE = re.compile(r"<!--SYS:TIMER\|([^>]*?)-->", re.DOTALL)
 
 
 def parse_timer_markers(text: str) -> Tuple[str, list]:
@@ -109,17 +87,17 @@ async def cancel_pending_timer(
         # revoke Celery task
         try:
             from app.tasks.bugtrack_tasks import bugtrack_timeout
-            bugtrack_timeout.AsyncResult(pending.task_id).revoke(
-                terminate=False
-            )
+
+            bugtrack_timeout.AsyncResult(pending.task_id).revoke(terminate=False)
         except Exception as e:
-            logger.warning(
-                "[TimerCoord] revoke task 失败 (继续清 store): %s", e
-            )
+            logger.warning("[TimerCoord] revoke task 失败 (继续清 store): %s", e)
         await store.clear(user_id, scope)
         logger.info(
             "[TimerCoord] user=%s scope=%s cancel 旧 pending timer "
-            "(state=%s task=%s)", user_id, scope, pending.state,
+            "(state=%s task=%s)",
+            user_id,
+            scope,
+            pending.state,
             pending.task_id[:8],
         )
     except Exception as e:
@@ -175,6 +153,7 @@ async def _arm_timer(
 
     try:
         from app.tasks.bugtrack_tasks import bugtrack_timeout
+
         result = bugtrack_timeout.apply_async(
             args=(user_id, scope, state, record_id, payload),
             countdown=countdown,
@@ -184,8 +163,11 @@ async def _arm_timer(
     except Exception as e:
         # Celery 不可用时 arm 失败 — 不影响主流程 (Dify 仍正常回复), 仅超时兜底失效
         logger.error(
-            "[TimerCoord] arm Celery 任务失败 (超时兜底将失效, 主流程不受影响): "
-            "user=%s state=%s, %s", user_id, state, e, exc_info=True,
+            "[TimerCoord] arm Celery 任务失败 (超时兜底将失效, 主流程不受影响): " "user=%s state=%s, %s",
+            user_id,
+            state,
+            e,
+            exc_info=True,
         )
         return
 
@@ -200,17 +182,17 @@ async def _arm_timer(
     logger.info(
         "[TimerCoord] arm 成功: user=%s scope=%s state=%s record_id=%s "
         "countdown=%ss task=%s",
-        user_id, scope, state, record_id or "(none)", countdown,
+        user_id,
+        scope,
+        state,
+        record_id or "(none)",
+        countdown,
         task_id[:8],
     )
 
 
 __all__ = [
     "parse_timer_markers",
-    "parse_switch_markers",
-    "SWITCH_TO_BUG",
-    "SWITCH_TO_KB_REENTRY",
-    "SWITCH_TO_KB_DONE",
     "cancel_pending_timer",
     "apply_markers",
 ]

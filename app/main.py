@@ -18,16 +18,18 @@ from app.core.exceptions import (
     WeChatAPIError,
     SessionError,
     handle_wechat_error,
-    handle_session_error
+    handle_session_error,
 )
 from app.protocols.kf_adapter import KfAdapter
 from app.protocols.bot_adapter import BotAdapter
 from app.services import WeChatService, MediaService, get_ai_service
+from app.services.bug_issue_status_service import bug_issue_status_service
 from app.services.conversation_store import create_conversation_store
 from app.services.pending_timer_store import create_pending_timer_store
 from app.services.dedup_store import create_dedup_store
 from app.services.message_queue import create_message_queue
 from app.services.message_processor import MessageProcessor
+from app.services.bug_assistant_message_service import bug_assistant_message_service
 from app.core.database import close_database, verify_database
 
 # 配置标准日志
@@ -63,13 +65,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         ai_service=app.state.ai_service,
         conversation_store=app.state.conversation_store,
         pending_timer_store=app.state.pending_timer_store,
+        bug_assistant_service=(
+            bug_assistant_message_service
+            if settings.bugtrack.orchestrator_mode.lower() == "active"
+            else None
+        ),
+        bug_status_service=(bug_issue_status_service if settings.bugtrack.enabled else None),
     )
-    app.state.kf_adapter = KfAdapter(
-        app.state.wechat_service, app.state.dedup_store
-    )
-    app.state.bot_adapter = BotAdapter(
-        app.state.wechat_service, app.state.dedup_store
-    )
+    app.state.kf_adapter = KfAdapter(app.state.wechat_service, app.state.dedup_store)
+    app.state.bot_adapter = BotAdapter(app.state.wechat_service, app.state.dedup_store)
 
     # 持久消息队列 + 分布式锁 (#15+#17B): APP_MESSAGE_QUEUE=redis 时启用, 否则 None
     # (路由层回退 BackgroundTasks/create_task)。queue 与 lock 共享同一 Redis client。
@@ -154,7 +158,7 @@ async def root():
         "version": settings.app.version,
         "status": "running",
         "docs": "/docs",
-        "health": "/monitoring/health"
+        "health": "/monitoring/health",
     }
 
 
@@ -172,14 +176,14 @@ async def service_info():
             "多模态回复 (markdown)",
             "Dify chatflow 多轮 (双 app 路由)",
             "Chatwoot 双向集成",
-            "监控和健康检查"
+            "监控和健康检查",
         ],
         "endpoints": {
             "wechat_callback": "/wechat/kf/callback",
             "health_check": "/monitoring/health",
             "metrics": "/monitoring/metrics",
-            "stats": "/monitoring/stats"
-        }
+            "stats": "/monitoring/stats",
+        },
     }
 
 

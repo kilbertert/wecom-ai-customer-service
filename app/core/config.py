@@ -33,9 +33,7 @@ class WeChatSettings(BaseSettings):
     )
 
     # 指定客服配置（可选）
-    allowed_open_kfid: Optional[str] = Field(
-        None, description="只处理指定客服的消息，为空则处理所有客服"
-    )
+    allowed_open_kfid: Optional[str] = Field(None, description="只处理指定客服的消息，为空则处理所有客服")
 
     class Config:
         env_prefix = "WECHAT_"
@@ -58,9 +56,7 @@ class RedisSettings(BaseSettings):
 
     # 缓存配置
     cache_ttl: int = Field(7200, description="缓存过期时间(秒)")
-    token_cache_key: str = Field(
-        "wechat:access_token", description="Access Token缓存键"
-    )
+    token_cache_key: str = Field("wechat:access_token", description="Access Token缓存键")
 
     class Config:
         env_prefix = "REDIS_"
@@ -157,7 +153,23 @@ class BugtrackSettings(BaseSettings):
     )
     route_session_ttl: int = Field(
         1800,
-        description="H5 A/B 路由会话持久化 TTL（秒）",
+        description="H5 路由会话兼容数据 TTL（秒）",
+    )
+    orchestrator_mode: str = Field(
+        "off",
+        description='Bug v2 渠道路由模式: "off" | "active"',
+    )
+    orchestrator_fallback_to_dify_b: bool = Field(
+        False,
+        description="旧 Dify B 回退开关；M4 运行态忽略，仅供配置回滚审计",
+    )
+    status_sync_interval_seconds: int = Field(
+        300,
+        description="订阅 Issue 的飞书进度轮询间隔；0 表示禁用定时轮询",
+    )
+    status_sync_batch_size: int = Field(
+        100,
+        description="单次进度轮询最多处理的 Issue 数量",
     )
 
     class Config:
@@ -194,14 +206,11 @@ class DifySettings(BaseSettings):
     api_key: SecretStr = Field(
         SecretStr("PLACEHOLDER_DIFY_API_KEY"), description="Dify API Key (app-xxx)"
     )
-    # 双 app 拆分 (KB问答 + bug追踪): api_key_b 非空 → 双 app 路由模式;
-    # 为空 → 单 app 兼容 (只走 api_key/api_key_a, 忽略 SWITCH 标记)。
+    # M4 运行态只使用 A；B token 可保留为人工回滚资产。
     api_key_a: SecretStr = Field(
         SecretStr(""), description="App A (KB问答) token; 空则回退 api_key"
     )
-    api_key_b: SecretStr = Field(
-        SecretStr(""), description="App B (bug追踪) token; 空则单 app 模式"
-    )
+    api_key_b: SecretStr = Field(SecretStr(""), description="旧 App B token，仅人工回滚时使用")
 
     # Workflow 输入变量名 — 与 Dify 工作流"开始"节点保持一致
     input_text: str = Field("input_text", description="Workflow 文本输入变量名")
@@ -238,13 +247,13 @@ class DifySettings(BaseSettings):
     # 字段 default=""。线上 charge_charging_v16 定义了这三个 select (见 /parameters)。
     # 逐消息可在 input_data 里用 language/hint_endpoint/hint_region 覆盖 (见 _run_chatflow)。
     chatflow_input_language: str = Field(
-        "", description='Chatflow select: input_language (zh|en|vi)'
+        "", description="Chatflow select: input_language (zh|en|vi)"
     )
     chatflow_input_hint_endpoint: str = Field(
-        "", description='Chatflow select: input_hint_endpoint (user|butler|pc)'
+        "", description="Chatflow select: input_hint_endpoint (user|butler|pc)"
     )
     chatflow_input_hint_region: str = Field(
-        "", description='Chatflow select: input_hint_region (cn|overseas)'
+        "", description="Chatflow select: input_hint_region (cn|overseas)"
     )
 
     class Config:
@@ -337,7 +346,7 @@ class AppSettings(BaseSettings):
     queue_lock_ttl: int = Field(
         600,
         description="分布式锁 TTL 秒; 须 > 最坏 4 轮 Dify (MAX_ROUTES=3, ×chatflow_timeout120=480); "
-                    "太短->锁过期中段被他人抢占致状态竞态; 太长->崩溃后该用户消息恢复延迟",
+        "太短->锁过期中段被他人抢占致状态竞态; 太长->崩溃后该用户消息恢复延迟",
     )
     queue_max_attempts: int = Field(
         3,
@@ -408,24 +417,21 @@ def load_settings():
         logger.info("配置从.env文件加载成功")
 
         # 检查是否使用了占位符值
-        if (
-            settings.wechat.corp_id.startswith("PLACEHOLDER")
-            or str(settings.wechat.corp_secret).startswith("PLACEHOLDER")
-        ):
+        if settings.wechat.corp_id.startswith("PLACEHOLDER") or str(
+            settings.wechat.corp_secret
+        ).startswith("PLACEHOLDER"):
             logger.warning("检测到占位符配置值，请确保已正确配置生产环境变量")
 
-        # 配置对齐约束 (Path C 防护): APP_CONVERSATION_TTL 必须与
-        # BUGTRACK_TIMEOUT_SECONDS 一等。conv TTL > bug timeout -> 超时后 conv 仍在,
-        # 用户晚归命中 stale conv_b (await_confirm_* 残留); conv TTL < bug timeout ->
-        # 超时前 conv 提前过期。两者都破坏"超时后新会话 cv=IDLE"不变量。不等则告警
-        # (若需更强保证, 可在此处 settings.app.conversation_ttl = min(...) 强制取小)。
+        # APP_CONVERSATION_TTL 同时控制 A conversation 和渠道侧 bug_v2_active
+        # 指针；与 BUGTRACK_TIMEOUT_SECONDS 对齐可让超时草稿和渠道续填窗口一致。
         conv_ttl = getattr(settings.app, "conversation_ttl", 1800)
         bug_timeout = getattr(settings.bugtrack, "timeout_seconds", 1800)
         if conv_ttl != bug_timeout:
             logger.warning(
                 "[CONFIG] APP_CONVERSATION_TTL(%s) != BUGTRACK_TIMEOUT_SECONDS(%s) "
                 "-> 超时路径 cv_flow_state 一致性可能破裂 (Path C 复现风险), 请对齐",
-                conv_ttl, bug_timeout,
+                conv_ttl,
+                bug_timeout,
             )
 
         # 队列/去重对齐约束 (#15+#17B): redis 持久队列下, 进程崩溃重投递靠 DedupStore

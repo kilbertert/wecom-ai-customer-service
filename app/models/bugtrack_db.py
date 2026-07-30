@@ -45,9 +45,7 @@ class BugDraft(Base):
     )
 
     module: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-    operation_description: Mapped[str] = mapped_column(
-        Text, nullable=False, default=""
-    )
+    operation_description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     environment: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     issue_type: Mapped[str] = mapped_column(String(64), nullable=False, default="bug")
     search_keyword: Mapped[str] = mapped_column(String(255), nullable=False, default="")
@@ -78,6 +76,9 @@ class BugDraft(Base):
     )
     turns: Mapped[list["BugTurn"]] = relationship(
         back_populates="draft", cascade="all, delete-orphan"
+    )
+    report: Mapped[Optional["BugReport"]] = relationship(
+        back_populates="draft", cascade="all, delete-orphan", uselist=False
     )
 
     __mapper_args__ = {"version_id_col": version}
@@ -156,9 +157,7 @@ class BugAttachment(Base):
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(127), nullable=False)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    source_file_id: Mapped[str] = mapped_column(
-        String(191), nullable=False, default=""
-    )
+    source_file_id: Mapped[str] = mapped_column(String(191), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="staged")
     feishu_file_token: Mapped[str] = mapped_column(
         String(255), nullable=False, default=""
@@ -190,7 +189,9 @@ class BugStateEvent(Base):
     from_state: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     to_state: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     actor: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
-    event_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    event_data: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
@@ -237,8 +238,12 @@ class BugRouteSession(Base):
     active_app: Mapped[str] = mapped_column(String(8), nullable=False, default="A")
     conv_a: Mapped[str] = mapped_column(String(191), nullable=False, default="")
     conv_b: Mapped[str] = mapped_column(String(191), nullable=False, default="")
-    route_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    route_data: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
@@ -251,4 +256,214 @@ class BugRouteSession(Base):
     __table_args__ = (
         UniqueConstraint("channel", "session_id", name="uq_bug_route_session"),
         Index("ix_bug_route_expires", "expires_at"),
+    )
+
+
+class BugIssue(Base):
+    """Canonical product issue; many customer reports may point to one issue."""
+
+    __tablename__ = "bug_issues"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_system: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="local"
+    )
+    external_record_id: Mapped[Optional[str]] = mapped_column(String(191))
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    module: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    normalized_description: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+    environment: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    issue_type: Mapped[str] = mapped_column(String(64), nullable=False, default="bug")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="triage")
+    external_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    reports: Mapped[list["BugReport"]] = relationship(back_populates="issue")
+    subscriptions: Mapped[list["BugSubscription"]] = relationship(
+        back_populates="issue", cascade="all, delete-orphan"
+    )
+    status_events: Mapped[list["BugIssueStatusEvent"]] = relationship(
+        back_populates="issue", cascade="all, delete-orphan"
+    )
+
+    __mapper_args__ = {"version_id_col": version}
+    __table_args__ = (
+        UniqueConstraint(
+            "source_system", "external_record_id", name="uq_bug_issue_external"
+        ),
+        Index("ix_bug_issues_status_updated", "status", "updated_at"),
+    )
+
+
+class BugReport(Base):
+    """One concrete customer occurrence, preserved even for duplicate issues."""
+
+    __tablename__ = "bug_reports"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    draft_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bug_drafts.id", ondelete="CASCADE"), nullable=False
+    )
+    issue_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("bug_issues.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    link_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="new_issue"
+    )
+    external_record_id: Mapped[str] = mapped_column(
+        String(191), nullable=False, default=""
+    )
+    report_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    draft: Mapped[BugDraft] = relationship(back_populates="report")
+    issue: Mapped[Optional[BugIssue]] = relationship(back_populates="reports")
+
+    __table_args__ = (
+        UniqueConstraint("draft_id", name="uq_bug_report_draft"),
+        Index("ix_bug_reports_issue_created", "issue_id", "created_at"),
+        Index("ix_bug_reports_status_created", "status", "created_at"),
+    )
+
+
+class BugSubscription(Base):
+    """Idempotent customer subscription to one canonical issue."""
+
+    __tablename__ = "bug_subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    issue_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bug_issues.id", ondelete="CASCADE"), nullable=False
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    subscriber_key: Mapped[str] = mapped_column(String(191), nullable=False)
+    user_key: Mapped[str] = mapped_column(String(191), nullable=False, default="")
+    session_id: Mapped[str] = mapped_column(String(191), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    issue: Mapped[BugIssue] = relationship(back_populates="subscriptions")
+    deliveries: Mapped[list["BugNotificationDelivery"]] = relationship(
+        back_populates="subscription", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "issue_id", "channel", "subscriber_key", name="uq_bug_subscription"
+        ),
+        Index("ix_bug_subscriptions_status_updated", "status", "updated_at"),
+    )
+
+
+class BugIssueStatusEvent(Base):
+    """One externally observed Issue progress change."""
+
+    __tablename__ = "bug_issue_status_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    issue_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bug_issues.id", ondelete="CASCADE"), nullable=False
+    )
+    source_system: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="feishu"
+    )
+    previous_status: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=""
+    )
+    new_status: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    event_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    issue: Mapped[BugIssue] = relationship(back_populates="status_events")
+    deliveries: Mapped[list["BugNotificationDelivery"]] = relationship(
+        back_populates="status_event", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_bug_issue_events_issue_created", "issue_id", "created_at"),
+    )
+
+
+class BugNotificationDelivery(Base):
+    """Durable per-subscriber delivery for one Issue status event."""
+
+    __tablename__ = "bug_notification_deliveries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bug_subscriptions.id", ondelete="CASCADE"), nullable=False
+    )
+    status_event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bug_issue_status_events.id", ondelete="CASCADE"), nullable=False
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    recipient_key: Mapped[str] = mapped_column(String(191), nullable=False, default="")
+    session_id: Mapped[str] = mapped_column(String(191), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    subscription: Mapped[BugSubscription] = relationship(back_populates="deliveries")
+    status_event: Mapped[BugIssueStatusEvent] = relationship(
+        back_populates="deliveries"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id",
+            "status_event_id",
+            name="uq_bug_notification_subscription_event",
+        ),
+        Index("ix_bug_notifications_status_created", "status", "created_at"),
+        Index(
+            "ix_bug_notifications_recipient_status",
+            "channel",
+            "recipient_key",
+            "status",
+        ),
     )
