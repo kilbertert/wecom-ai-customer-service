@@ -37,13 +37,20 @@ _UPLOAD_CACHE_TTL = 1800.0  # 30 分钟 (bug 多轮确认流程通常数分钟�
 _UPLOAD_CACHE_CAP = 100
 
 
-def _cache_put(upload_id: str, content: bytes, filename: str, content_type: str) -> None:
+def _cache_put(
+    upload_id: str, content: bytes, filename: str, content_type: str
+) -> None:
     """缓存上传文件字节 (带 TTL)。超容量时先淘汰过期项。"""
     now = time.time()
     if len(_UPLOAD_CACHE) >= _UPLOAD_CACHE_CAP:
         for k in [k for k, v in _UPLOAD_CACHE.items() if v[3] < now]:
             _UPLOAD_CACHE.pop(k, None)
-    _UPLOAD_CACHE[upload_id] = (content, filename, content_type, now + _UPLOAD_CACHE_TTL)
+    _UPLOAD_CACHE[upload_id] = (
+        content,
+        filename,
+        content_type,
+        now + _UPLOAD_CACHE_TTL,
+    )
 
 
 def _cache_get(upload_id: str) -> Optional[Tuple[bytes, str, str]]:
@@ -60,8 +67,7 @@ def _cache_get(upload_id: str) -> Optional[Tuple[bytes, str, str]]:
 async def fetch_upload_bytes(upload_file_id: str) -> Optional[Tuple[bytes, str, str]]:
     """按 Dify upload_file_id 取文件字节, 供飞书附件上传用。
 
-    优先进程内缓存 (上传 Dify 时已存); miss 则从 Dify 文件库下载兜底
-    (先 app B token, 404/403 回退 app A, 因 KF 图片默认上传 A、bug 路由切 B)。
+    优先进程内缓存 (上传 Dify 时已存); miss 则从 Dify A 文件库下载兜底。
 
     Returns:
         (bytes, filename, content_type) 或 None (全部失败)
@@ -78,15 +84,12 @@ async def fetch_upload_bytes(upload_file_id: str) -> Optional[Tuple[bytes, str, 
     eu = settings.dify.end_user_default
     keys: List[str] = []
     try:
-        kb = settings.dify.api_key_b.get_secret_value() if settings.dify.api_key_b else ""
-    except Exception:
-        kb = ""
-    try:
-        ka = settings.dify.api_key_a.get_secret_value() or settings.dify.api_key.get_secret_value()
+        ka = (
+            settings.dify.api_key_a.get_secret_value()
+            or settings.dify.api_key.get_secret_value()
+        )
     except Exception:
         ka = ""
-    if kb:
-        keys.append(kb)
     if ka and ka not in keys:
         keys.append(ka)
 
@@ -97,7 +100,9 @@ async def fetch_upload_bytes(upload_file_id: str) -> Optional[Tuple[bytes, str, 
             logger.info("[dify] 回取文件 %s 成功 (兜底下载) size=%dB", uid, len(content))
             return (content, f"{uid}.jpg", "image/jpeg")
         except DifyError as e:
-            logger.warning("[dify] 回取文件 %s 失败 (key 末尾 %s): %s", uid, key[-6:] if key else "?", e)
+            logger.warning(
+                "[dify] 回取文件 %s 失败 (key 末尾 %s): %s", uid, key[-6:] if key else "?", e
+            )
             continue
     logger.warning("[dify] 回取文件 %s 全部失败 (缓存 miss + 下载失败)", uid)
     return None
@@ -215,14 +220,13 @@ class DifyService:
                 app_mode=app_mode,
             )
 
-        # 双 app: A=KB问答, B=bug追踪。key_a 回退 api_key (单 app 兼容); key_b 空=单 app 模式
-        key_a = (settings.dify.api_key_a.get_secret_value()
-                 or settings.dify.api_key.get_secret_value())
-        key_b = settings.dify.api_key_b.get_secret_value()
+        # M4: A 仅负责 RAG/FAQ。历史 B token 可以保留在环境中作为人工回滚
+        # 资产，但服务不再构造或调用 B client。
+        key_a = (
+            settings.dify.api_key_a.get_secret_value()
+            or settings.dify.api_key.get_secret_value()
+        )
         self._clients: Dict[str, DifyClient] = {"A": _make_client(key_a)}
-        self._dual_app = bool(key_b)
-        if self._dual_app:
-            self._clients["B"] = _make_client(key_b)
         # 兼容: self._client / self.client 指向 A
         self._client = self._clients["A"]
         # 保持一个长连接的 httpx 客户端,以便 close() 时统一关闭
@@ -231,25 +235,15 @@ class DifyService:
         )
 
     @property
-    def dual_app(self) -> bool:
-        """是否双 app 模式 (api_key_b 已配置)。"""
-        return self._dual_app
-
-    def _client_for_app(self, app: str) -> DifyClient:
-        """按 app 标识取对应 DifyClient; 单 app 模式或未知 app 一律回退 A。"""
-        if self._dual_app and app == "B":
-            return self._clients["B"]
-        return self._clients["A"]
-
-
-    @property
     def client(self) -> DifyClient:
         return self._client
 
     # ------------------------------------------------------------------
     # 对外接口
     # ------------------------------------------------------------------
-    async def upload_file(self, file_content: bytes, file_name: str, user_id: str = "", app: str = "A") -> str:
+    async def upload_file(
+        self, file_content: bytes, file_name: str, user_id: str = "", app: str = "A"
+    ) -> str:
         """上传文件到 Dify 并返回 upload_file_id (UUID)。
 
         Args:
@@ -269,14 +263,19 @@ class DifyService:
             ctype = _guess_audio_mime(file_name)
 
         try:
-            client = self._client_for_app(app) if hasattr(self, "_client_for_app") else self._client
+            client = self._client
             # Dify access_controller requires_user_ownership: created_by 必须 == chatflow user_id
             if user_id and getattr(client, "end_user", "") != user_id:
                 from app.services.dify_client import DifyClient
+
                 client = DifyClient(
-                    api_base=client.api_base, api_key=client.api_key, end_user=user_id,
-                    upload_timeout=client.upload_timeout, workflow_timeout=client.workflow_timeout,
-                    chatflow_timeout=client.chatflow_timeout, app_mode=client.app_mode,
+                    api_base=client.api_base,
+                    api_key=client.api_key,
+                    end_user=user_id,
+                    upload_timeout=client.upload_timeout,
+                    workflow_timeout=client.workflow_timeout,
+                    chatflow_timeout=client.chatflow_timeout,
+                    app_mode=client.app_mode,
                 )
             file_id = await client.upload_file(
                 filename=file_name,
@@ -284,7 +283,12 @@ class DifyService:
                 content_type=ctype,
             )
             # 旧 image_file_ids 兼容缓存；草稿附件主链路走关系型绑定 + 持久文件。
-            _cache_put(str(file_id), file_content, file_name, ctype or "application/octet-stream")
+            _cache_put(
+                str(file_id),
+                file_content,
+                file_name,
+                ctype or "application/octet-stream",
+            )
             return file_id
         except DifyError as e:
             raise AIBackendError(f"Dify 文件上传失败: {e}") from e
@@ -328,9 +332,13 @@ class DifyService:
             if img_bytes:
                 img_name = input_data.get("file_image_name") or "image.png"
                 ctype = _detect_image_mime(img_bytes, img_name)
-                upload_file_id = str(await client.upload_file(
-                    filename=img_name, content=img_bytes, content_type=ctype,
-                ))
+                upload_file_id = str(
+                    await client.upload_file(
+                        filename=img_name,
+                        content=img_bytes,
+                        content_type=ctype,
+                    )
+                )
                 # 缓存字节: 供 bug 截图入飞书附件回取 + 改投重传兜底
                 _cache_put(upload_file_id, img_bytes, img_name, ctype)
                 files.append(
@@ -342,7 +350,9 @@ class DifyService:
                 )
                 logger.info(
                     "[DIFY] 图片上传至 app(end_user=%s) file_id=%s size=%dB",
-                    client.end_user, upload_file_id, len(img_bytes),
+                    client.end_user,
+                    upload_file_id,
+                    len(img_bytes),
                 )
         else:
             query = str(input_data) if input_data is not None else ""
@@ -391,7 +401,10 @@ class DifyService:
                 raise AIBackendError("Bug 图片缺少 Dify conversation_id，未安全保存")
             try:
                 from app.core.database import session_scope
-                from app.services.bugtrack_service import DraftIdentity, bugtrack_service
+                from app.services.bugtrack_service import (
+                    DraftIdentity,
+                    bugtrack_service,
+                )
 
                 async with session_scope() as db_session:
                     draft = await bugtrack_service.ensure_draft(
@@ -415,7 +428,9 @@ class DifyService:
                 attachment_persisted = True
                 logger.info(
                     "[DIFY] Bug 图片已持久化 draft=%s conv=%s size=%dB",
-                    str(draft.id)[:8], conv[:8], len(img_bytes),
+                    str(draft.id)[:8],
+                    conv[:8],
+                    len(img_bytes),
                 )
             except AIBackendError:
                 raise
@@ -430,7 +445,12 @@ class DifyService:
 
         # 2) 调 chatflow (透传 conversation_id 续接多轮)
         try:
-            logger.info("[DIFY] chatflow end_user=%s files=%d conv=%s", client.end_user, len(files or []), conversation_id or "")
+            logger.info(
+                "[DIFY] chatflow end_user=%s files=%d conv=%s",
+                client.end_user,
+                len(files or []),
+                conversation_id or "",
+            )
             raw = await client.run_chatflow(
                 query=query,
                 inputs=inputs,
@@ -512,7 +532,7 @@ class DifyService:
                 2) 已是 Dify workflow 的 parameters 字典
             user_id: 调用方传入的用户标识(WeChat 场景为 external_userid),
                      会被用作 Dify 的 ``end_user`` 字段。
-            app: 双 app 模式下选 "A"(KB问答) 或 "B"(bug追踪); 单 app 模式忽略。
+            app: 历史兼容参数，M4 中始终使用 A；Bug 由编排服务处理。
 
         Returns:
             形如 ``{"content": <reply_text>, "raw": <raw_dify_body>}`` 的字典。
@@ -522,7 +542,7 @@ class DifyService:
         end_user = user_id or settings.dify.end_user_default
 
         # 若 DifyClient 缓存了默认 end_user 与本次不同,临时构造新 client
-        client = self._client_for_app(app)
+        client = self._client
         if client.end_user != end_user:
             client = DifyClient(
                 api_base=client.api_base,
@@ -536,7 +556,9 @@ class DifyService:
 
         # 路由: chatflow / advanced-chat app 用 run_chatflow
         if (client.app_mode or "chatflow") == "chatflow":
-            return await self._run_chatflow(input_data, client, conversation_id, app=app)
+            return await self._run_chatflow(
+                input_data, client, conversation_id, app=app
+            )
 
         # 构造 workflow inputs
         inputs: Dict[str, Any] = {}
@@ -578,9 +600,13 @@ class DifyService:
                 if img_bytes:
                     img_name = input_data.get("file_image_name") or "image.png"
                     ctype = _detect_image_mime(img_bytes, img_name)
-                    _fid = str(await client.upload_file(
-                        filename=img_name, content=img_bytes, content_type=ctype,
-                    ))
+                    _fid = str(
+                        await client.upload_file(
+                            filename=img_name,
+                            content=img_bytes,
+                            content_type=ctype,
+                        )
+                    )
                     _cache_put(_fid, img_bytes, img_name, ctype)
                     inputs[settings.dify.input_image] = [client.file_ref(_fid, "image")]
             else:

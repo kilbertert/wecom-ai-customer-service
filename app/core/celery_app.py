@@ -7,7 +7,7 @@ celery_app = Celery(
     "wecom_service",
     broker=settings.celery.broker_url,
     backend=settings.celery.result_backend,
-    include=["app.tasks"]
+    include=["app.tasks"],
 )
 
 # Celery配置
@@ -18,26 +18,38 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-
     # 工作进程配置
     worker_prefetch_multiplier=settings.celery.worker_prefetch_multiplier,
     worker_max_tasks_per_child=settings.celery.worker_max_tasks_per_child,
-
     # 队列配置
     task_default_queue=settings.celery.task_default_queue,
     task_default_exchange=settings.celery.task_default_exchange,
     task_default_routing_key=settings.celery.task_default_routing_key,
-
     # 结果过期时间
     result_expires=3600,
-
     # 任务路由
     task_routes={
         "app.tasks.process_wechat_message": {"queue": "wechat_messages"},
         "app.tasks.send_wechat_reply": {"queue": "wechat_replies"},
         "app.tasks.process_media_file": {"queue": "media_processing"},
-    }
+        "app.tasks.bugtrack_sync_v2_issue": {"queue": "wecom_timers"},
+        "app.tasks.bugtrack_reconcile_issue_statuses": {"queue": "wecom_timers"},
+        "app.tasks.bugtrack_deliver_issue_notification": {
+            "queue": "wecom_timers"
+        },
+    },
 )
+
+if (
+    settings.bugtrack.enabled
+    and settings.bugtrack.status_sync_interval_seconds > 0
+):
+    celery_app.conf.beat_schedule = {
+        "bugtrack-reconcile-issue-statuses": {
+            "task": "app.tasks.bugtrack_reconcile_issue_statuses",
+            "schedule": float(settings.bugtrack.status_sync_interval_seconds),
+        }
+    }
 
 # 自动发现任务
 celery_app.autodiscover_tasks()

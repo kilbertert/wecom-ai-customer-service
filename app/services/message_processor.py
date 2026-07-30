@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -31,15 +32,16 @@ from app.services.bot_trace import (
     format_thinking_lines,
 )
 from app.services.conversation_store import ConversationStore
+from app.services.charge_reply_policy import ChargeReplyPolicy, get_charge_reply_policy
+from app.services.bug_assistant_message_service import (
+    BugAssistantMessageResult,
+    BugAssistantMessageService,
+)
 from app.services.pending_timer_store import PendingTimerStore
 from app.services.timer_coordinator import (
     apply_markers,
     cancel_pending_timer,
     parse_timer_markers,
-    parse_switch_markers,
-    SWITCH_TO_BUG,
-    SWITCH_TO_KB_REENTRY,
-    SWITCH_TO_KB_DONE,
 )
 from app.services.multimodal import compose_multimodal_markdown
 from app.services.trace_extract import extract_knowledge, extract_thinking
@@ -48,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 # bot 支持的消息类型
 _BOT_SUPPORTED_TYPES = ("text", "image", "voice", "mixed")
+_LEGACY_SWITCH_MARKER_RE = re.compile(r"<!--SYS:SWITCH_TO_[A-Z_]+-->")
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,9 @@ class MessageProcessor:
         ai_service: Any,
         conversation_store: ConversationStore,
         pending_timer_store: Optional[PendingTimerStore] = None,
+        bug_assistant_service: Optional[BugAssistantMessageService] = None,
+        bug_status_service: Any = None,
+        reply_policy: Optional[ChargeReplyPolicy] = None,
     ) -> None:
         self._wechat = wechat_service
         self._media = media_service
@@ -80,10 +86,11 @@ class MessageProcessor:
         self._conv = conversation_store
         # 二阶段: 待办定时器存储 (非会话历史)。None 时跳过 timer 协调 (向后兼容)。
         self._timers = pending_timer_store
+        self._bug_assistant = bug_assistant_service
+        self._bug_status = bug_status_service
+        self._reply_policy = reply_policy or get_charge_reply_policy()
 
-    async def process(
-        self, inbound: InboundMessage, adapter: ProtocolAdapter
-    ) -> None:
+    async def process(self, inbound: InboundMessage, adapter: ProtocolAdapter) -> None:
         """处理一条入站消息 (作为后台任务调用)。
 
         任何异常都被捕获并记录, 不抛出 (后台任务无人 await)。
@@ -92,18 +99,16 @@ class MessageProcessor:
         is_bot = inbound.protocol == "bot"
         logger.info(
             "[PROC] 开始处理: protocol=%s msgid=%s type=%s",
-            inbound.protocol, msgid, inbound.msg_type,
+            inbound.protocol,
+            msgid,
+            inbound.msg_type,
         )
 
         # bot 决策日志 (可拔插, 默认 off — 渲染由 adapter.send 按 trace_mode 决定)
         trace: Optional[BotTrace] = None
         if is_bot:
-            trace = BotTrace(
-                chat_type=inbound.chat_type, msg_type=inbound.msg_type
-            )
-            trace.event(
-                "receive", "ok", f"from={inbound.user_id} id={msgid[:12]}"
-            )
+            trace = BotTrace(chat_type=inbound.chat_type, msg_type=inbound.msg_type)
+            trace.event("receive", "ok", f"from={inbound.user_id} id={msgid[:12]}")
 
         dedup = adapter.dedup
         ttl = getattr(adapter, "dedup_ttl", 300)
@@ -129,10 +134,27 @@ class MessageProcessor:
         done_flag = [False]
         try:
             # 2) 媒体编排 + 预过滤 → input_data 或 canned_reply
-            scope = ("bot" if is_bot else (inbound.open_kfid or "kf"))
+            scope = "bot" if is_bot else (inbound.open_kfid or "kf")
             state = await self._conv.get_state(inbound.user_id, scope)
-            dual = getattr(self._ai, "dual_app", False)
-            active = state.get("active", "A") if dual else "A"
+            pending_notifications = []
+            if is_bot and self._bug_status is not None:
+                try:
+                    pending_notifications = await self._bug_status.list_notifications(
+                        channel="wecom_bot",
+                        user_key=inbound.user_id,
+                        session_id=f"{inbound.user_id}:{scope}",
+                        limit=20,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[PROC] Bug progress notification lookup failed user=%s: %s",
+                        inbound.user_id,
+                        str(exc)[:160],
+                    )
+            # M4: route-session 仍可返回历史 active/conv_b，但运行时只保留
+            # A 的 FAQ conversation；Bug 多轮状态由关系型 v2 草稿负责。
+            state["active"] = "A"
+            state["conv_b"] = ""
             prepared = await self._prepare_input(inbound, trace)
             if not prepared.input_data and not prepared.canned_reply:
                 logger.info("[PROC] msgid=%s 无有效内容, 跳过", msgid)
@@ -152,132 +174,246 @@ class MessageProcessor:
                 if not is_bot and inbound.open_kfid:
                     await self._chatwoot_notify_inbound(inbound)
                 if await self._is_handoff(inbound):
-                    logger.info(
-                        "[PROC] handoff=True, 人工接管, 跳过 AI: msgid=%s", msgid
-                    )
+                    logger.info("[PROC] handoff=True, 人工接管, 跳过 AI: msgid=%s", msgid)
                     # 人工接管: 不发 AI 回复 (人工经 Chatwoot 另一条路径回复)。
                     # mark_done 防重试; 不消耗 conversation_id。
                     await dedup.mark_done(msgid)
                     done_flag[0] = True
                     return
 
-                conv_id = (state.get("conv_a") if active == "A"
-                           else state.get("conv_b")) or None
+                policy_reply = None
+                if not bool(state.get("bug_v2_active")):
+                    data = prepared.input_data or {}
+                    policy_reply = self._reply_policy.evaluate(
+                        text=str(data.get("text") or ""),
+                        language=str(data.get("language") or ""),
+                        active_app="A",
+                        has_attachments=isinstance(data.get("file_image_bytes"), bytes),
+                        vague_count=max(0, int(state.get("vague_count") or 0)),
+                        vague_exhausted=bool(state.get("vague_exhausted")),
+                    )
+
+                v2_result = None
+                should_run_v2 = self._should_start_bug_v2(prepared, state)
+                if (
+                    policy_reply is None
+                    and self._bug_assistant is not None
+                    and should_run_v2
+                ):
+                    try:
+                        v2_result = await self._run_bug_v2(inbound, prepared, scope)
+                    except Exception as exc:
+                        logger.error(
+                            "[PROC] Bug v2 failed msgid=%s: %s",
+                            msgid,
+                            exc,
+                            exc_info=True,
+                        )
+                        v2_result = BugAssistantMessageResult(
+                            assistant_text=("Bug 提交服务暂时不可用，本次消息尚未处理，" "请稍后重试。"),
+                            state="retry_required",
+                            continue_session=bool(state.get("bug_v2_active")),
+                        )
+                    if v2_result.fallback_required:
+                        v2_result = BugAssistantMessageResult(
+                            assistant_text=("检测到可能已有相同问题，但旧流程回退已关闭。" "请稍后重试或联系人工客服。"),
+                            state="fallback_disabled",
+                        )
+                    state["bug_v2_active"] = bool(v2_result.continue_session)
+                    state["active"] = "A"
+                    state["vague_count"] = 0
+                    state["vague_exhausted"] = False
+                elif policy_reply is None and should_run_v2:
+                    v2_result = BugAssistantMessageResult(
+                        assistant_text=("已识别为问题反馈，但 Bug 提交服务暂时不可用，" "本次消息尚未处理，请稍后重试。"),
+                        state="retry_required",
+                        continue_session=bool(state.get("bug_v2_active")),
+                    )
+                    state["vague_count"] = 0
+                    state["vague_exhausted"] = False
+
+                if policy_reply is not None:
+                    if policy_reply.route.startswith("vague_"):
+                        state["vague_count"] = policy_reply.vague_count
+                        state["vague_exhausted"] = policy_reply.vague_exhausted
+                    else:
+                        state["vague_count"] = 0
+                        state["vague_exhausted"] = False
+                    if policy_reply.route.startswith("verified_"):
+                        state["bug_v2_active"] = False
+                    state["active"] = "A"
+
+                conv_id = str(state.get("conv_a") or "") or None
                 # context trace: 反映真实多轮状态 (替换 _prepare_input 里过时的
                 # "单轮模式,无历史" 文案 —— chatflow 透传 conversation_id 续接多轮)。
                 if trace is not None:
                     if conv_id:
                         trace.event(
-                            "context", "ok",
-                            f"续接多轮 conv={conv_id[:12]}… app={active}",
+                            "context",
+                            "ok",
+                            f"续接多轮 conv={conv_id[:12]}… app=A",
                         )
                     else:
                         trace.event("context", "ok", "首次会话, 新建多轮")
 
-                # 5) 调 AI 工作流 (active app)
-                try:
-                    wf = await self._ai.run_workflow(
-                        prepared.input_data,
-                        user_id=inbound.user_id,
-                        conversation_id=conv_id,
-                        app=active,
-                    )
-                except Exception as e:
-                    # B3: 对用户只回固定脱敏文案, 详细错误只进日志 (不发内部异常细节)
-                    logger.error(
-                        "[PROC] AI 工作流失败: msgid=%s, %s", msgid, e,
-                        exc_info=True,
-                    )
-                    if trace is not None:
-                        trace.event("knowledge", "skip", "无知识库检索")
-                        trace.event("thinking", "skip", "无思考过程")
-                        trace.event("ai", "fail", str(e)[:80])
-                    reply_text = (
-                        "抱歉，AI 服务暂时不可用，请稍后重试。"
-                        if not is_bot
-                        else "AI 服务暂时不可用，请稍后重试"
-                    )
-
+                # 5) Bug v2 或 A FAQ 二选一；不再存在 B 改投和 marker 循环。
+                if policy_reply is not None:
+                    reply_text = policy_reply.text
+                    final_wf = {
+                        "assistant_text": reply_text,
+                        "content": reply_text,
+                        "text": reply_text,
+                        "raw": {
+                            "data": {
+                                "outputs": {
+                                    "policy_route": policy_reply.route,
+                                    "answer": reply_text,
+                                }
+                            }
+                        },
+                    }
+                    await self._conv.save_state(inbound.user_id, scope, state)
+                elif v2_result is not None:
+                    reply_text = v2_result.assistant_text
+                    final_wf = {
+                        "assistant_text": reply_text,
+                        "conversation_id": "",
+                        "bug_v2": v2_result.to_dict(),
+                    }
+                    await self._conv.save_state(inbound.user_id, scope, state)
                 else:
-                    # 取 active app 回复 + 新 conv_id
-                    reply_text = (
-                        compose_multimodal_markdown(wf)
-                        if isinstance(wf, dict) else ""
+                    state["vague_count"] = 0
+                    state["vague_exhausted"] = False
+                    try:
+                        wf = await self._ai.run_workflow(
+                            prepared.input_data,
+                            user_id=inbound.user_id,
+                            conversation_id=conv_id,
+                            app="A",
+                        )
+                    except Exception as e:
+                        # B3: 对用户只回固定脱敏文案, 详细错误只进日志 (不发内部异常细节)
+                        logger.error(
+                            "[PROC] AI 工作流失败: msgid=%s, %s",
+                            msgid,
+                            e,
+                            exc_info=True,
+                        )
+                        if trace is not None:
+                            trace.event("knowledge", "skip", "无知识库检索")
+                            trace.event("thinking", "skip", "无思考过程")
+                            trace.event("ai", "fail", str(e)[:80])
+                        reply_text = (
+                            "抱歉，AI 服务暂时不可用，请稍后重试。" if not is_bot else "AI 服务暂时不可用，请稍后重试"
+                        )
+                        final_wf = {}
+                    else:
+                        reply_text = (
+                            compose_multimodal_markdown(wf)
+                            if isinstance(wf, dict)
+                            else ""
+                        )
+                        new_conv = (
+                            wf.get("conversation_id") or ""
+                            if isinstance(wf, dict)
+                            else ""
+                        )
+                        if new_conv:
+                            state["conv_a"] = new_conv
+                        final_wf = wf
+                        await self._conv.save_state(inbound.user_id, scope, state)
+
+                # 意图门控未覆盖的表达可能让 Dify A 返回历史 Bug 标记。
+                # M4 不再调用 Dify B，但将该标记兼容改投 v2 编排服务。
+                if (
+                    policy_reply is None
+                    and v2_result is None
+                    and "<!--SYS:SWITCH_TO_BUG-->" in reply_text
+                ):
+                    logger.warning(
+                        "[PROC] legacy Bug marker received msgid=%s",
+                        msgid,
                     )
-                    new_conv = (wf.get("conversation_id") or ""
-                                if isinstance(wf, dict) else "")
-                    if new_conv:
-                        state["conv_a" if active == "A" else "conv_b"] = new_conv
-                    final_wf = wf
-
-                    # 双 app 标记驱动路由: 循环改投直到无 SWITCH 标记或达上限。
-                    # 防 A↔B ping-pong (B→A REENTRY 后 A 又判 bug → SWITCH_TO_BUG → B 采集)。
-                    # 上限 MAX_ROUTES 次改投; 超出则剥离残留标记用最后回复。
-                    if dual:
-                        MAX_ROUTES = 3
-                        for _ in range(MAX_ROUTES):
-                            reply_text, switches = parse_switch_markers(reply_text)
-                            re_route = None  # None=不改投/仅切active; "A"/"B"=同条改投
-                            if SWITCH_TO_BUG in switches and active == "A":
-                                state["active"] = "B"; re_route = "B"
-                            elif SWITCH_TO_KB_REENTRY in switches and active == "B":
-                                state["active"] = "A"; re_route = "A"
-                            elif SWITCH_TO_KB_DONE in switches and active == "B":
-                                state["active"] = "A"  # 发 B 话术, 下条→A, 不改投
-                            if not re_route:
-                                break
-                            try:
-                                # 改投到 re_route app: input_data 携带 app 无关的图片
-                                # 字节, _run_chatflow 会在发送时按目标 app 上传, 文件
-                                # 归属自动正确, 无需在此特殊处理 (根除跨 app file_id 失效)。
-                                wf2 = await self._ai.run_workflow(
-                                    prepared.input_data,
-                                    user_id=inbound.user_id,
-                                    conversation_id=(state.get("conv_b")
-                                                     if re_route == "B"
-                                                     else state.get("conv_a")) or None,
-                                    app=re_route,
-                                )
-                            except Exception as e2:
-                                logger.error(
-                                    "[PROC] 改投 %s 失败 msgid=%s: %s",
-                                    re_route, msgid, e2, exc_info=True,
-                                )
-                                break
-                            rt2 = (compose_multimodal_markdown(wf2)
-                                   if isinstance(wf2, dict) else "")
-                            nc2 = (wf2.get("conversation_id") or ""
-                                   if isinstance(wf2, dict) else "")
-                            if nc2:
-                                state["conv_b" if re_route == "B"
-                                      else "conv_a"] = nc2
-                            reply_text = rt2  # 下轮解析其 SWITCH 标记
-                            final_wf = wf2
-                            active = state.get("active", "A")
-                        # 最终剥离残留 SWITCH 标记 (达上限仍带标记时)
-                        reply_text, _ = parse_switch_markers(reply_text)
-
-                    # 持久化路由状态
+                    state["conv_a"] = ""
+                    state["vague_count"] = 0
+                    state["vague_exhausted"] = False
+                    marker_text = str((prepared.input_data or {}).get("text") or "")
+                    if self._reply_policy.blocks_bug_route(marker_text):
+                        logger.warning(
+                            "[PROC] ignored legacy Bug marker for non-Bug query "
+                            "msgid=%s",
+                            msgid,
+                        )
+                        reply_text = self._reply_policy.non_bug_marker_reply(
+                            str((prepared.input_data or {}).get("language") or ""),
+                            marker_text,
+                        )
+                        final_wf = {
+                            "assistant_text": reply_text,
+                            "content": reply_text,
+                            "text": reply_text,
+                        }
+                    elif self._bug_assistant is None:
+                        reply_text = "已识别为问题反馈，但 Bug 提交服务暂时不可用，" "本次消息尚未处理，请稍后重试。"
+                    else:
+                        try:
+                            marker_result = await self._run_bug_v2(
+                                inbound, prepared, scope
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "[PROC] legacy Bug marker v2 reroute failed "
+                                "msgid=%s: %s",
+                                msgid,
+                                exc,
+                                exc_info=True,
+                            )
+                            marker_result = BugAssistantMessageResult(
+                                assistant_text=("Bug 提交服务暂时不可用，本次消息尚未处理，" "请稍后重试。"),
+                                state="retry_required",
+                            )
+                        if marker_result.fallback_required:
+                            marker_result = BugAssistantMessageResult(
+                                assistant_text=(
+                                    "检测到可能已有相同问题，但旧流程回退已关闭。" "请稍后重试或联系人工客服。"
+                                ),
+                                state="fallback_disabled",
+                            )
+                        state["bug_v2_active"] = bool(marker_result.continue_session)
+                        state["active"] = "A"
+                        reply_text = marker_result.assistant_text
+                        final_wf = {
+                            "assistant_text": reply_text,
+                            "conversation_id": "",
+                            "bug_v2": marker_result.to_dict(),
+                        }
                     await self._conv.save_state(inbound.user_id, scope, state)
 
-                    # bot: 知识库 / 思考阶段 trace (用最终 wf)
-                    if trace is not None and isinstance(final_wf, dict):
-                        self._trace_kb_thinking(trace, final_wf)
-                        trace.event("ai", "ok", self._ai_detail(final_wf))
+                # 清理其余历史 SWITCH marker；TIMER marker 必须保留到
+                # 发送成功后再交给定时器协调器。
+                reply_text = _LEGACY_SWITCH_MARKER_RE.sub("", reply_text)
 
+                if trace is not None and isinstance(final_wf, dict):
+                    self._trace_kb_thinking(trace, final_wf)
+                    trace.event("ai", "ok", self._ai_detail(final_wf))
+
+            if pending_notifications:
+                progress_text = "\n\n".join(
+                    item.message for item in pending_notifications if item.message
+                )
+                if progress_text:
+                    reply_text = (
+                        f"{progress_text}\n\n{reply_text}"
+                        if reply_text
+                        else progress_text
+                    )
 
             # 6) 空回复兜底 (B1): KF 与 bot 都给用户一个兜底文案, 不再静默丢弃
             #    (旧版 KF 只记日志+return, 用户什么都收不到; Dify data.status=failed
             #    经 compose 变空串时尤甚)。兜底后正常走 step 7 投递 + mark_done。
             if not reply_text or not reply_text.strip():
-                reply_text = (
-                    "抱歉，我暂时无法处理该消息，请稍后重试。"
-                    if not is_bot
-                    else "（AI 未返回内容）"
-                )
-                logger.warning(
-                    "[PROC] msgid=%s 工作流返回空内容, 使用兜底文案", msgid
-                )
+                reply_text = "抱歉，未生成有效回复，请重新描述问题或稍后重试。"
+                logger.warning("[PROC] msgid=%s 工作流返回空内容, 使用兜底文案", msgid)
 
             # 二阶段: 从 AI 回复末尾解析 TIMER 握手标记, 剥离后用户不可见。
             # markers 收集起来, send 成功后再 arm/cancel (不阻塞回复投递)。
@@ -300,13 +436,28 @@ class MessageProcessor:
             await dedup.mark_done(msgid)
             done_flag[0] = True
 
+            if pending_notifications and self._bug_status is not None:
+                try:
+                    await self._bug_status.acknowledge(
+                        channel="wecom_bot",
+                        user_key=inbound.user_id,
+                        session_id=f"{inbound.user_id}:{scope}",
+                        notification_ids=[
+                            item.notification_id for item in pending_notifications
+                        ],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[PROC] Bug progress notification ack failed user=%s: %s",
+                        inbound.user_id,
+                        str(exc)[:160],
+                    )
+
             # 二阶段: 回复已投递, 处理 TIMER 标记 (arm/cancel 30 分钟倒计时)。
             # 放在 send 成功后: 若回复投递失败, 不应 arm 定时器 (用户没收到待确认问题)。
             if self._timers is not None and timer_markers:
                 scope = "bot" if is_bot else (inbound.open_kfid or "kf")
-                await apply_markers(
-                    self._timers, inbound.user_id, scope, timer_markers
-                )
+                await apply_markers(self._timers, inbound.user_id, scope, timer_markers)
 
             # 8) Chatwoot 同步 (仅 KF: 把 AI 回复同步到人工侧)
             if not is_bot and inbound.open_kfid:
@@ -321,14 +472,17 @@ class MessageProcessor:
             # release_processing, 允许重试重新 acquire。
             logger.error(
                 "[PROC] 编排异常 (将重抛供上层重试/死信): msgid=%s, %s",
-                msgid, e, exc_info=True,
+                msgid,
+                e,
+                exc_info=True,
             )
             raise
         except BaseException as e:
             # A3: CancelledError 等 BaseException 也要 release, 否则 msgid 卡
             # _processing (且 _processing 旧版无 TTL 清理 → 永久泄漏)。记日志后重抛。
             logger.warning(
-                "[PROC] 编排被中断 (BaseException): msgid=%s, %s", msgid,
+                "[PROC] 编排被中断 (BaseException): msgid=%s, %s",
+                msgid,
                 type(e).__name__,
             )
             raise
@@ -341,6 +495,76 @@ class MessageProcessor:
     # ------------------------------------------------------------------
     # 媒体编排 + 预过滤: InboundMessage → PreparedInput
     # ------------------------------------------------------------------
+    def _should_start_bug_v2(
+        self, prepared: PreparedInput, state: dict[str, Any]
+    ) -> bool:
+        """Conservative Bug intent gate for the direct v2 path.
+
+        Existing v2 drafts always own their next turn. A new draft requires an
+        explicit fault/progress signal; an attachment alone is not enough to
+        route a normal FAQ into Bug.
+        """
+        if bool(state.get("bug_v2_active")):
+            return True
+        data = prepared.input_data or {}
+        text = str(data.get("text") or "").strip().lower()
+        has_image = isinstance(data.get("file_image_bytes"), bytes)
+        if text.startswith("[用户发了一段语音"):
+            return False
+        if not text and not has_image:
+            return False
+        return (
+            self._reply_policy.route_target(
+                text=text,
+                active_app="A",
+                has_attachments=has_image,
+            )
+            == "B"
+        )
+
+    async def _run_bug_v2(
+        self,
+        inbound: InboundMessage,
+        prepared: PreparedInput,
+        scope: str,
+    ):
+        if self._bug_assistant is None:
+            raise RuntimeError("Bug v2 service is not configured")
+        input_data = dict(prepared.input_data or {})
+        text = str(input_data.get("text") or "").strip()
+        if text in {"[image]", "[图片]"}:
+            text = ""
+        image_bytes = input_data.get("file_image_bytes")
+        image_name = str(input_data.get("file_image_name") or "")
+        return await self._bug_assistant.process(
+            channel="wecom_bot" if inbound.protocol == "bot" else "wecom_kf",
+            user_key=inbound.user_id,
+            session_id=f"{inbound.user_id}:{scope}",
+            text=text,
+            language=str(input_data.get("language") or ""),
+            message_id=inbound.msgid,
+            image_bytes=image_bytes if isinstance(image_bytes, bytes) else None,
+            image_name=image_name,
+            image_mime=self._image_mime(image_bytes, image_name),
+        )
+
+    @staticmethod
+    def _image_mime(content: Any, filename: str) -> str:
+        if not isinstance(content, bytes) or not content:
+            return ""
+        if content.startswith(b"\x89PNG"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith(b"GIF8"):
+            return "image/gif"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp"
+        name = (filename or "").lower()
+        if name.endswith(".png"):
+            return "image/png"
+        return "image/jpeg"
+
     async def _prepare_input(
         self, inbound: InboundMessage, trace: Optional[BotTrace]
     ) -> PreparedInput:
@@ -383,7 +607,8 @@ class MessageProcessor:
                 input_data["text"] = "[image]"
                 logger.info(
                     "[PROC] KF 图片待传: media_id=%s size=%dB",
-                    inbound.media_ref, len(content),
+                    inbound.media_ref,
+                    len(content),
                 )
                 return PreparedInput(input_data=input_data)
             except Exception as e:
@@ -400,9 +625,7 @@ class MessageProcessor:
                     inbound.media_ref, "voice"
                 )
                 if media_info.get("error"):
-                    logger.warning(
-                        "[PROC] KF 语音转码失败: %s", media_info["error"]
-                    )
+                    logger.warning("[PROC] KF 语音转码失败: %s", media_info["error"])
                     input_data["text"] = "[用户发了一段语音,识别失败]"
                     return PreparedInput(input_data=input_data)
                 # ASR 转写: 优先 WAV 转码结果, 回退原始文件路径
@@ -411,11 +634,13 @@ class MessageProcessor:
                 transcript = ""
                 if wav_path:
                     from app.services.asr import transcribe as asr_transcribe
+
                     transcript = await asr_transcribe(wav_path)
                 input_data["text"] = transcript or "[用户发了一段语音,识别失败]"
                 logger.info(
                     "[PROC] KF 语音 ASR: media_id=%s -> %s",
-                    inbound.media_ref, input_data["text"][:50],
+                    inbound.media_ref,
+                    input_data["text"][:50],
                 )
                 return PreparedInput(input_data=input_data)
             except Exception as e:
@@ -458,15 +683,22 @@ class MessageProcessor:
                         _aeskey = inbound.aeskey or ""
                         if not _aeskey:
                             try:
-                                _aeskey = settings.wechat.encoding_aes_key.get_secret_value()
+                                _aeskey = (
+                                    settings.wechat.encoding_aes_key.get_secret_value()
+                                )
                             except Exception:
                                 _aeskey = ""
                         if _aeskey:
                             try:
                                 import base64 as _b64
                                 from Crypto.Cipher import AES as _AES
+
                                 _ak = _aeskey
-                                _key = _b64.b64decode(_ak + "=") if len(_ak) == 43 else _b64.b64decode(_ak)
+                                _key = (
+                                    _b64.b64decode(_ak + "=")
+                                    if len(_ak) == 43
+                                    else _b64.b64decode(_ak)
+                                )
                                 _iv = _key[:16]
                                 _cipher = _AES.new(_key, _AES.MODE_CBC, _iv)
                                 _dec = _cipher.decrypt(media_bytes)
@@ -475,30 +707,52 @@ class MessageProcessor:
                                     media_bytes = _dec[:-_pad]
                                 else:
                                     media_bytes = _dec
-                                logger.info("[PROC] bot image AES解密: msgid=%s dec_size=%dB magic=%s", inbound.msgid, len(media_bytes), media_bytes[:8].hex())
+                                logger.info(
+                                    "[PROC] bot image AES解密: msgid=%s "
+                                    "dec_size=%dB magic=%s",
+                                    inbound.msgid,
+                                    len(media_bytes),
+                                    media_bytes[:8].hex(),
+                                )
                                 # PIL 打开+转标准JPEG (避免解密后PNG损坏/特殊格式 qwen打不开)
                                 try:
                                     from PIL import Image
                                     import io as _io
+
                                     _img = Image.open(_io.BytesIO(media_bytes))
                                     if _img.mode != "RGB":
                                         _img = _img.convert("RGB")
                                     _buf = _io.BytesIO()
                                     _img.save(_buf, format="PNG")
                                     media_bytes = _buf.getvalue()
-                                    logger.info("[PROC] bot image PIL转PNG: msgid=%s size=%dB magic=%s", inbound.msgid, len(media_bytes), media_bytes[:8].hex())
+                                    logger.info(
+                                        "[PROC] bot image PIL转PNG: msgid=%s "
+                                        "size=%dB magic=%s",
+                                        inbound.msgid,
+                                        len(media_bytes),
+                                        media_bytes[:8].hex(),
+                                    )
                                 except Exception as _pe:
-                                    logger.error("[PROC] bot image PIL转码失败: %s", _pe, exc_info=True)
+                                    logger.error(
+                                        "[PROC] bot image PIL转码失败: %s",
+                                        _pe,
+                                        exc_info=True,
+                                    )
                             except Exception as e:
-                                logger.error("[PROC] bot image AES解密失败: %s", e, exc_info=True)
+                                logger.error(
+                                    "[PROC] bot image AES解密失败: %s", e, exc_info=True
+                                )
                         if trace is not None:
                             trace.event(
-                                "media", "ok",
+                                "media",
+                                "ok",
                                 f"image url downloaded size={len(media_bytes)}B",
                             )
                         logger.info(
                             "[PROC] bot image url 下载: msgid=%s size=%dB magic=%s",
-                            inbound.msgid, len(media_bytes), media_bytes[:8].hex(),
+                            inbound.msgid,
+                            len(media_bytes),
+                            media_bytes[:8].hex(),
                         )
                     else:
                         # voice url (实测未触发, 保留通用下载)
@@ -507,13 +761,9 @@ class MessageProcessor:
                             r.raise_for_status()
                             media_bytes = r.content
                 elif inbound.media_kind == "media_id":
-                    media_bytes = await self._wechat.download_media(
-                        inbound.media_ref
-                    )
+                    media_bytes = await self._wechat.download_media(inbound.media_ref)
                 else:
-                    raise RuntimeError(
-                        f"未知的 media_kind: {inbound.media_kind}"
-                    )
+                    raise RuntimeError(f"未知的 media_kind: {inbound.media_kind}")
 
                 # image: 携带原始字节 (已下载+AES解密+PIL转码), 不在此上传。
                 # 上传在 _run_chatflow 发送时按目标 app 进行 (Dify 文件库按 app 隔离,
@@ -524,12 +774,14 @@ class MessageProcessor:
                     dify_file_image_name = f"wechat_image_{_slug}.png"
                     if trace is not None:
                         trace.event(
-                            "media", "ok",
+                            "media",
+                            "ok",
                             f"image ready size={len(media_bytes)}B",
                         )
                     logger.info(
                         "[PROC] bot image 待传: msgid=%s size=%dB",
-                        inbound.msgid, len(media_bytes),
+                        inbound.msgid,
+                        len(media_bytes),
                     )
                 # voice ASR (media_id 路径): 下载+AMR->WAV+ASR -> transcript
                 # Dify 无 ASR 节点, 语音在 wecom 侧转文本 (见 asr.py)
@@ -537,24 +789,28 @@ class MessageProcessor:
                     v_info = await self._media.download_and_process_media(
                         inbound.media_ref, "voice"
                     )
-                    v_wav = (None if v_info.get("error")
-                             else v_info.get("wav_path") or v_info.get("file_path"))
+                    v_wav = (
+                        None
+                        if v_info.get("error")
+                        else v_info.get("wav_path") or v_info.get("file_path")
+                    )
                     if v_wav:
                         from app.services.asr import transcribe as asr_transcribe
+
                         bot_voice_transcript = await asr_transcribe(v_wav)
                     if trace is not None:
                         trace.event(
-                            "media", "ok",
+                            "media",
+                            "ok",
                             f"voice ASR: {bot_voice_transcript[:40]}",
                         )
                     logger.info(
                         "[PROC] bot voice ASR: msgid=%s -> %s",
-                        inbound.msgid, bot_voice_transcript[:50],
+                        inbound.msgid,
+                        bot_voice_transcript[:50],
                     )
             except Exception as e:
-                logger.error(
-                    "[PROC] bot 媒体编排失败: msgid=%s, %s", inbound.msgid, e
-                )
+                logger.error("[PROC] bot 媒体编排失败: msgid=%s, %s", inbound.msgid, e)
                 if trace is not None:
                     trace.event("media", "fail", str(e)[:80])
         else:
@@ -563,11 +819,13 @@ class MessageProcessor:
 
         # 1) 预过滤
         is_unsupported = inbound.msg_type not in _BOT_SUPPORTED_TYPES
-        is_empty = inbound.msg_type in ("text", "mixed") and not inbound.text and not inbound.media_ref
+        is_empty = (
+            inbound.msg_type in ("text", "mixed")
+            and not inbound.text
+            and not inbound.media_ref
+        )
         if is_unsupported or is_empty:
-            canned = (
-                "收到不支持的消息类型" if is_unsupported else "收到空消息"
-            )
+            canned = "收到不支持的消息类型" if is_unsupported else "收到空消息"
             if trace is not None:
                 trace.event("prefilter", "fail", f"{inbound.msg_type} 不支持/空")
                 trace.event("knowledge", "skip", "无知识库检索")
@@ -657,9 +915,7 @@ class MessageProcessor:
 
             sync = ChatwootSyncService()
             try:
-                result = await sync.check_handoff(
-                    inbound.open_kfid, inbound.user_id
-                )
+                result = await sync.check_handoff(inbound.open_kfid, inbound.user_id)
             finally:
                 await sync.aclose()
         except Exception as e:
@@ -669,7 +925,9 @@ class MessageProcessor:
             logger.warning(
                 "[PROC] HANDOFF_FAIL_OPEN handoff 检查异常, 默认不接管 (AI 可能抢答): "
                 "msgid=%s, open_kfid=%s, %s",
-                inbound.msgid, inbound.open_kfid, e,
+                inbound.msgid,
+                inbound.open_kfid,
+                e,
             )
             return False
         handoff = bool((result or {}).get("handoff"))
@@ -692,8 +950,10 @@ class MessageProcessor:
             sync = ChatwootSyncService()
             try:
                 content = inbound.text or (
-                    "[图片]" if inbound.media_type == "image"
-                    else "[语音]" if inbound.media_type == "voice"
+                    "[图片]"
+                    if inbound.media_type == "image"
+                    else "[语音]"
+                    if inbound.media_type == "voice"
                     else ""
                 )
                 await sync.notify_incoming(
@@ -709,13 +969,9 @@ class MessageProcessor:
             finally:
                 await sync.aclose()
         except Exception as e:
-            logger.error(
-                "[ChatwootSync] 入站同步失败 (非致命, 不影响 WeCom 流程): %s", e
-            )
+            logger.error("[ChatwootSync] 入站同步失败 (非致命, 不影响 WeCom 流程): %s", e)
 
-    async def _chatwoot_notify(
-        self, inbound: InboundMessage, reply_text: str
-    ) -> None:
+    async def _chatwoot_notify(self, inbound: InboundMessage, reply_text: str) -> None:
         try:
             from app.services.chatwoot_sync_service import ChatwootSyncService
 
@@ -736,9 +992,7 @@ class MessageProcessor:
             finally:
                 await sync.aclose()
         except Exception as e:
-            logger.error(
-                "[ChatwootSync] 同步失败 (非致命, 不影响 WeCom 流程): %s", e
-            )
+            logger.error("[ChatwootSync] 同步失败 (非致命, 不影响 WeCom 流程): %s", e)
 
 
 __all__ = ["MessageProcessor", "PreparedInput"]

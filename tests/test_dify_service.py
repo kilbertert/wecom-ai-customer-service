@@ -53,6 +53,17 @@ def service(mock_dify_client_cls):
     return DifyService(), _instance
 
 
+def test_m4_constructs_only_a_client_even_when_b_token_is_configured(
+    mock_dify_client_cls,
+):
+    cls, instance = mock_dify_client_cls
+    svc = DifyService()
+
+    assert set(svc._clients) == {"A"}
+    assert svc.client is instance
+    assert cls.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # upload_file
 # ---------------------------------------------------------------------------
@@ -349,9 +360,7 @@ async def test_chatflow_inputs_empty_when_no_config_no_passthrough(chatflow_serv
 
 async def test_chatflow_inputs_from_deployment_config(chatflow_service, monkeypatch):
     """F3: 部署级配置 (DIFY_CHATFLOW_INPUT_*) 注入到 chatflow inputs。"""
-    monkeypatch.setattr(
-        "app.services.dify.settings.dify.chatflow_input_language", "zh"
-    )
+    monkeypatch.setattr("app.services.dify.settings.dify.chatflow_input_language", "zh")
     monkeypatch.setattr(
         "app.services.dify.settings.dify.chatflow_input_hint_endpoint", "user"
     )
@@ -368,11 +377,11 @@ async def test_chatflow_inputs_from_deployment_config(chatflow_service, monkeypa
     }
 
 
-async def test_chatflow_inputs_passthrough_overrides_config(chatflow_service, monkeypatch):
+async def test_chatflow_inputs_passthrough_overrides_config(
+    chatflow_service, monkeypatch
+):
     """F3: input_data 透传值 (language/hint_endpoint/hint_region) 覆盖部署级配置。"""
-    monkeypatch.setattr(
-        "app.services.dify.settings.dify.chatflow_input_language", "zh"
-    )
+    monkeypatch.setattr("app.services.dify.settings.dify.chatflow_input_language", "zh")
     monkeypatch.setattr(
         "app.services.dify.settings.dify.chatflow_input_hint_region", "cn"
     )
@@ -503,6 +512,9 @@ async def test_chatflow_mode_files_array_image_bytes(chatflow_service):
     client.upload_file.assert_awaited_once()
     call_kwargs = client.run_chatflow.await_args.kwargs
     assert call_kwargs["files"] == [
-        {"type": "image", "transfer_method": "local_file",
-         "upload_file_id": "dify-file-uuid-xxx"}
+        {
+            "type": "image",
+            "transfer_method": "local_file",
+            "upload_file_id": "dify-file-uuid-xxx",
+        }
     ]

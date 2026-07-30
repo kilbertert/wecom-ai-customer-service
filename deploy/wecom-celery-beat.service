@@ -1,0 +1,17 @@
+[Unit]
+Description=WeCom AI Celery Beat (Bug Issue progress reconciliation)
+After=network.target wecom-celery-worker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ai-customer/wecom-ai-customer-service-main
+EnvironmentFile=/root/ai-customer/wecom-ai-customer-service-main/.env
+ExecStart=/root/ai-customer/wecom-ai-customer-service-main/venv/bin/celery -A app.core.celery_app beat --loglevel=info --pidfile=/run/wecom-celery-beat.pid --schedule=/var/lib/wecom-ai/celerybeat-schedule
+Restart=always
+RestartSec=10
+StandardOutput=append:/tmp/wecom-celery-beat.log
+StandardError=append:/tmp/wecom-celery-beat.log
+
+[Install]
+WantedBy=multi-user.target

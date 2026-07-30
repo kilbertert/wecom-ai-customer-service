@@ -18,12 +18,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
 from app.core.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
+
+
+async def _await_with_database_cleanup(awaitable):
+    from app.core.database import close_database
+
+    try:
+        return await awaitable
+    finally:
+        await close_database()
+
+
+def _run_database_task(awaitable):
+    """Run one async DB task without leaking pooled connections across loops."""
+
+    return asyncio.run(_await_with_database_cleanup(awaitable))
 
 
 @celery_app.task(
@@ -52,7 +68,10 @@ def bugtrack_timeout(
     payload = payload or {}
     logger.info(
         "[bugtrack_timeout] fire: user=%s scope=%s state=%s record_id=%s",
-        user_id, scope, state, record_id or "(none)",
+        user_id,
+        scope,
+        state,
+        record_id or "(none)",
     )
 
     # 1) 防重复 fire + 原子 CAS 清 (审查 P1 #5): 仅当 stored task_id == 本任务 id 才清,
@@ -64,6 +83,7 @@ def bugtrack_timeout(
             create_pending_timer_store,
         )
         import asyncio
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -86,13 +106,13 @@ def bugtrack_timeout(
         if reason != "cleared":
             logger.info(
                 "[bugtrack_timeout] user=%s 跳过 fire (reason=%s, self=%s)",
-                user_id, reason, (self.request.id or "")[:8],
+                user_id,
+                reason,
+                (self.request.id or "")[:8],
             )
             return {"status": "skipped", "reason": reason}
     except Exception as e:
-        logger.warning(
-            "[bugtrack_timeout] pending 检查异常 (继续): %s", e
-        )
+        logger.warning("[bugtrack_timeout] pending 检查异常 (继续): %s", e)
 
     # 2) 超时处理: 不写表 (避免 [超时未确认] 垃圾记录污染主表)。
     #    半成品内容丢失 (用户未在 30 分钟窗口内确认, 可接受); 仅记日志。
@@ -105,7 +125,10 @@ def bugtrack_timeout(
     logger.info(
         "[bugtrack_timeout] 超时不写表 (避免污染主表): user=%s state=%s "
         "record_id=%s op_desc_len=%d",
-        user_id, state, record_id or "(none)", len(op_desc),
+        user_id,
+        state,
+        record_id or "(none)",
+        len(op_desc),
     )
     return {
         "status": "skipped_no_write",
@@ -114,4 +137,77 @@ def bugtrack_timeout(
     }
 
 
-__all__ = ["bugtrack_timeout"]
+@celery_app.task(
+    bind=True,
+    name="app.tasks.bugtrack_sync_v2_issue",
+    max_retries=5,
+    default_retry_delay=30,
+)
+def bugtrack_sync_v2_issue(self, draft_id: str) -> Dict[str, Any]:
+    """Retry one durable create_issue_v2 outbox entry."""
+
+    from app.services.bug_issue_sync_service import bug_issue_sync_service
+
+    try:
+        result = _run_database_task(bug_issue_sync_service.sync(draft_id))
+        return {"status": "succeeded", **result.to_dict()}
+    except Exception as exc:
+        logger.warning(
+            "[bugtrack_sync_v2_issue] retry draft=%s error=%s",
+            draft_id,
+            str(exc)[:200],
+        )
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(
+    name="app.tasks.bugtrack_reconcile_issue_statuses",
+)
+def bugtrack_reconcile_issue_statuses() -> Dict[str, Any]:
+    """Poll subscribed Feishu Issues and enqueue durable push deliveries."""
+
+    from app.core.config import settings
+    from app.services.bug_issue_status_service import bug_issue_status_service
+
+    result = _run_database_task(
+        bug_issue_status_service.reconcile(
+            limit=max(1, int(settings.bugtrack.status_sync_batch_size))
+        )
+    )
+    for delivery_id in result.delivery_ids:
+        bugtrack_deliver_issue_notification.apply_async(
+            args=[delivery_id], queue="wecom_timers"
+        )
+    return {"status": "succeeded", **result.to_dict()}
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.bugtrack_deliver_issue_notification",
+    max_retries=5,
+    default_retry_delay=60,
+)
+def bugtrack_deliver_issue_notification(
+    self, delivery_id: str
+) -> Dict[str, Any]:
+    """Deliver one proactive WeCom notification with durable retry state."""
+
+    from app.services.bug_issue_status_service import bug_issue_status_service
+
+    try:
+        return _run_database_task(bug_issue_status_service.deliver(delivery_id))
+    except Exception as exc:
+        logger.warning(
+            "[bugtrack_notification] retry delivery=%s error=%s",
+            delivery_id,
+            str(exc)[:200],
+        )
+        raise self.retry(exc=exc)
+
+
+__all__ = [
+    "bugtrack_timeout",
+    "bugtrack_sync_v2_issue",
+    "bugtrack_reconcile_issue_statuses",
+    "bugtrack_deliver_issue_notification",
+]

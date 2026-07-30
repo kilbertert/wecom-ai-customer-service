@@ -14,6 +14,9 @@ __all__ = [
     "process_media_file",
     "cleanup_temp_files",
 
-    # Bug track tasks (二阶段超时)
+    # Bug track tasks
     "bugtrack_timeout",
+    "bugtrack_sync_v2_issue",
+    "bugtrack_reconcile_issue_statuses",
+    "bugtrack_deliver_issue_notification",
 ]

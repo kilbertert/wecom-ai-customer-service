@@ -47,6 +47,29 @@ async def test_save_empty_id_is_noop():
     assert await store.get("user-1", "bot") is None
 
 
+@pytest.mark.asyncio
+async def test_historical_b_state_is_normalized_to_a_runtime_shape():
+    store = InMemoryConversationStore()
+    await store.save_state(
+        "user-1",
+        "bot",
+        {
+            "active": "B",
+            "conv_a": "conv-a",
+            "conv_b": "conv-b-old",
+            "bug_v2_active": True,
+        },
+    )
+
+    state = await store.get_state("user-1", "bot")
+    assert state == {
+        "active": "A",
+        "conv_a": "conv-a",
+        "conv_b": "",
+        "bug_v2_active": True,
+    }
+
+
 def test_key_normalizes_empty_values():
     assert _key("", "") == ("anon", "default")
     assert _key("u", "s") == ("u", "s")
