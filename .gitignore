@@ -64,3 +64,9 @@ build/
 *.sqlite
 *.sqlite3
 data/bugtrack/
+
+# Python 虚拟环境（可重建，不应入库；否则数千文件会淹没真正的未跟踪文件）
+.venv/
+venv/
+__pycache__/
+*.pyc
